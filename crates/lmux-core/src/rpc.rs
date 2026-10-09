@@ -1794,6 +1794,7 @@ async fn add_surface_impl(
 }
 
 async fn close_surface(inner: &Arc<Inner>, surface: &str) {
+    tracing::info!(%surface, "closing surface (rpc)");
     // Read the term from the guard that is already held, and let it drop before
     // awaiting anything: `surface_term` takes the same lock, and a tokio lock is
     // not re-entrant, so awaiting it here would hang the daemon and every client
@@ -1832,6 +1833,8 @@ async fn close_surface(inner: &Arc<Inner>, surface: &str) {
 }
 
 async fn close_workspace(inner: &Arc<Inner>, ws: &str) {
+    let title = inner.state.lock().await.workspace(ws).map(|w| w.title.clone()).unwrap_or_default();
+    tracing::info!(workspace = %ws, %title, "closing workspace (rpc)");
     let surfaces: Vec<(Ref, bool)> = {
         let state = inner.state.lock().await;
         let Some(w) = state.workspace(ws) else {

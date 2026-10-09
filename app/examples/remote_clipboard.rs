@@ -123,10 +123,11 @@ fn main() {
             "command": if local { "env PS1='READY$ ' zsh -f" } else { "env PS1='READY$ ' bash --norc --noprofile" },
         }),
     );
-    rig.wait("the new workspace", Duration::from_secs(10), |r| {
-        r.state.tree.workspaces.iter().any(|w| !before.contains(&w.id))
-    });
-    let ws = rig.state.tree.workspaces.iter().find(|w| !before.contains(&w.id)).unwrap().clone();
+    // Ours by name as well as new, so a workspace someone opens in the app
+    // meanwhile is never touched.
+    let ours = |w: &lmux_proto::Workspace| !before.contains(&w.id) && w.title == "lmux-clipboard-test";
+    rig.wait("the new workspace", Duration::from_secs(10), |r| r.state.tree.workspaces.iter().any(ours));
+    let ws = rig.state.tree.workspaces.iter().find(|w| ours(w)).unwrap().clone();
     let sid = ws.panes[0].surfaces[0].id.clone();
     println!("workspace {} surface {sid}", ws.id);
 
