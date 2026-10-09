@@ -1,0 +1,11 @@
+[package]
+name = "lmux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lmux-proto.workspace = true
+lmux-core.workspace = true
+lmux-browser.workspace = true
