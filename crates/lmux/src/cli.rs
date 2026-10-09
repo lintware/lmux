@@ -674,7 +674,7 @@ pub enum Cmd {
     },
 
     // ----- browser -----------------------------------------------------------
-    /// Drive a browser pane: browser [<surface>|--surface S] <subcommand>
+    /// Drive a browser pane: browser [<surface>|--surface S|--workspace W] <subcommand>
     #[command(after_help = BROWSER_HELP)]
     Browser {
         #[command(subcommand)]
