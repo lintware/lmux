@@ -851,6 +851,8 @@ impl SessionState {
                 active_surface: Some(surface.to_string()),
             }],
             focused_pane: Some(pane_ref.clone()),
+            ports: vec![],
+            pr: None,
         });
         // Sit right after the workspace it came from.
         if let (Some(from), Some(at)) = (self.workspace_index(&src_id), self.workspace_index(&ws_ref)) {
@@ -1718,6 +1720,8 @@ mod tests {
                 active_surface: Some(surf.clone()),
             }],
             focused_pane: Some(p.clone()),
+            ports: vec![],
+            pr: None,
         });
         (ws, p, surf)
     }

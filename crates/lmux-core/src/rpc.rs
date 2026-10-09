@@ -1596,6 +1596,8 @@ async fn browser_workspace(inner: &Arc<Inner>, id: u64, params: &Value) -> RpcRe
                 active_surface: Some(surface_ref.clone()),
             }],
             focused_pane: Some(pane_ref.clone()),
+            ports: vec![],
+            pr: None,
         });
         if state.selected_workspace.is_none() {
             state.selected_workspace = Some(ws_ref.clone());
@@ -1953,6 +1955,8 @@ mod tests {
                 active_surface: Some(term.clone()),
             }],
             focused_pane: Some(pane.clone()),
+            ports: vec![],
+            pr: None,
         });
         (s, ws, pane, term, web)
     }
