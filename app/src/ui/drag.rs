@@ -100,6 +100,9 @@ fn resolve(state: &AppState, drag: &TabDrag, pointer: Pos2) -> Option<DropTarget
             }
             Some(DropTarget::Swap { other: pane_id })
         }
+        // Sidebar rows (workspaces, folders) are resolved against the sidebar,
+        // not against the pane under the pointer.
+        DragItem::Workspace(_) | DragItem::Folder(_) => None,
     }
 }
 
@@ -179,6 +182,8 @@ fn paint(ui: &mut Ui, state: &AppState, drag: &TabDrag) {
                 p.rect_filled(*r, CornerRadius::ZERO, Color32::from_black_alpha(140));
             }
         }
+        // A sidebar row dims its own row inside the sidebar.
+        DragItem::Workspace(_) | DragItem::Folder(_) => {}
     }
 
     // The ghost that follows the pointer.
@@ -203,6 +208,9 @@ fn paint(ui: &mut Ui, state: &AppState, drag: &TabDrag) {
                 .or_else(|| pn.surfaces.first())
                 .map(|s| s.title.clone())
         }),
+        // The sidebar draws its own ghost for a row.
+        DragItem::Workspace(id) => state.workspace(id).map(|w| w.title.clone()),
+        DragItem::Folder(id) => state.folder(id).map(|f| f.name.clone()),
     };
     if let Some(label) = label {
         p.text(
@@ -259,6 +267,8 @@ fn paint(ui: &mut Ui, state: &AppState, drag: &TabDrag) {
                     }
                 }
             }
+            // Sidebar-row feedback is drawn inside the sidebar itself.
+            DropTarget::Sidebar { .. } => {}
         }
     }
 }
@@ -269,7 +279,7 @@ fn caret_x(state: &AppState, drag: &TabDrag, pane: &str, index: usize) -> Option
     let p = state.pane(pane)?;
     let dragged = match &drag.item {
         DragItem::Surface(s) => Some(s.as_str()),
-        DragItem::Pane(_) => None,
+        DragItem::Pane(_) | DragItem::Workspace(_) | DragItem::Folder(_) => None,
     };
     let list: Vec<&lmux_proto::Surface> = p
         .surfaces
