@@ -125,11 +125,51 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
         }
     }
     if resp.hovered() {
-        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-        if scroll.abs() > 0.5 {
-            let lines = (scroll / metrics.h).round() as i32;
-            if let Some(tv) = c.state.terms.get_mut(surface) {
-                tv.scroll(if lines == 0 { -scroll.signum() as i32 } else { lines });
+        // Raw wheel events, converted to points. `smooth_scroll_delta` is
+        // low-pass filtered over frames, so a single notch can arrive as a
+        // fraction of a line: the accumulator in the term keeps the remainder
+        // and whole lines are what get scrolled.
+        let wheel = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|ev| match ev {
+                    egui::Event::MouseWheel { unit, delta, .. } => Some(match unit {
+                        egui::MouseWheelUnit::Point => delta.y,
+                        egui::MouseWheelUnit::Line => delta.y * metrics.h,
+                        egui::MouseWheelUnit::Page => delta.y * metrics.h * rows as f32,
+                    }),
+                    _ => None,
+                })
+                .sum::<f32>()
+        });
+        if wheel != 0.0 {
+            let lines = c
+                .state
+                .terms
+                .get_mut(surface)
+                .map(|tv| tv.accumulate_scroll(wheel, metrics.h))
+                .unwrap_or(0);
+            if lines != 0 {
+                let pty_attached = c.state.local_ptys.contains_key(surface);
+                let alt = c
+                    .state
+                    .terms
+                    .get(surface)
+                    .is_some_and(|tv| tv.mode().contains(TermMode::ALT_SCREEN));
+                if pty_attached && alt {
+                    // tmux drives this PTY through the alternate screen, which
+                    // keeps no history, so the local grid has nothing to scroll:
+                    // arrow keys are what the pane's application (and tmux's own
+                    // copy-mode) understands.
+                    let seq: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
+                    let mut bytes = Vec::with_capacity(3 * lines.unsigned_abs() as usize);
+                    for _ in 0..lines.unsigned_abs() {
+                        bytes.extend_from_slice(seq);
+                    }
+                    c.state.write_local(surface, &bytes);
+                } else if let Some(tv) = c.state.terms.get_mut(surface) {
+                    tv.scroll(lines);
+                }
             }
         }
     }

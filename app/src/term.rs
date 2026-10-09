@@ -39,6 +39,9 @@ pub struct TermView {
     term: Term<VoidListener>,
     processor: Processor,
     size: TermSize,
+    /// Wheel remainder: points that did not add up to a whole line yet, so a
+    /// trackpad's small deltas still scroll instead of rounding away to zero.
+    scroll_accum: f32,
     /// Wanted by the UI as visible (drives subscribe/unsubscribe).
     pub wants_visible: bool,
     /// Currently subscribed on the daemon.
@@ -56,6 +59,7 @@ impl TermView {
             term: new_term(size),
             processor: Processor::new(),
             size,
+            scroll_accum: 0.0,
             wants_visible: false,
             subscribed: false,
             have_snapshot: false,
@@ -102,6 +106,20 @@ impl TermView {
 
     pub fn scroll(&mut self, lines: i32) {
         self.term.scroll_display(Scroll::Delta(lines));
+    }
+
+    /// Turn a raw wheel delta in points into whole lines, keeping the remainder
+    /// for the next frame. Positive means the content moved down, i.e. the user
+    /// is scrolling back into history, which is `Scroll::Delta`'s positive
+    /// direction too.
+    pub fn accumulate_scroll(&mut self, points: f32, line_height: f32) -> i32 {
+        if line_height <= 0.0 {
+            return 0;
+        }
+        self.scroll_accum += points / line_height;
+        let whole = self.scroll_accum.trunc();
+        self.scroll_accum -= whole;
+        whole as i32
     }
 
     pub fn display_offset(&self) -> usize {
