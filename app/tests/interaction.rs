@@ -944,3 +944,49 @@ fn ctrl_c_is_sent_as_control_code() {
     assert_eq!(sent, vec!["\u{3}".to_owned()]);
 }
 
+
+#[test]
+fn fuzzy_matching_ranks_tight_matches_first() {
+    use lmux_app::ui::palette::fuzzy_score;
+    assert!(fuzzy_score("nw", "New Workspace").is_some());
+    assert!(fuzzy_score("zz", "New Workspace").is_none());
+    assert!(fuzzy_score("split r", "Split Right") > fuzzy_score("split r", "Split Down").or(Some(i32::MIN)));
+    assert!(fuzzy_score("new w", "New Workspace") > fuzzy_score("new w", "Next Workspace"));
+}
+
+fn type_and_enter(h: &mut Harness<Fixture>, text: &str) {
+    h.run();
+    h.input_mut().events.push(egui::Event::Text(text.into()));
+    h.run();
+    press(h, Modifiers::NONE, Key::Enter);
+}
+
+#[test]
+fn the_command_palette_runs_the_typed_command() {
+    let mut h = harness(fixture());
+    let mods = Modifiers { command: true, shift: true, ..Default::default() };
+    press(&mut h, mods, Key::P);
+    assert!(h.state().state.palette.is_some(), "Cmd+Shift+P opens the palette");
+    type_and_enter(&mut h, "split down");
+    let rpcs = rpc_methods(h.state());
+    let call = rpcs.iter().find(|(m, _)| m == "pane.split").expect("pane.split sent");
+    assert_eq!(call.1["side"], "down");
+    assert!(h.state().state.palette.is_none(), "running a command closes it");
+}
+
+#[test]
+fn go_to_workspace_selects_the_typed_workspace() {
+    let mut h = harness(fixture());
+    press(&mut h, Modifiers::COMMAND, Key::P);
+    type_and_enter(&mut h, "third");
+    assert_eq!(h.state().state.selected.as_deref(), Some("workspace:3"));
+}
+
+#[test]
+fn escape_closes_the_palette() {
+    let mut h = harness(fixture());
+    press(&mut h, Modifiers::COMMAND, Key::P);
+    h.run();
+    press(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().state.palette.is_none());
+}

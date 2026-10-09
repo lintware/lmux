@@ -5,6 +5,7 @@ pub mod browser;
 pub mod drag;
 pub mod icons;
 pub mod notifications;
+pub mod palette;
 pub mod pane;
 pub mod sidebar;
 pub mod tabstrip;

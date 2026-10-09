@@ -259,3 +259,44 @@ fn the_add_host_dialog_queues_the_typed_target() {
         st.actions
     );
 }
+
+/// Cmd+P lists every host's workspaces; picking the remote one selects it on
+/// the remote host, which asks to come on screen.
+#[test]
+fn go_to_workspace_reaches_another_host() {
+    let mut fx = fixture();
+    fx.hosts[1].state.selected = None;
+    fx.hosts[0].state.palette = Some(lmux_app::state::Palette {
+        mode: lmux_app::state::PaletteMode::Workspaces,
+        query: String::new(),
+        index: 0,
+    });
+    let mut h = harness(fx, 1.0);
+    h.run();
+    h.input_mut().events.push(egui::Event::Text("server".into()));
+    h.run();
+    h.input_mut().events.push(egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Default::default(),
+    });
+    h.run();
+    let fx = h.state();
+    assert_eq!(fx.hosts[1].state.selected.as_deref(), Some("workspace:1"));
+    assert!(fx.hosts[1].state.activated);
+    assert!(fx.hosts[0].state.palette.is_none());
+}
+
+#[test]
+fn snapshot_go_to_workspace_palette() {
+    let mut fx = fixture();
+    fx.hosts[0].state.palette = Some(lmux_app::state::Palette {
+        mode: lmux_app::state::PaletteMode::Workspaces,
+        query: String::new(),
+        index: 1,
+    });
+    let mut h = harness(fx, 2.0);
+    h.snapshot("palette_workspaces");
+}

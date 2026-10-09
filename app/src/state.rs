@@ -161,6 +161,8 @@ pub struct AppState {
     pub folder_rename: Option<FolderRename>,
     /// Inline rename of a workspace card's title (`folder` holds the workspace).
     pub ws_rename: Option<FolderRename>,
+    /// The command palette, while it is open.
+    pub palette: Option<Palette>,
     /// Terminal font size in points (Cmd+= / Cmd+- / Cmd+0).
     pub term_font: f32,
     /// The collapse flip the folder row's last click made, for the double click
@@ -220,6 +222,24 @@ pub enum Action {
     AddHost(String),
     /// Forget this host (the one whose state queued the action).
     RemoveHost,
+}
+
+/// What the palette lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteMode {
+    /// Cmd+Shift+P: commands.
+    Commands,
+    /// Cmd+P: every workspace on every host.
+    Workspaces,
+}
+
+/// The open command palette.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Palette {
+    pub mode: PaletteMode,
+    pub query: String,
+    /// The highlighted row in the filtered list.
+    pub index: usize,
 }
 
 /// Inline rename of a surface chip.
@@ -408,6 +428,7 @@ impl AppState {
             renaming: None,
             folder_rename: None,
             ws_rename: None,
+            palette: None,
             term_font: crate::theme::FS_TERM,
             folder_toggle: None,
             folder_rename_pending: None,

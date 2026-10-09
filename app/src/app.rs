@@ -505,6 +505,31 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
     }
     add_host_dialog(&ctx, c);
 
+    // The palette draws over everything; what it picks runs on its host.
+    let picked = {
+        let mut all: Vec<&mut ui::Ctx> = left.iter_mut().collect();
+        let at = all.len();
+        all.push(&mut *c);
+        all.extend(right.iter_mut());
+        ui::palette::show(ui, full, &mut all, at)
+    };
+    match picked {
+        Some(ui::palette::Pick::Command(name)) => run_command(c, name),
+        Some(ui::palette::Pick::Workspace(host, id)) => {
+            let target = if host < active {
+                left.get_mut(host)
+            } else if host == active {
+                Some(&mut *c)
+            } else {
+                right.get_mut(host - active - 1)
+            };
+            if let Some(h) = target {
+                h.state.select_workspace(&id);
+            }
+        }
+        None => {}
+    }
+
     // Drag feedback runs last, over everything a drag can land on. The sidebar
     // rows and the panes have both been drawn, so one pass resolves against the
     // geometry on screen and the ghost is free to cross between them. A row
@@ -579,6 +604,21 @@ pub fn shortcuts(ctx: &egui::Context, c: &mut ui::Ctx) {
     // Notifications: jump to the newest unread.
     if key(cmd_shift, Key::U) {
         c.state.jump_to_unread();
+    }
+    // The palette: commands, or go to a workspace.
+    if key(cmd_shift, Key::P) {
+        c.state.palette = Some(crate::state::Palette {
+            mode: crate::state::PaletteMode::Commands,
+            query: String::new(),
+            index: 0,
+        });
+    }
+    if key(cmd, Key::P) {
+        c.state.palette = Some(crate::state::Palette {
+            mode: crate::state::PaletteMode::Workspaces,
+            query: String::new(),
+            index: 0,
+        });
     }
 
     if key(cmd, Key::D) {
@@ -808,5 +848,64 @@ fn add_host_dialog(ctx: &egui::Context, c: &mut ui::Ctx) {
         c.state.add_host_draft = None;
     } else {
         c.state.add_host_draft = Some(draft);
+    }
+}
+
+/// Run a palette command on the host on screen. Names are those in
+/// `ui::palette::COMMANDS`.
+pub fn run_command(c: &mut ui::Ctx, name: &str) {
+    let focused_pane = c.state.focused_pane();
+    let active_surface = focused_pane
+        .as_deref()
+        .and_then(|p| c.state.pane(p))
+        .and_then(|p| c.state.active_surface(p));
+    match name {
+        "New Workspace" => {
+            let folder = c.state.default_new_folder();
+            c.state.new_session(folder);
+        }
+        "Rename Workspace" => c.state.begin_ws_rename(None),
+        "Close Workspace" => {
+            if let Some(ws) = c.state.selected.clone() {
+                c.state.rpc(m::WORKSPACE_CLOSE, serde_json::json!({ "workspace": ws }));
+            }
+        }
+        "Next Workspace" => c.state.cycle_workspace(1),
+        "Previous Workspace" => c.state.cycle_workspace(-1),
+        "New Terminal Tab" => {
+            if let Some(p) = &focused_pane {
+                c.state.new_terminal_chip(p);
+            }
+        }
+        "New Browser Tab" => {
+            if let Some(p) = &focused_pane {
+                c.state.new_browser_chip(p);
+            }
+        }
+        "Rename Tab" => {
+            if let Some(sid) = &active_surface {
+                let title = c.state.surface(sid).map(|s| s.title.clone()).unwrap_or_default();
+                c.state.begin_rename(sid, &title);
+            }
+        }
+        "Close Tab" => c.state.close_active_chip(),
+        "Next Tab" => c.state.cycle_tab(1),
+        "Previous Tab" => c.state.cycle_tab(-1),
+        "Split Right" => split(c, &focused_pane, &active_surface, "right"),
+        "Split Down" => split(c, &focused_pane, &active_surface, "down"),
+        "Toggle Sidebar" => c.state.sidebar_hidden = !c.state.sidebar_hidden,
+        "Show Notifications" => c.state.notif_open = true,
+        "Jump to Latest Unread" => {
+            c.state.jump_to_unread();
+        }
+        "New Folder" => {
+            let parent = c.state.default_new_folder();
+            c.state.new_folder(parent);
+        }
+        "Add Remote Host…" => c.state.add_host_draft = Some(String::new()),
+        "Zoom In" => c.state.zoom_terminal(1.0),
+        "Zoom Out" => c.state.zoom_terminal(-1.0),
+        "Reset Zoom" => c.state.zoom_terminal(0.0),
+        _ => {}
     }
 }
