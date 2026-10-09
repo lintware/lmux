@@ -462,7 +462,53 @@ pub(crate) async fn spawn_terminal_env(
     Ok((window, pane))
 }
 
+/// Turn the target params people type into refs: a bare number names that
+/// ref (`2` is `workspace:2`), and a workspace may also be named by its title.
+/// An explicit workspace that matches nothing is an error here, so it is not
+/// reported later as a missing surface or pane.
+fn normalize_targets(state: &crate::tree::SessionState, params: &mut Value) -> Result<(), RpcError> {
+    let Some(obj) = params.as_object_mut() else {
+        return Ok(());
+    };
+    for key in ["surface", "pane"] {
+        if let Some(Value::String(v)) = obj.get_mut(key) {
+            if !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit()) {
+                *v = format!("{key}:{v}");
+            }
+        }
+    }
+    let Some(Value::String(ws)) = obj.get("workspace") else {
+        return Ok(());
+    };
+    if state.workspace(ws).is_some() {
+        return Ok(());
+    }
+    let numbered = format!("workspace:{ws}");
+    let found = if !ws.is_empty() && ws.bytes().all(|c| c.is_ascii_digit()) && state.workspace(&numbered).is_some() {
+        numbered
+    } else {
+        let named: Vec<&Ref> = state.workspaces.iter().filter(|w| &w.title == ws).map(|w| &w.id).collect();
+        match named.as_slice() {
+            [one] => (*one).clone(),
+            [] => return Err(not_found(format!("workspace {ws} not found"))),
+            many => {
+                return Err(RpcError {
+                    code: RpcErrorCode::InvalidParams,
+                    message: format!("{} workspaces are named {ws:?}; use a ref like {}", many.len(), many[0]),
+                })
+            }
+        }
+    };
+    obj.insert("workspace".into(), Value::String(found));
+    Ok(())
+}
+
 pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
+    let mut params = req.params.clone();
+    if let Err(e) = normalize_targets(&*inner.state.lock().await, &mut params) {
+        return RpcResponse { id: req.id, result: None, error: Some(e) };
+    }
+    let req = &RpcRequest { id: req.id, method: req.method.clone(), params };
     // Creates move focus to what they make, unless asked not to (`focus: false`,
     // cmux's `--focus false`): then the workspace's focus is put back after.
     let creates = [methods::SPLIT_NEW, methods::SURFACE_NEW, methods::BROWSER_OPEN];
@@ -1946,6 +1992,25 @@ mod tests {
         assert!(resolve_surface(&s, &json!({"surface": "surface:9"})).is_none());
         assert!(resolve_pane(&s, &json!({"pane": "pane:9"})).is_none());
         assert!(resolve_workspace(&s, &json!({"workspace": "workspace:9"})).is_none());
+    }
+
+    #[test]
+    fn targets_by_number_or_title() {
+        let (mut s, ws2, ..) = two_workspaces();
+        let norm = |s: &SessionState, p: Value| {
+            let mut p = p;
+            normalize_targets(s, &mut p).map(|_| p).map_err(|e| e.message)
+        };
+        let n = ws2.trim_start_matches("workspace:");
+        assert_eq!(norm(&s, json!({"workspace": n})).unwrap()["workspace"], ws2.as_str());
+        assert_eq!(norm(&s, json!({"workspace": "w2"})).unwrap()["workspace"], ws2.as_str());
+        assert_eq!(norm(&s, json!({"surface": "3", "pane": "2"})).unwrap(), json!({"surface": "surface:3", "pane": "pane:2"}));
+        // A workspace that is not there says so, rather than "surface not found".
+        assert_eq!(norm(&s, json!({"workspace": "workspace:9"})).unwrap_err(), "workspace workspace:9 not found");
+        assert_eq!(norm(&s, json!({"workspace": "nope"})).unwrap_err(), "workspace nope not found");
+        // Two workspaces with one title: ask for a ref.
+        s.workspaces[0].title = "w2".into();
+        assert!(norm(&s, json!({"workspace": "w2"})).unwrap_err().contains("2 workspaces are named"));
     }
 
     #[test]

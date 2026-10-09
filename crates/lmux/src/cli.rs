@@ -77,7 +77,8 @@ Other:
   help                       Print help for a command
 
 Targets: --workspace/--surface/--pane take refs such as workspace:2, surface:5,
-pane:3. Left out, they mean the caller's own (from $LMUX_SURFACE_ID and
+pane:3, or just the number (2). A workspace can also be named by its title.
+Left out, they mean the caller's own (from $LMUX_SURFACE_ID and
 $LMUX_WORKSPACE_ID), else what is focused.";
 
 #[derive(Parser, Debug)]
