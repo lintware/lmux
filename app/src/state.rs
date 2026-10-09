@@ -165,6 +165,11 @@ pub struct AppState {
     pending_closes: HashMap<u64, CloseTarget>,
     /// The "still running" question, while it is open.
     pub confirm_close: Option<ConfirmClose>,
+    /// Animate (the running-agent spinner). The app turns it on; tests keep
+    /// still frames.
+    pub animate: bool,
+    /// While Cmd is held, cards of the host on screen show their ⌘1…9 key.
+    pub digit_hints: bool,
     /// The pane shown alone over its workspace (Cmd+Shift+Enter), if any.
     pub zoomed_pane: Option<Ref>,
     /// The command palette, while it is open.
@@ -451,6 +456,8 @@ impl AppState {
             ws_rename: None,
             palette: None,
             zoomed_pane: None,
+            digit_hints: false,
+            animate: false,
             pending_closes: HashMap::new(),
             confirm_close: None,
             term_font: crate::theme::FS_TERM,
@@ -777,11 +784,17 @@ impl AppState {
     }
 
     /// Workspaces in the order the sidebar shows them: each folder's nested
-    /// folders and then its own sessions, depth first, then the top level.
-    /// Cmd+1…9 and next/previous workspace follow this order.
+    /// folders and then its own sessions, depth first, then the top level;
+    /// folded folders' sessions are left out. Cmd+1…9 and next/previous
+    /// workspace follow this order.
     pub fn sidebar_order(&self) -> Vec<Ref> {
         fn walk(st: &AppState, parent: Option<&str>, out: &mut Vec<Ref>) {
             for f in st.tree.folders.iter().filter(|f| f.parent.as_deref() == parent) {
+                // A folded folder's sessions are not on screen, so they get
+                // no number, as in cmux.
+                if f.collapsed || st.collapsed.contains(&f.id) {
+                    continue;
+                }
                 walk(st, Some(&f.id), out);
                 out.extend(
                     st.tree
@@ -796,8 +809,10 @@ impl AppState {
         walk(self, None, &mut out);
         out.extend(self.tree.workspaces.iter().filter(|w| w.folder.is_none()).map(|w| w.id.clone()));
         // A workspace whose folder is unknown still gets a place.
+        let known: std::collections::HashSet<&str> = self.tree.folders.iter().map(|f| f.id.as_str()).collect();
         for w in &self.tree.workspaces {
-            if !out.contains(&w.id) {
+            let orphan = w.folder.as_deref().is_some_and(|f| !known.contains(f));
+            if orphan && !out.contains(&w.id) {
                 out.push(w.id.clone());
             }
         }

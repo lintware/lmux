@@ -1070,3 +1070,16 @@ fn closing_a_busy_tab_asks_first() {
     assert!(call.1.get("if_idle").is_none(), "the second close is unconditional");
     assert!(h.state().state.confirm_close.is_none());
 }
+
+/// Holding Cmd shows each card's ⌘ digit; a folded folder rolls up unread.
+#[test]
+fn snapshot_cmd_hints_and_folded_unread() {
+    let mut fx = fixture();
+    fx.state.tree.workspaces[1].unread_notifications = 3;
+    fx.state.collapsed.insert("folder:2".into());
+    let mut h = harness(fx);
+    h.input_mut().events.push(egui::Event::ModifiersChanged(Modifiers::COMMAND));
+    h.step();
+    assert!(h.state().state.digit_hints);
+    h.snapshot("sidebar_cmd_hints");
+}

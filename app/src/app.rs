@@ -65,6 +65,7 @@ impl LmuxApp {
                 let mut state = AppState::new();
                 // Local PTY readers wake the UI when their pane produces output.
                 state.set_wake(cc.egui_ctx.clone());
+                state.animate = true;
                 if multi {
                     state.host_salt = net.host_name();
                 }
@@ -379,6 +380,7 @@ impl LmuxApp {
         net.set_wake(ctx.clone());
         let mut state = AppState::new();
         state.set_wake(ctx.clone());
+        state.animate = true;
         net.begin_connect(ctx);
         self.hosts.push(HostSession { state, net, was_connected: false });
         self.reindex(&configs);

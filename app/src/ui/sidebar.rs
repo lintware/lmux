@@ -162,6 +162,8 @@ fn body(ui: &mut Ui, rect: Rect, hosts: &mut [Ctx], active: usize) {
 
 /// One host's folders and cards. Only the host on screen shows a selected card.
 fn host_list(ui: &mut Ui, c: &mut Ctx, is_active: bool, multi: bool) {
+    // Holding Cmd shows which digit selects each card, as in cmux.
+    c.state.digit_hints = is_active && ui.input(|i| i.modifiers.command && !i.modifiers.shift);
     let folders = c.state.tree.folders.clone();
     let workspaces = c.state.tree.workspaces.clone();
     let selected = if is_active { c.state.selected.clone() } else { None };
@@ -384,6 +386,16 @@ fn folder_row(
         c.state.toggle_folder(&folder.id, ui.input(|i| i.time));
     }
 
+    // Unread notifications inside a folded folder (nested folders included),
+    // so it still says something needs you; an open one shows its cards'.
+    let unread = if collapsed { folder_unread(&c.state.tree, &folder.id) } else { 0 };
+    let plus_hover_zone = resp.hovered();
+    if unread > 0 && !(c.state.tab_drag.is_none() && plus_hover_zone) {
+        let badge = egui::pos2(inner.max.x - 12.0, cy);
+        painter.circle_filled(badge, 8.0, theme::BADGE);
+        painter.text(badge, Align2::CENTER_CENTER, unread.to_string(), theme::ui(theme::FS_TINY), Color32::WHITE);
+    }
+
     // The row's own `+`: a session in this folder, without leaving the row.
     // Registered after the row, so it takes the click inside its own rect, and
     // hidden while a row is being dragged so it cannot read as a drop target.
@@ -414,6 +426,20 @@ fn folder_row(
 
     folder_menu(&resp, folder, c);
     collapsed
+}
+
+/// Unread notifications of every session in `folder` and the folders inside it.
+fn folder_unread(tree: &lmux_proto::Tree, folder: &str) -> u32 {
+    let mut total: u32 = tree
+        .workspaces
+        .iter()
+        .filter(|w| w.folder.as_deref() == Some(folder))
+        .map(|w| w.unread_notifications)
+        .sum();
+    for child in tree.folders.iter().filter(|f| f.parent.as_deref() == Some(folder)) {
+        total += folder_unread(tree, &child.id);
+    }
+    total
 }
 
 /// The folder row's own menu: everything acts on this folder.
@@ -674,7 +700,16 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
     if let Some(color) = agent_color(ws.agent) {
         // Idle's accent blue is the selected card's own colour: go white there.
         let color = if selected && color == theme::ACCENT { Color32::WHITE } else { color };
-        icons::dot(&p, egui::pos2(x + 3.0, y + 6.0), 3.0, color);
+        if ws.agent == AgentState::Running {
+            // A running agent spins, so activity reads at a glance.
+            let phase = if c.state.animate { (ui.input(|i| i.time) * 0.8).fract() as f32 } else { 0.0 };
+            icons::spinner(&p, egui::pos2(x + 3.0, y + 7.0), 4.0, color, phase);
+            if c.state.animate {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        } else {
+            icons::dot(&p, egui::pos2(x + 3.0, y + 6.0), 3.0, color);
+        }
         p.text(
             egui::pos2(x + 12.0, y),
             Align2::LEFT_TOP,
@@ -812,6 +847,31 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
         p.rect_filled(bar, CornerRadius::same(2), track);
         let filled = Rect::from_min_size(bar.min, Vec2::new(bar.width() * progress.value.clamp(0.0, 1.0), bar.height()));
         p.rect_filled(filled, CornerRadius::same(2), if selected { Color32::WHITE } else { theme::ACCENT });
+    }
+
+    // ⌘N while Cmd is held: the key that selects this card (9 is the last).
+    if c.state.digit_hints {
+        let order = c.state.sidebar_order();
+        let pos = order.iter().position(|w| *w == ws.id);
+        let digit = match pos {
+            Some(i) if i < 8 => Some(i + 1),
+            Some(i) if i + 1 == order.len() => Some(9),
+            _ => None,
+        };
+        if let Some(d) = digit {
+            let text = format!("⌘{d}");
+            let font = theme::ui_semibold(theme::FS_TINY);
+            let w = crate::util::measure(ui.ctx(), &text, &font) + 10.0;
+            let right = rect.max.x - if ws.unread_notifications > 0 { 26.0 } else { 6.0 };
+            let pill = Rect::from_min_size(egui::pos2(right - w, rect.min.y + 4.0), Vec2::new(w, 15.0));
+            let (fill, fg) = if selected {
+                (Color32::from_white_alpha(60), Color32::WHITE)
+            } else {
+                (Color32::from_white_alpha(22), theme::TEXT_SOFT)
+            };
+            p.rect_filled(pill, CornerRadius::same(7), fill);
+            p.text(pill.center(), Align2::CENTER_CENTER, text, font, fg);
+        }
     }
 
     // Unread badge, top right.
