@@ -14,6 +14,9 @@ use crate::wire::{self, m, ClientMsg, Ref};
 /// How long to wait before attaching a local pane again after its tmux client
 /// died, so a tmux that cannot serve the pane is not respawned every frame.
 const LOCAL_PTY_RETRY: Duration = Duration::from_secs(1);
+/// How long a hidden streamed terminal keeps its view. Showing it again
+/// within this is instant; later, it comes back from a fresh snapshot.
+const HIDDEN_VIEW_TTL: Duration = Duration::from_secs(60);
 
 /// What to do with the reply to a browser request.
 #[derive(Debug, Clone, PartialEq)]
@@ -1666,11 +1669,18 @@ impl AppState {
     /// Terminals the daemon streams: subscribe while visible, unsubscribe while
     /// hidden, and let the daemon resize their tmux windows.
     fn sync_streamed_terms(&mut self, visible: &HashSet<Ref>) {
+        // Views hidden for a while go: each holds a screen and its history,
+        // and every terminal ever shown used to stay in memory.
+        let now = Instant::now();
+        self.terms.retain(|id, t| {
+            visible.contains(id) || t.hidden_since.is_none_or(|h| now.duration_since(h) < HIDDEN_VIEW_TTL)
+        });
         let ids: Vec<Ref> = self.terms.keys().cloned().collect();
         for id in &ids {
             let visible_now = visible.contains(id);
             let Some(t) = self.terms.get_mut(id) else { continue };
             t.wants_visible = visible_now;
+            t.hidden_since = if visible_now { None } else { t.hidden_since.or(Some(now)) };
             if visible_now && !t.subscribed {
                 t.subscribed = true;
                 self.pending.push(ClientMsg::Subscribe { surface: id.clone(), history: None });
@@ -2054,6 +2064,26 @@ mod tests {
         assert_eq!(s.terms["surface:1"].display_offset(), 0);
     }
 
+
+    /// A streamed terminal hidden for a while gives up its view; shown again,
+    /// it subscribes afresh and the snapshot brings the screen back.
+    #[test]
+    fn long_hidden_streamed_views_are_dropped() {
+        let mut s = AppState::new();
+        s.ensure_term("a");
+        s.sync_streamed_terms(&HashSet::from(["a".to_owned()]));
+        assert!(s.terms["a"].subscribed);
+        s.sync_streamed_terms(&HashSet::new());
+        assert!(!s.terms["a"].subscribed, "hidden: unsubscribed");
+        assert!(s.terms.contains_key("a"), "a recently hidden view is kept");
+        s.terms.get_mut("a").unwrap().hidden_since = Some(Instant::now() - HIDDEN_VIEW_TTL - Duration::from_secs(1));
+        s.sync_streamed_terms(&HashSet::new());
+        assert!(!s.terms.contains_key("a"), "a long-hidden view is dropped");
+        s.pending.clear();
+        s.ensure_term("a");
+        s.sync_streamed_terms(&HashSet::from(["a".to_owned()]));
+        assert!(s.pending.iter().any(|m| matches!(m, ClientMsg::Subscribe { surface, .. } if surface == "a")));
+    }
 
     /// Terminals that asked for focus events hear when they gain or lose the
     /// keyboard; the rest are never sent a report.

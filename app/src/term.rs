@@ -73,6 +73,9 @@ pub struct TermView {
     pub wants_visible: bool,
     /// Currently subscribed on the daemon.
     pub subscribed: bool,
+    /// When a streamed view was last hidden; it is dropped after a while
+    /// (see `AppState::sync_streamed_terms`).
+    pub hidden_since: Option<std::time::Instant>,
     /// True once a `term_snapshot` has been written.
     pub have_snapshot: bool,
     /// The surface reported exit.
@@ -117,6 +120,7 @@ impl TermView {
             history_scroll: None,
             wants_visible: false,
             subscribed: false,
+            hidden_since: None,
             have_snapshot: false,
             exited: false,
             pointer: PointerState::default(),
@@ -301,7 +305,11 @@ fn side(right_half: bool) -> Side {
 }
 
 fn new_term(size: TermSize, listener: Listener) -> Term<Listener> {
-    let config = Config { scrolling_history: 10_000, ..Config::default() };
+    // A view's own history only needs to hold what scrolling back fetches
+    // from tmux (which keeps 50,000 lines): a full 10,000-line history cost
+    // 32-51 MB per view. Local panes are drawn by tmux on the alternate
+    // screen and keep none.
+    let config = Config { scrolling_history: crate::state::STREAMED_HISTORY as usize, ..Config::default() };
     Term::new(config, &size, listener)
 }
 
