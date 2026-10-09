@@ -21,7 +21,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::browser::BrowserBackend;
 use crate::tmux::{Tmux, TmuxConfig, TmuxEvent};
-use crate::tree::{terminal_surface, SessionState, TermMeta};
+use crate::tmux::WinInfo;
+use crate::tree::{terminal_surface, AgentSession, SessionState, TermMeta};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -73,6 +74,16 @@ const BRANCH_REFRESH: Duration = Duration::from_secs(5);
 
 /// Persist debounce: coalesce a burst of changes into one write.
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// How often live panes are checked for cwd changes and exited agents.
+const RESUME_REFRESH: Duration = Duration::from_secs(30);
+
+/// After typing `claude --resume`, the pane shows a shell until Claude starts.
+/// Within this window a shell foreground does not mean "Claude exited".
+const RESUME_GRACE: Duration = Duration::from_secs(30);
+
+/// Pause between resumed agents, so ten panes do not start Claude at once.
+const RESUME_STAGGER: Duration = Duration::from_millis(750);
 
 /// Per-client queue cap (messages). Past this the client is lagging; we drop its
 /// backlog rather than growing without bound while the laptop is asleep.
@@ -246,6 +257,51 @@ pub struct Inner {
     dirty: Notify,
     /// Wakes the tree-coalescing task.
     tree_dirty: Notify,
+    /// Respawn bookkeeping (see `reconcile`).
+    respawn: std::sync::Mutex<RespawnState>,
+}
+
+#[derive(Default)]
+struct RespawnState {
+    /// Surfaces with a respawn in flight, so a second reconcile skips them.
+    in_flight: HashSet<Ref>,
+    /// When an agent was last typed into a respawned pane (see `RESUME_GRACE`).
+    resumed_at: HashMap<Ref, Instant>,
+}
+
+/// A terminal whose tmux pane is gone and must be started again.
+struct Respawn {
+    surface: Ref,
+    workspace: Ref,
+    title: String,
+    cols: u16,
+    rows: u16,
+    cwd: Option<String>,
+    workspace_cwd: String,
+    agent: Option<AgentSession>,
+}
+
+/// Foreground command names that mean "only the shell is running".
+fn is_shell(command: &str) -> bool {
+    matches!(
+        command.trim_start_matches('-'),
+        "bash" | "zsh" | "fish" | "sh" | "dash" | "ksh" | "tcsh" | "csh" | "nu"
+    )
+}
+
+/// Parse a tmux `@lmux_agent_session` value, `<agent>:<id>`.
+fn parse_agent_tag(tag: &str) -> Option<AgentSession> {
+    let (agent, id) = tag.split_once(':')?;
+    (agent == "claude" && crate::tree::valid_agent_session_id(id)).then(|| AgentSession {
+        agent: agent.to_string(),
+        id: id.to_string(),
+    })
+}
+
+/// The command typed into a respawned pane to resume an agent.
+fn resume_command(a: &AgentSession) -> Option<String> {
+    (a.agent == "claude" && crate::tree::valid_agent_session_id(&a.id))
+        .then(|| format!("claude --resume {}\r", a.id))
 }
 
 impl Inner {
@@ -512,26 +568,51 @@ impl Inner {
         };
         let live: HashSet<String> = wins.iter().map(|w| w.pane.clone()).collect();
         let has_browser = self.browser.is_some();
+        let mut respawn: Vec<Respawn> = Vec::new();
         {
             let mut state = self.state.lock().await;
+            let in_flight = self.respawn.lock().unwrap().in_flight.clone();
 
-            // 1. Drop surfaces whose tmux pane is gone; refresh live ones.
+            // 1. Refresh live terminals. A terminal whose tmux pane is gone was
+            //    not closed by the user (that path is `handle_window_closed`):
+            //    tmux itself went away, so start it again rather than drop it.
             let surfaces = state.all_surface_refs();
             for surf in surfaces {
-                let kind = state.surface(&surf).map(|s| s.kind.clone());
+                let kind = state.surface(&surf).map(|s| (s.kind.clone(), s.title.clone()));
                 match kind {
-                    Some(SurfaceKind::Terminal { tmux_pane, .. }) => match tmux_pane {
+                    Some((SurfaceKind::Terminal { tmux_pane, cols, rows }, title)) => match tmux_pane {
                         Some(p) if live.contains(&p) => {
                             if let Some(w) = wins.iter().find(|w| w.pane == p) {
                                 state.set_pane_surface_size(&surf, w.cols, w.rows);
                                 state.set_term(&surf, &w.window, &p);
+                                self.observe_live(&mut state, &surf, w);
                             }
                         }
                         _ => {
-                            state.remove_surface(&surf);
+                            if in_flight.contains(&surf) {
+                                continue;
+                            }
+                            let Some(ws) = state.workspace_of_surface(&surf) else {
+                                continue;
+                            };
+                            let workspace_cwd = state
+                                .workspace(&ws)
+                                .map(|w| w.cwd.clone())
+                                .unwrap_or_default();
+                            let r = state.resume.get(&surf).cloned().unwrap_or_default();
+                            respawn.push(Respawn {
+                                surface: surf.clone(),
+                                workspace: ws,
+                                title,
+                                cols,
+                                rows,
+                                cwd: r.cwd,
+                                workspace_cwd,
+                                agent: r.agent,
+                            });
                         }
                     },
-                    Some(SurfaceKind::Browser { .. }) => {
+                    Some((SurfaceKind::Browser { .. }, _)) => {
                         if !has_browser {
                             state.remove_surface(&surf);
                         }
@@ -607,13 +688,199 @@ impl Inner {
                 }
                 state.workspace_mut(&ws_ref).unwrap().focused_pane = Some(pane_ref.clone());
                 state.set_term(&surf, &w.window, &w.pane);
+                self.observe_live(&mut state, &surf, w);
             }
 
             if state.selected_workspace.is_none() {
                 state.selected_workspace = state.workspaces.first().map(|w| w.id.clone());
             }
+            state.prune_resume();
         }
-        tracing::info!(windows = wins.len(), "reconciled with tmux");
+        tracing::info!(windows = wins.len(), respawn = respawn.len(), "reconciled with tmux");
+        if !respawn.is_empty() {
+            {
+                let mut r = self.respawn.lock().unwrap();
+                for x in &respawn {
+                    r.in_flight.insert(x.surface.clone());
+                }
+            }
+            // In the background: starting ten agents one after another must not
+            // hold up the app websocket.
+            let me = self.clone();
+            tokio::spawn(async move { me.respawn_terminals(respawn).await });
+        }
+        self.mark_dirty();
+    }
+
+    /// Record a live pane's cwd, pick up an agent tag the state file lost, and
+    /// forget an agent that has exited (its shell is back in the foreground).
+    fn observe_live(&self, state: &mut SessionState, surf: &str, w: &WinInfo) {
+        let in_grace = self
+            .respawn
+            .lock()
+            .unwrap()
+            .resumed_at
+            .get(surf)
+            .is_some_and(|t| t.elapsed() < RESUME_GRACE);
+        let r = state.resume_mut(surf);
+        if let Some(cwd) = &w.cwd {
+            r.cwd = Some(cwd.clone());
+        }
+        if r.agent.is_none() {
+            r.agent = w.agent_session.as_deref().and_then(parse_agent_tag);
+        }
+        if r.agent.is_some() && !in_grace && w.command.as_deref().is_some_and(is_shell) {
+            // Claude was quit on purpose: a reboot must not bring it back.
+            r.agent = None;
+            let me_tmux = self.tmux.clone();
+            let window = w.window.clone();
+            tokio::spawn(async move {
+                let _ = me_tmux.set_window_option(&window, "@lmux_agent_session", "").await;
+            });
+        }
+    }
+
+    /// Periodic cwd / agent-exit refresh for live panes.
+    async fn refresh_resume(self: &Arc<Self>) {
+        let Ok(wins) = self.tmux.list_windows().await else {
+            return;
+        };
+        let before;
+        let after;
+        {
+            let mut state = self.state.lock().await;
+            before = state.resume.clone();
+            for w in &wins {
+                if let Some(surf) = state.pane_index.get(&w.pane).cloned() {
+                    self.observe_live(&mut state, &surf, w);
+                }
+            }
+            after = state.resume.clone();
+        }
+        if before != after {
+            self.mark_dirty();
+        }
+    }
+
+    /// Start lost terminals again in their old directories, typing the agent's
+    /// resume command where one was running. Each agent session resumes in at
+    /// most one pane; duplicates get a plain shell.
+    async fn respawn_terminals(self: Arc<Self>, list: Vec<Respawn>) {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut resumed = 0usize;
+        let mut missing_dirs: Vec<String> = Vec::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        let is_dir = |d: &str| !d.is_empty() && std::path::Path::new(d).is_dir();
+        for r in list {
+            let saved_dir_gone = r.cwd.as_deref().is_some_and(|d| !is_dir(d));
+            let cwd = r
+                .cwd
+                .clone()
+                .filter(|d| is_dir(d))
+                .or_else(|| Some(r.workspace_cwd.clone()).filter(|d| is_dir(d)))
+                .unwrap_or_else(|| home.clone());
+            let spawned = crate::rpc::spawn_terminal(
+                &self, &r.workspace, &r.surface, &r.title, &cwd, None, r.cols, r.rows,
+            )
+            .await;
+            let (window, pane) = match spawned {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::warn!(surface = %r.surface, "respawn failed: {e}");
+                    self.respawn.lock().unwrap().in_flight.remove(&r.surface);
+                    continue;
+                }
+            };
+            let agent = r
+                .agent
+                .clone()
+                .filter(|_| !saved_dir_gone)
+                .filter(|a| resume_command(a).is_some() && seen.insert(a.id.clone()));
+            match agent {
+                Some(a) => {
+                    // Let the shell come up before typing into it.
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let cmd = resume_command(&a).unwrap_or_default();
+                    if let Err(e) = self.tmux.send_bytes(&pane, cmd.as_bytes()).await {
+                        tracing::warn!(surface = %r.surface, "typing resume failed: {e}");
+                    }
+                    let _ = self
+                        .tmux
+                        .set_window_option(&window, "@lmux_agent_session", &format!("{}:{}", a.agent, a.id))
+                        .await;
+                    self.respawn
+                        .lock()
+                        .unwrap()
+                        .resumed_at
+                        .insert(r.surface.clone(), Instant::now());
+                    resumed += 1;
+                    tracing::info!(surface = %r.surface, session = %a.id, "resumed agent");
+                    tokio::time::sleep(RESUME_STAGGER).await;
+                }
+                None => {
+                    if saved_dir_gone && r.agent.is_some() {
+                        missing_dirs.push(r.title.clone());
+                    }
+                    let mut state = self.state.lock().await;
+                    state.resume_mut(&r.surface).agent = None;
+                }
+            }
+            self.respawn.lock().unwrap().in_flight.remove(&r.surface);
+            self.resnapshot_subscribers(&r.surface).await;
+            self.tree_changed();
+        }
+        self.mark_dirty();
+        let mut lines = Vec::new();
+        if resumed > 0 {
+            lines.push(format!(
+                "Resumed {resumed} Claude session{} after tmux restarted.",
+                if resumed == 1 { "" } else { "s" }
+            ));
+        }
+        if !missing_dirs.is_empty() {
+            lines.push(format!(
+                "Could not resume in {}: saved directory is gone.",
+                missing_dirs.join(", ")
+            ));
+        }
+        if !lines.is_empty() {
+            let req = RpcRequest {
+                id: 0,
+                method: methods::NOTIFY.to_string(),
+                params: json!({"title": "lmux", "body": lines.join(" ")}),
+            };
+            crate::rpc::dispatch(&self, &req).await;
+        }
+    }
+
+    /// Clients still subscribed to a respawned terminal hold the old screen;
+    /// send each a snapshot of the new pane.
+    async fn resnapshot_subscribers(self: &Arc<Self>, surface: &str) {
+        let ids: Vec<u64> = {
+            let c = self.clients.lock().await;
+            c.subs.get(surface).map(|s| s.iter().copied().collect()).unwrap_or_default()
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let Some(term) = self.state.lock().await.term_cloned(surface) else {
+            return;
+        };
+        let Ok((cols, rows, data)) = self.tmux.snapshot(&term.pane).await else {
+            return;
+        };
+        for id in ids {
+            self.push_to_client(
+                id,
+                Out::Msg(ServerMsg::TermSnapshot {
+                    surface: surface.to_string(),
+                    cols,
+                    rows,
+                    data: data.clone(),
+                }),
+            )
+            .await;
+        }
     }
 
     async fn handle_window_closed(self: &Arc<Self>, window: &str) {
@@ -668,6 +935,7 @@ pub async fn run(cfg: Config, browser: Option<Arc<dyn BrowserBackend>>) -> anyho
         clients: Mutex::new(Clients::default()),
         dirty: Notify::new(),
         tree_dirty: Notify::new(),
+        respawn: std::sync::Mutex::new(RespawnState::default()),
     });
 
     tokio::spawn(tmux_event_loop(inner.clone(), ev_rx));
@@ -713,6 +981,19 @@ pub async fn run(cfg: Config, browser: Option<Arc<dyn BrowserBackend>>) -> anyho
                     let tree = me.tree().await;
                     me.broadcast(Out::Msg(ServerMsg::Tree { tree })).await;
                 }
+            }
+        });
+    }
+
+    // cwd and agent-exit tracking for respawn after tmux is lost.
+    {
+        let me = inner.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(RESUME_REFRESH);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                me.refresh_resume().await;
             }
         });
     }
@@ -1218,6 +1499,43 @@ mod tests {
         let v = with_caller(json!({}), Some("workspace:2"), Some("surface:3"));
         assert_eq!(v["caller_workspace"], "workspace:2");
         assert_eq!(v["caller_surface"], "surface:3");
+    }
+
+    #[test]
+    fn agent_tags_and_ids() {
+        let a = parse_agent_tag("claude:0b6f7c1e-1a2b-4c3d-9e8f-001122334455").unwrap();
+        assert_eq!(a.agent, "claude");
+        assert_eq!(
+            resume_command(&a).unwrap(),
+            "claude --resume 0b6f7c1e-1a2b-4c3d-9e8f-001122334455\r"
+        );
+        assert!(parse_agent_tag("").is_none());
+        assert!(parse_agent_tag("codex:abc").is_none());
+        assert!(parse_agent_tag("claude:").is_none());
+        assert!(parse_agent_tag("claude:abc; rm -rf ~").is_none());
+        assert!(parse_agent_tag("claude:abc\ndef").is_none());
+        assert!(!crate::tree::valid_agent_session_id(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn shell_detection() {
+        for sh in ["zsh", "-zsh", "bash", "fish", "sh"] {
+            assert!(is_shell(sh), "{sh}");
+        }
+        for cmd in ["claude", "node", "vim", "python3"] {
+            assert!(!is_shell(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn old_state_without_resume_loads() {
+        let json = r#"{"host":"h","workspaces":[],"selected_workspace":null}"#;
+        let s: SessionState = serde_json::from_str(json).unwrap();
+        assert!(s.resume.is_empty());
+        let mut s = s;
+        s.resume_mut("surface:9").cwd = Some("/tmp".into());
+        s.prune_resume();
+        assert!(s.resume.is_empty(), "entries for unknown surfaces are pruned");
     }
 
     #[test]

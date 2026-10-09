@@ -978,6 +978,16 @@ async fn call(socket: &str, method: &str, mut params: Value) -> anyhow::Result<V
     let stream = tokio::net::UnixStream::connect(socket)
         .await
         .with_context(|| format!("connecting to daemon socket {socket} (is `lmux server` running?)"))?;
+    call_on(stream, req).await
+}
+
+/// Like [`call`], but gives up after `limit`. Claude Code waits for hooks, so a
+/// hook must never hang on a daemon that is down or wedged.
+async fn call_quick(socket: &str, method: &str, params: Value, limit: std::time::Duration) {
+    let _ = tokio::time::timeout(limit, call(socket, method, params)).await;
+}
+
+async fn call_on(stream: tokio::net::UnixStream, req: RpcRequest) -> anyhow::Result<Value> {
     let (r, mut w) = stream.into_split();
     let mut line = serde_json::to_string(&req)?;
     line.push('\n');
@@ -1018,6 +1028,30 @@ async fn hooks(cmd: HooksCmd, socket: &str, _json: bool) -> anyhow::Result<()> {
 
     match cmd {
         ClaudeHook::SessionStart => {
+            // Remember the session so the pane can run `claude --resume` after a
+            // reboot. Subagents report their own SessionStart; only the
+            // top-level session resumes. `/clear`, `/compact` and fork start a
+            // new session id, which this records too.
+            let is_subagent = payload.get("agent_id").is_some_and(|v| !v.is_null());
+            if let (Ok(surface), Some(id), false) = (
+                std::env::var("LMUX_SURFACE_ID"),
+                payload["session_id"].as_str().filter(|s| !s.is_empty()),
+                is_subagent,
+            ) {
+                call_quick(
+                    socket,
+                    methods::AGENT_SESSION,
+                    json!({
+                        "surface": surface,
+                        "agent": "claude",
+                        "id": id,
+                        "cwd": payload["cwd"],
+                        "source": payload["source"],
+                    }),
+                    std::time::Duration::from_millis(500),
+                )
+                .await;
+            }
             if let Some(ws) = ws {
                 let mut p = json!({"state": "idle", "workspace": ws});
                 if let Some(cwd) = payload["cwd"].as_str() {
@@ -1108,7 +1142,7 @@ fn summarize_transcript(payload: &Value) -> Option<String> {
 fn claude_settings_snippet() -> String {
     serde_json::to_string_pretty(&json!({
         "hooks": {
-            "SessionStart": [{"hooks": [{"type": "command", "command": "lmux hooks claude session-start"}]}],
+            "SessionStart": [{"matcher": "startup|resume|clear|compact|fork", "hooks": [{"type": "command", "command": "lmux hooks claude session-start"}]}],
             "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "lmux hooks claude prompt-submit"}]}],
             "Stop": [{"hooks": [{"type": "command", "command": "lmux hooks claude stop"}]}],
             "Notification": [{"hooks": [{"type": "command", "command": "lmux hooks claude notification"}]}]

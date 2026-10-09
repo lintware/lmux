@@ -170,7 +170,7 @@ fn default_cwd(params: &Value, state: &crate::tree::SessionState, ws: Option<&st
     std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
 }
 
-async fn spawn_terminal(
+pub(crate) async fn spawn_terminal(
     inner: &Arc<Inner>,
     workspace: &str,
     surface: &str,
@@ -983,6 +983,42 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             let all: Vec<LogEntry> = state.logs.clone();
             let from = all.len().saturating_sub(limit);
             ok(id, json!({"entries": &all[from..]}))
+        }
+        methods::AGENT_SESSION => {
+            let Some(surface) = s(params, "surface") else {
+                return err(id, RpcErrorCode::InvalidParams, "surface required");
+            };
+            let agent = s(params, "agent").unwrap_or_else(|| "claude".to_string());
+            let session = s(params, "id").unwrap_or_default();
+            if agent != "claude" {
+                return err(id, RpcErrorCode::InvalidParams, "only agent \"claude\" can be resumed");
+            }
+            if !crate::tree::valid_agent_session_id(&session) {
+                return err(id, RpcErrorCode::InvalidParams, "invalid session id");
+            }
+            let window = {
+                let mut state = inner.state.lock().await;
+                if state.surface(&surface).is_none() {
+                    return err(id, RpcErrorCode::NotFound, "surface not found");
+                }
+                let r = state.resume_mut(&surface);
+                r.agent = Some(crate::tree::AgentSession {
+                    agent: agent.clone(),
+                    id: session.clone(),
+                });
+                if let Some(cwd) = s(params, "cwd").filter(|c| !c.is_empty()) {
+                    r.cwd = Some(cwd);
+                }
+                state.term_cloned(&surface).map(|t| t.window)
+            };
+            if let Some(window) = window {
+                let _ = inner
+                    .tmux
+                    .set_window_option(&window, "@lmux_agent_session", &format!("{agent}:{session}"))
+                    .await;
+            }
+            inner.mark_dirty();
+            ok(id, json!({}))
         }
         methods::AGENT_STATE => {
             let Some(state_str) = s(params, "state") else {
