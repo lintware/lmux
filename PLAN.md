@@ -172,6 +172,9 @@ Add a cloud box as a host from the app: provision (or adopt) a VM, install `lmux
 **M8 cmux parity pass.**
 Side-by-side comparison with cmux (`~/Documents/cmux`): layout, spacing, colours, keybindings, menus and command names. Every difference is fixed or recorded as intended.
 
+**Later: mobile app.**
+A phone client for the same hosts: the sidebar of workspaces with agent status and notifications, terminals to read and type into, and browser panes as the frame stream the desktop app already gets. Everything runs on the hosts, so the phone only views and drives them, the way the laptop does for remote hosts. The daemons need a way to reach a phone without the laptop's SSH tunnel (for example over Tailscale), and push notifications when an agent needs input.
+
 ## Risks to test early
 
 - **Ref collisions across hosts.** Two daemons both have `workspace:1`. Every place the app stores a ref (selection, drag state, layout, subscriptions, notifications) must carry the host too. Do this as a type (`HostRef`), not by convention.
