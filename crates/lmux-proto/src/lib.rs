@@ -227,6 +227,9 @@ pub enum RpcErrorCode {
     NotFound,
     Unsupported,
     Internal,
+    /// A close asked with `if_idle` found a program still running; the
+    /// message names it.
+    Busy,
 }
 
 // ---------------------------------------------------------------------------

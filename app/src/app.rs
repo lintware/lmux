@@ -167,7 +167,11 @@ impl eframe::App for LmuxApp {
                 let mut c = ui::Ctx { state: &mut h.state, net: &mut h.net };
                 shortcuts(&ctx, &mut c);
                 let text_editing = ctx.memory(|mem| mem.focused().is_some());
-                if window_focused && !text_editing {
+                // A dialog or the palette owns the keyboard while it is open.
+                let modal = c.state.confirm_close.is_some()
+                    || c.state.palette.is_some()
+                    || c.state.add_host_draft.is_some();
+                if window_focused && !text_editing && !modal {
                     route_input(&ctx, &mut c);
                 }
             }
@@ -570,6 +574,7 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
         }
     }
     add_host_dialog(&ctx, c);
+    confirm_close_dialog(&ctx, c);
 
     // The palette draws over everything; what it picks runs on its host.
     let picked = {
@@ -661,7 +666,7 @@ pub fn shortcuts(ctx: &egui::Context, c: &mut ui::Ctx) {
     }
     if key(cmd_shift, Key::W) {
         if let Some(ws) = c.state.selected.clone() {
-            c.state.rpc(m::WORKSPACE_CLOSE, serde_json::json!({ "workspace": ws }));
+            c.state.close_workspace(&ws);
         }
     }
     if key(cmd_shift, Key::R) {
@@ -936,7 +941,7 @@ pub fn run_command(c: &mut ui::Ctx, name: &str) {
         "Rename Workspace" => c.state.begin_ws_rename(None),
         "Close Workspace" => {
             if let Some(ws) = c.state.selected.clone() {
-                c.state.rpc(m::WORKSPACE_CLOSE, serde_json::json!({ "workspace": ws }));
+                c.state.close_workspace(&ws);
             }
         }
         "Next Workspace" => c.state.cycle_workspace(1),
@@ -977,5 +982,44 @@ pub fn run_command(c: &mut ui::Ctx, name: &str) {
         "Zoom Out" => c.state.zoom_terminal(-1.0),
         "Reset Zoom" => c.state.zoom_terminal(0.0),
         _ => {}
+    }
+}
+
+/// "claude is still running in this tab. Close it anyway?" Enter closes,
+/// Escape keeps it, as cmux's close confirmation.
+fn confirm_close_dialog(ctx: &egui::Context, c: &mut ui::Ctx) {
+    let Some(q) = c.state.confirm_close.clone() else { return };
+    let what = match q.target {
+        crate::state::CloseTarget::Surface(..) => "tab",
+        crate::state::CloseTarget::Workspace(_) => "workspace",
+    };
+    let mut answer: Option<bool> = None;
+    egui::Window::new(format!("Close this {what}?"))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .fixed_size(Vec2::new(300.0, 0.0))
+        .show(ctx, |ui| {
+            ui.label(format!("{} is still running in this {what}. Closing it ends the process.", q.program));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Close").clicked() {
+                    answer = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+    let (enter, escape) = ctx.input_mut(|i| {
+        (i.consume_key(Modifiers::NONE, Key::Enter), i.consume_key(Modifiers::NONE, Key::Escape))
+    });
+    if enter {
+        answer = Some(true);
+    } else if escape {
+        answer = Some(false);
+    }
+    if let Some(close) = answer {
+        c.state.answer_close(close);
     }
 }

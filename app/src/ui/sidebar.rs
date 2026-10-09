@@ -796,10 +796,7 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
         icons::close(&p, Rect::from_center_size(close_center, Vec2::splat(9.0)), color);
     }
     if close_resp.clicked() {
-        c.state.rpc(
-            lmux_proto::methods::WORKSPACE_CLOSE,
-            serde_json::json!({ "workspace": ws.id }),
-        );
+        c.state.close_workspace(&ws.id);
         return;
     }
 
@@ -903,7 +900,7 @@ fn card_menu(resp: &egui::Response, ws: &Workspace, c: &mut Ctx) {
             serde_json::json!({ "workspace": ws.id, "folder": folder }),
         );
     } else if close {
-        c.state.rpc(lmux_proto::methods::WORKSPACE_CLOSE, serde_json::json!({ "workspace": ws.id }));
+        c.state.close_workspace(&ws.id);
     }
 }
 

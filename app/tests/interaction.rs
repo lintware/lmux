@@ -1021,3 +1021,50 @@ fn cmd_shift_enter_zooms_the_focused_pane_and_back() {
     assert!(h.state().state.zoomed_pane.is_none());
     assert!(h.state().state.pane_rects.contains_key("pane:9"));
 }
+
+/// Cmd+W asks the daemon to close only if nothing runs there. A "busy" answer
+/// puts the tab selection back and asks; Enter then closes for real.
+#[test]
+fn closing_a_busy_tab_asks_first() {
+    let mut h = harness(fixture_three_chips());
+    press(&mut h, Modifiers::COMMAND, Key::W);
+    let (id, params) = h
+        .state()
+        .state
+        .pending
+        .iter()
+        .find_map(|m| match m {
+            ClientMsg::Rpc { request } if request.method == "surface.close" => {
+                Some((request.id, request.params.clone()))
+            }
+            _ => None,
+        })
+        .expect("surface.close sent");
+    assert_eq!(params["if_idle"], true);
+    h.state_mut().state.pending.clear();
+
+    h.state_mut().state.handle_server_msg(lmux_proto::ServerMsg::RpcResult {
+        response: lmux_proto::RpcResponse {
+            id,
+            result: None,
+            error: Some(lmux_proto::RpcError {
+                code: lmux_proto::RpcErrorCode::Busy,
+                message: "claude".into(),
+            }),
+        },
+    });
+    let st = &h.state().state;
+    let q = st.confirm_close.as_ref().expect("the question is open");
+    assert_eq!(q.program, "claude");
+    assert!(st.banner.is_none(), "a busy answer is a question, not an error");
+    let active = st.pane("pane:1").and_then(|p| st.active_surface(p));
+    assert_eq!(active.as_deref(), Some("surface:2"), "the selection is back on the busy tab");
+
+    h.run();
+    press(&mut h, Modifiers::NONE, Key::Enter);
+    let rpcs = rpc_methods(h.state());
+    let call = rpcs.iter().find(|(m, _)| m == "surface.close").expect("closed after confirming");
+    assert_eq!(call.1["surface"], "surface:2");
+    assert!(call.1.get("if_idle").is_none(), "the second close is unconditional");
+    assert!(h.state().state.confirm_close.is_none());
+}

@@ -22,7 +22,7 @@ pub const WORKSPACE_NEW: &str = "workspace.new"; // {name?, cwd?, command?, fold
 pub const WORKSPACE_LIST: &str = "workspace.list"; // {} -> {workspaces: [..]}
 pub const WORKSPACE_SELECT: &str = "workspace.select"; // {workspace}
 pub const WORKSPACE_RENAME: &str = "workspace.rename"; // {workspace?, title}
-pub const WORKSPACE_CLOSE: &str = "workspace.close"; // {workspace}
+pub const WORKSPACE_CLOSE: &str = "workspace.close"; // {workspace, if_idle?} -> Busy error as for surface.close
 pub const WORKSPACE_MOVE: &str = "workspace.move"; // {workspace, folder?: Ref|null, index?}
 
 // --- panes & surfaces ---
@@ -31,7 +31,7 @@ pub const PANE_LIST: &str = "pane.list"; // {workspace?} -> {panes: [..]}
 pub const PANE_FOCUS: &str = "pane.focus"; // {pane}
 pub const PANE_RESIZE: &str = "pane.resize"; // {pane, ratio}
 pub const SURFACE_NEW: &str = "surface.new"; // {pane?, type?, url?, command?, cwd?} -> {surface} (new tab in pane)
-pub const SURFACE_CLOSE: &str = "surface.close"; // {surface?}
+pub const SURFACE_CLOSE: &str = "surface.close"; // {surface?, if_idle?} -> Busy error naming the program when if_idle and one runs
 pub const SURFACE_RENAME: &str = "surface.rename"; // {surface?, title}
 // Drag-and-drop rearranging in the client. Together these cover dragging a tab
 // within its strip, onto another pane, and onto a pane's edge to make a split.

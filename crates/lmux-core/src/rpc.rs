@@ -170,6 +170,26 @@ fn default_cwd(params: &Value, state: &crate::tree::SessionState, ws: Option<&st
     std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
 }
 
+/// Shells count as idle: closing a pane at its prompt loses nothing.
+const SHELLS: &[&str] = &["zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "login", "-zsh", "-bash"];
+
+/// The first program other than a shell running in the foreground of one of
+/// these terminal surfaces, asked of tmux now, so a close can be confirmed.
+async fn busy_program(inner: &Arc<Inner>, surfaces: &[String]) -> Option<String> {
+    let panes: Vec<String> = {
+        let state = inner.state.lock().await;
+        surfaces.iter().filter_map(|s| state.term_cloned(s)).map(|t| t.pane).collect()
+    };
+    for pane in panes {
+        let Ok(cmd) = inner.tmux.display(&pane, "#{pane_current_command}").await else { continue };
+        let cmd = cmd.trim();
+        if !cmd.is_empty() && !SHELLS.contains(&cmd) {
+            return Some(cmd.to_owned());
+        }
+    }
+    None
+}
+
 pub(crate) async fn spawn_terminal(
     inner: &Arc<Inner>,
     workspace: &str,
@@ -463,6 +483,18 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             let Some(ws) = ws else {
                 return err(id, RpcErrorCode::NotFound, "workspace not found");
             };
+            if params.get("if_idle").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let surfaces: Vec<String> = {
+                    let state = inner.state.lock().await;
+                    state
+                        .workspace(&ws)
+                        .map(|w| w.panes.iter().flat_map(|p| p.surfaces.iter().map(|s| s.id.clone())).collect())
+                        .unwrap_or_default()
+                };
+                if let Some(cmd) = busy_program(inner, &surfaces).await {
+                    return err(id, RpcErrorCode::Busy, &cmd);
+                }
+            }
             close_workspace(inner, &ws).await;
             ok(id, json!({"workspace": ws}))
         }
@@ -587,6 +619,11 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             let Some(surface) = surface else {
                 return err(id, RpcErrorCode::NotFound, "surface not found");
             };
+            if params.get("if_idle").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if let Some(cmd) = busy_program(inner, std::slice::from_ref(&surface)).await {
+                    return err(id, RpcErrorCode::Busy, &cmd);
+                }
+            }
             close_surface(inner, &surface).await;
             ok(id, json!({"surface": surface}))
         }

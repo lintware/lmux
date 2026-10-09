@@ -161,6 +161,10 @@ pub struct AppState {
     pub folder_rename: Option<FolderRename>,
     /// Inline rename of a workspace card's title (`folder` holds the workspace).
     pub ws_rename: Option<FolderRename>,
+    /// Closes sent with `if_idle`, by RPC id, until the daemon answers.
+    pending_closes: HashMap<u64, CloseTarget>,
+    /// The "still running" question, while it is open.
+    pub confirm_close: Option<ConfirmClose>,
     /// The pane shown alone over its workspace (Cmd+Shift+Enter), if any.
     pub zoomed_pane: Option<Ref>,
     /// The command palette, while it is open.
@@ -224,6 +228,21 @@ pub enum Action {
     AddHost(String),
     /// Forget this host (the one whose state queued the action).
     RemoveHost,
+}
+
+/// Something a close was asked for, kept until the daemon answers.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CloseTarget {
+    /// `(pane, surface, the pane's tab selection before the close)`.
+    Surface(Ref, Ref, Option<Ref>),
+    Workspace(Ref),
+}
+
+/// A close the daemon refused because a program is still running there.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfirmClose {
+    pub target: CloseTarget,
+    pub program: String,
 }
 
 /// What the palette lists.
@@ -432,6 +451,8 @@ impl AppState {
             ws_rename: None,
             palette: None,
             zoomed_pane: None,
+            pending_closes: HashMap::new(),
+            confirm_close: None,
             term_font: crate::theme::FS_TERM,
             folder_toggle: None,
             folder_rename_pending: None,
@@ -929,6 +950,7 @@ impl AppState {
     /// right, or the one to the left when the closed chip was last. Closing a
     /// background chip leaves the active one alone.
     pub fn close_surface(&mut self, pane_id: &str, surface_id: &str) {
+        let before = self.pane_active.get(pane_id).cloned();
         let surfaces: Vec<Ref> = self
             .pane(pane_id)
             .map(|p| p.surfaces.iter().map(|s| s.id.clone()).collect())
@@ -954,6 +976,57 @@ impl AppState {
         // A chip being renamed and closed should not leave an editor behind.
         if self.renaming.as_ref().is_some_and(|r| r.surface == surface_id) {
             self.renaming = None;
+        }
+        // Ask the daemon to close only if nothing is running there; a busy
+        // pane comes back as a question (see `confirm_close`).
+        let id = self.rpc_with_id(m::SURFACE_CLOSE, serde_json::json!({ "surface": surface_id, "if_idle": true }));
+        self.pending_closes.insert(
+            id,
+            CloseTarget::Surface(pane_id.to_owned(), surface_id.to_owned(), before),
+        );
+    }
+
+    /// Close a workspace, asking first if a program is running in it.
+    pub fn close_workspace(&mut self, ws: &str) {
+        let id = self.rpc_with_id(m::WORKSPACE_CLOSE, serde_json::json!({ "workspace": ws, "if_idle": true }));
+        self.pending_closes.insert(id, CloseTarget::Workspace(ws.to_owned()));
+    }
+
+    /// The user answered the "still running" question: close anyway, or not.
+    pub fn answer_close(&mut self, close: bool) {
+        let Some(q) = self.confirm_close.take() else { return };
+        if !close {
+            return;
+        }
+        match q.target {
+            CloseTarget::Surface(pane, surface, _) => {
+                // The selection moved with the first attempt; move it again,
+                // as the tab may have been reselected meanwhile.
+                self.close_surface_now(&pane, &surface);
+            }
+            CloseTarget::Workspace(ws) => {
+                self.rpc(m::WORKSPACE_CLOSE, serde_json::json!({ "workspace": ws }));
+            }
+        }
+    }
+
+    fn close_surface_now(&mut self, pane_id: &str, surface_id: &str) {
+        let surfaces: Vec<Ref> = self
+            .pane(pane_id)
+            .map(|p| p.surfaces.iter().map(|s| s.id.clone()).collect())
+            .unwrap_or_default();
+        if self.pane(pane_id).and_then(|p| self.active_surface(p)).as_deref() == Some(surface_id) {
+            if let Some(index) = surfaces.iter().position(|s| s == surface_id) {
+                let next = surfaces.get(index + 1).or_else(|| index.checked_sub(1).and_then(|i| surfaces.get(i)));
+                match next.cloned() {
+                    Some(n) => {
+                        self.pane_active.insert(pane_id.to_owned(), n);
+                    }
+                    None => {
+                        self.pane_active.remove(pane_id);
+                    }
+                }
+            }
         }
         self.rpc(m::SURFACE_CLOSE, serde_json::json!({ "surface": surface_id }));
     }
@@ -1122,8 +1195,26 @@ impl AppState {
             }
             ServerMsg::Log { .. } => {}
             ServerMsg::RpcResult { response } => {
-                if let Some(err) = response.error {
-                    self.banner = Some((format!("{}: {}", err.code_str(), err.message), true));
+                let close = self.pending_closes.remove(&response.id);
+                match (response.error, close) {
+                    (Some(err), Some(target)) if err.code == lmux_proto::RpcErrorCode::Busy => {
+                        // Put the tab selection back: nothing was closed.
+                        if let CloseTarget::Surface(pane, _, before) = &target {
+                            match before {
+                                Some(b) => {
+                                    self.pane_active.insert(pane.clone(), b.clone());
+                                }
+                                None => {
+                                    self.pane_active.remove(pane);
+                                }
+                            }
+                        }
+                        self.confirm_close = Some(ConfirmClose { target, program: err.message });
+                    }
+                    (Some(err), _) => {
+                        self.banner = Some((format!("{}: {}", err.code_str(), err.message), true));
+                    }
+                    _ => {}
                 }
                 if self.folder_rename_pending == Some(response.id) {
                     self.folder_rename_pending = None;
