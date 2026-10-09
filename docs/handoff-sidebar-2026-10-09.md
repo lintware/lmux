@@ -94,7 +94,7 @@ holds (`state.term_cloned(surface)`) and drops the guard before awaiting.
 
 Verified 2026-10-09: a scratch daemon on `127.0.0.1:7933` created a workspace, answered
 `close-surface --surface surface:1` immediately, kept serving `tree`, and `close-workspace`
-then reported the (now empty) workspace as not found. This was `REVIEW.md` **N1**; the
+then reported the (now empty) workspace as not found. This was `docs/review-2026-10-09.md` **N1**; the
 entry there is marked fixed.
 
 Health check, if a wedged daemon is suspected (a healthy one answers at once):

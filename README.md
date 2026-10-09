@@ -2,60 +2,59 @@
 
 **cmux + herdr + tmux, with the paid and annoying parts taken out.**
 
-lmux is a terminal workspace app for running coding agents:
+lmux is a workspace app for running coding agents across your own machines. Terminals, browsers and Claude sessions live on the host they run on and keep running when your laptop sleeps. The window on your laptop shows them all in one sidebar.
 
-- **cmux's window.** It has the same sidebar of folders and workspaces, splits, tabs, browser panes, notifications and agent-control CLI. Command names match cmux, so agents that know `cmux` already know `lmux`.
-- **herdr's persistence.** Nothing closes for good. Quit the app, close the lid, lose the network or reboot, and every pane comes back where it was: its directory, its scrollback and its Claude session.
-- **tmux underneath.** Every terminal lives in tmux on the machine it runs on, so it keeps running with no window attached.
+![lmux: an agent on a remote host driving a browser pane, with three hosts in the sidebar](docs/img/lmux.png)
 
-lmux leaves out cmux's paid and heavy parts: its cloud VM service, team features, vault and checkpoints, recordings, the iOS simulator and the many background helpers. It uses your own machines instead. That's the "l" in lmux: lean.
+| From | lmux keeps | lmux drops |
+|---|---|---|
+| **cmux** | The window: folders and workspaces in a sidebar, splits, tabs, browser panes, notifications, and the agent-control CLI with the same command names | Its cloud VM service, team features, vault and checkpoints, recordings, the iOS simulator, and the ~25 background helpers |
+| **herdr** | Persistence: quit, close the lid, lose the network or reboot, and every pane comes back with its directory, scrollback and Claude session | — |
+| **tmux** | Every terminal lives in tmux on its host, so it keeps running with no window attached | Having to remember tmux |
 
-## What it does
+## Why it's lean
 
-- **One sidebar for every machine.** This Mac, your servers and cloud boxes appear together, each labelled. A workspace bound to a server runs every terminal there, with no manual SSH.
-- **Remote work costs the laptop almost nothing.** Remote terminals and browsers run on the server and keep going while the laptop sleeps. The app only draws what's on screen.
-- **Browsers run on the host, in WebKit.** On a Mac host, pages run in a WKWebView helper; on Linux, in WebKitGTK. Agents on that host drive them, and the app shows them live. On this Mac, browser panes are native WebKit views inside the app.
-- **Agents drive everything.** `lmux send`, `read-screen`, `wait-for`, `browser snapshot/click/type/fill/eval`, and `notify` and `set-status` for the sidebar. Claude Code hooks keep each workspace's status and summary up to date.
-- **Agents resume.** Each tab's Claude session is recorded. If tmux or the machine restarts, the tab reopens in its directory and runs `claude --resume <id>`.
-- **Import from cmux.** `lmux import-cmux --move`, or *Import from cmux…* in the command palette, brings your cmux workspaces over:
-  - folders, splits, tabs, directories and browser pages come with them;
-  - each idle Claude session closes in cmux and resumes in lmux with its conversation;
-  - a Claude that's in the middle of a task stays in cmux until it's idle.
+The same workload in both apps on one MacBook Air: each workspace has a terminal printing about 20 lines a second plus an idle split. The figures are what each app added on top of its idle state ([`deploy/bench/stress.py`](deploy/bench/stress.py)).
 
-## How it's built
+| | cmux | lmux |
+|---|---|---|
+| App on disk | 744 MB | 29 MB |
+| Memory, 40 workspaces | +698 MB | about +100 MB |
+| CPU, 40 workspaces | 15.5% | 10% (the app itself 1.7%) |
+| Each command an agent runs | ~170 ms | ~3 ms |
+| Creating 40 workspaces | 11.5 s | 0.3 s |
+| Most tested | 40 workspaces | 200 workspaces, 400 live terminals |
 
-```
-lmux.app (laptop) ── one websocket per host, over SSH ──▶  lmux server (each host)
-  egui + wgpu UI                                             session tree, RPC, persistence
-  local panes: a PTY on tmux                                 tmux (control mode)
-  browser panes: WebKit                                      WebKit helper for pages on the host
-```
+The app draws only the pane on screen. With 400 terminals open and 200 of them printing, its own CPU stayed at 1.9%, the same as idle. macOS's limit of 511 terminals (shared by every app) is reached before lmux's.
 
-- `crates/lmux-proto`: shared wire types, plus the cmux export reader.
-- `crates/lmux-core`: the daemon, with the session tree, tmux backend, RPC, persistence and browsers.
-- `crates/lmux`: the binary. `lmux server` runs the daemon; every other subcommand is a CLI client.
-- `app/`: the native client (Rust, egui).
-- `helpers/webkit-mac`, `helpers/webkit-linux`: the host-side WebKit page runners.
-- `deploy/`: the macOS app bundle, the remote installer, systemd and launchd units, and cloud box scripts.
+## What you get
 
-The design and milestones are in [PLAN.md](PLAN.md).
+- **One sidebar for every machine.** This Mac, your servers and cloud boxes appear together, each labelled. A workspace bound to a server runs all its terminals there, with no manual SSH.
+- **Remote work costs the laptop almost nothing.** Remote terminals and browsers run on the server. The laptop receives only what's on screen.
+- **WebKit browsers on the host.** On a Mac host, pages run in a WKWebView helper; on Linux, in WebKitGTK. Agents on that host drive them, and you watch them live. On this Mac, browser panes are native WebKit views inside the app.
+- **Agents in control.** Agents get `send`, `read-screen` and `wait-for`; `browser snapshot`, `click`, `type`, `fill` and `eval`; and `notify` and `set-status`. Claude Code hooks keep each card's status and summary current.
+- **Agents come back.** Each tab's Claude session is recorded. After a tmux or machine restart, the tab reopens in its directory and runs `claude --resume <id>`.
+- **Move over from cmux in one step.** Use *Import from cmux…* in the command palette, or `lmux import-cmux --move`:
+  - folders, splits, tabs, directories and browser pages come over;
+  - each idle Claude closes in cmux and resumes in lmux with its conversation;
+  - a Claude that's in the middle of a task waits in cmux until it's idle.
 
 ## Install
 
-On the Mac:
+**On your Mac:**
 
 ```sh
-deploy/macos/bundle.sh          # builds and installs /Applications/lmux.app and ~/.local/bin/lmux
+deploy/macos/bundle.sh      # builds and installs /Applications/lmux.app and ~/.local/bin/lmux
 open -a lmux
 ```
 
-On a server (Linux or macOS, with tmux and a Rust toolchain):
+**On a server** (Linux or macOS, with tmux and a Rust toolchain):
 
 ```sh
-deploy/install-remote.sh <ssh-host> [git-ref]
+deploy/install-remote.sh <ssh-host>
 ```
 
-You can also do this from the app: right-click the sidebar and choose *Add Remote Host…*. The installer starts the daemon as a user service and adds the Claude Code hooks.
+You can also do this from the app: right-click the sidebar and choose *Add Remote Host…*. The installer builds lmux there, runs the daemon as a user service (systemd or launchd) and adds the Claude Code hooks.
 
 ## Use
 
@@ -63,25 +62,65 @@ You can also do this from the app: right-click the sidebar and choose *Add Remot
 lmux new-workspace --name api --cwd ~/code/api
 lmux new-split right
 lmux send "npm test\n"
+lmux wait-for --text "passing"
 lmux read-screen --lines 20
+
 lmux browser open https://example.com
-lmux browser snapshot -i
-lmux import-cmux --dry-run      # see what would come over from cmux
-lmux import-cmux --move         # move it
-lmux --help                     # everything else
+lmux browser snapshot -i            # accessibility tree with refs e1, e2, ...
+lmux browser click e7
+
+lmux import-cmux --dry-run          # what would come over from cmux
+lmux import-cmux --move
+
+lmux --help                         # everything else
 ```
 
-## Status
+Inside a pane, `LMUX_WORKSPACE_ID` and `LMUX_SURFACE_ID` are set, so an agent can address its own workspace or the pane next to it.
 
-lmux is in active development on the `dev` branch. Done so far:
+## How it's built
 
+```
+lmux.app (laptop)  ── one websocket per host, over SSH ──▶  lmux server (each host)
+  egui + wgpu UI                                              session tree, RPC, persistence
+  local panes: a PTY on tmux                                  tmux in control mode
+  browser panes: WebKit                                       WebKit helper for the host's pages
+```
+
+| Path | What it is |
+|---|---|
+| `crates/lmux-proto` | Wire types shared by the daemon, CLI and app, and the cmux export reader |
+| `crates/lmux-core` | The daemon: session tree, tmux backend, RPC, persistence, browsers |
+| `crates/lmux` | The binary: `lmux server` runs the daemon; every other subcommand is a client |
+| `app/` | The native client (Rust, egui) |
+| `helpers/webkit-mac`, `helpers/webkit-linux` | Run browser pages on a host |
+| `deploy/` | App bundle, remote installer, service units, cloud box scripts, stress bench |
+| `docs/` | Design notes and reviews |
+
+[PLAN.md](PLAN.md) has the design and milestones.
+
+## Development
+
+```sh
+cargo test --workspace          # daemon, CLI and protocol (needs tmux)
+(cd app && cargo test)          # the app, including UI tests
+```
+
+Work happens on `dev`, and `main` follows it once it's stable.
+
+## Status and roadmap
+
+**Working:**
 - terminals, the CLI and the app;
-- several hosts in one sidebar;
+- many hosts in one sidebar;
 - local and remote WebKit browsers;
 - Claude resume;
 - cloud boxes;
 - importing from cmux.
 
-Next: full scrollback persistence across reboots, notifications from every host, and a cmux parity pass.
+**Next:**
+- scrollback restored across reboots;
+- notifications from every host;
+- a cmux parity pass on layout and keys;
+- stop tmux sending output for panes nobody is watching.
 
-**Later: a mobile app** for the same hosts, to watch and steer agents from a phone.
+**Later:** a mobile app for the same hosts, to watch and steer agents from your phone.
