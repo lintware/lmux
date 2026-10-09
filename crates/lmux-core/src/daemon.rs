@@ -550,6 +550,20 @@ impl Inner {
         branch
     }
 
+    /// Set one workspace's `git_branch` now, so a new workspace shows its
+    /// branch at once without waiting on every other workspace's git.
+    pub async fn refresh_branch_of(&self, workspace: &str) {
+        let cwd = {
+            let state = self.state.lock().await;
+            state.workspace(workspace).map(|w| w.cwd.clone())
+        };
+        let Some(cwd) = cwd.filter(|c| !c.is_empty()) else { return };
+        let branch = self.detect_branch(&cwd).await;
+        if let Some(w) = self.state.lock().await.workspace_mut(workspace) {
+            w.git_branch = branch;
+        }
+    }
+
     /// Refresh every workspace's `git_branch`. Returns true if anything changed.
     pub async fn refresh_branches(&self) -> bool {
         let pairs: Vec<(Ref, String)> = {

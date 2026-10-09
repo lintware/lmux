@@ -736,8 +736,8 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             }
 
             // New workspace: detect its branch now so the sidebar has it promptly
-            // (the background timer only refreshes periodically).
-            inner.refresh_branches().await;
+            // (the background timer refreshes the rest periodically).
+            inner.refresh_branch_of(&ws_ref).await;
             inner.tree_changed();
             inner.mark_dirty();
             ok(
@@ -1078,7 +1078,7 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             match res {
                 Ok((ws, pane, surface)) => {
                     retag_workspace(inner, &surface).await;
-                    inner.refresh_branches().await;
+                    inner.refresh_branch_of(&ws).await;
                     inner.tree_changed();
                     inner.mark_dirty();
                     ok(id, json!({"workspace": ws, "pane": pane, "surface": surface}))
