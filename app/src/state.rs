@@ -166,6 +166,8 @@ pub struct AppState {
     local_retry: HashMap<Ref, Instant>,
     /// egui context, used to wake the UI when a local PTY delivers output.
     wake: Option<egui::Context>,
+    /// This host's browser frame decoder, started with its first frame.
+    decoder: Option<crate::decode::Decoder>,
     pub notifications: Vec<Notification>,
     pub selected: Option<Ref>,
     /// Local tab selection per pane (the protocol has no activate-surface RPC).
@@ -536,6 +538,7 @@ impl AppState {
             local_wanted: HashSet::new(),
             local_retry: HashMap::new(),
             wake: None,
+            decoder: None,
             notifications: Vec::new(),
             selected: None,
             pane_active: HashMap::new(),
@@ -1542,7 +1545,15 @@ impl AppState {
             Ok(wire::Frame::BrowserFrame { surface, seq, jpeg, .. }) => {
                 // Decode on the worker thread; the result is picked up by
                 // `poll_decoded` and acked after its texture is uploaded.
-                crate::decode::decoder().submit(surface.to_owned(), seq, jpeg.to_vec());
+                let wake = self.wake.clone();
+                let dec = self.decoder.get_or_insert_with(|| {
+                    let d = crate::decode::Decoder::new();
+                    if let Some(ctx) = wake {
+                        d.set_wake(ctx);
+                    }
+                    d
+                });
+                dec.submit(surface.to_owned(), seq, jpeg.to_vec());
             }
             Err(e) => eprintln!("[frame] decode failed: {e:?}"),
         }
@@ -1551,7 +1562,8 @@ impl AppState {
     /// Collect frames finished by the decode worker and queue an ack for the
     /// one that replaced a surface's image. Called once per pump.
     pub fn poll_decoded(&mut self) {
-        for frame in crate::decode::decoder().drain() {
+        let Some(dec) = &self.decoder else { return };
+        for frame in dec.drain() {
             let b = self
                 .browsers
                 .entry(frame.surface.clone())

@@ -51,7 +51,6 @@ impl LmuxApp {
         configure(&cc.egui_ctx);
         theme::set_traffic_lights(cfg!(target_os = "macos"));
         eprintln!("[fonts] ui={ui_font} mono={mono_font}");
-        crate::decode::decoder().set_wake(cc.egui_ctx.clone());
 
         let configs = crate::net::app_hosts();
         let local_error = if std::env::var("LMUX_WS_URL").is_err() {

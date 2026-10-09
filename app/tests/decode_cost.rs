@@ -76,3 +76,19 @@ fn frame_round_trips_through_the_worker() {
     assert_eq!(b.pending_ack, Some(1), "the frame must be acked after decode");
     let _ = wire::KIND_BROWSER_FRAME;
 }
+
+/// Two hosts on screen: a frame from the second must reach the second, even
+/// when the first host polls after it has been decoded (it used to take it, so
+/// the second never acked and its stream stalled on "waiting for the first frame").
+#[test]
+fn each_host_keeps_its_own_frames() {
+    let mut local = AppState::new();
+    let mut remote = AppState::new();
+    remote.handle_frame(&frame_bytes());
+    std::thread::sleep(Duration::from_millis(200));
+    local.poll_decoded();
+    remote.poll_decoded();
+    assert!(local.browsers.get("surface:9").is_none(), "the other host took the frame");
+    let view = remote.browsers.get("surface:9").expect("the frame reached its host");
+    assert_eq!(view.pending_ack, Some(1));
+}

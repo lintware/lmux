@@ -6,7 +6,7 @@
 //! old `image::load_from_memory(...).to_rgba8()` path allocated.
 
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 /// A decoded frame, ready to upload as a texture.
 pub struct DecodedFrame {
@@ -29,7 +29,11 @@ pub struct Decoder {
     wake: Arc<Mutex<Option<egui::Context>>>,
 }
 
-fn decoder_impl() -> Decoder {
+impl Decoder {
+    /// A decode worker of its own. Each host has one: a shared queue let one
+    /// host drain (and never ack) another host's frames, which stalled its
+    /// stream on "waiting for the first frame".
+    pub fn new() -> Self {
     let (job_tx, job_rx) = channel::<Job>();
     let (res_tx, res_rx) = channel::<DecodedFrame>();
     let wake: Arc<Mutex<Option<egui::Context>>> = Arc::new(Mutex::new(None));
@@ -56,16 +60,9 @@ fn decoder_impl() -> Decoder {
             }
         })
         .expect("spawn jpeg decode worker");
-    Decoder { tx: job_tx, rx: Mutex::new(res_rx), wake }
-}
+        Decoder { tx: job_tx, rx: Mutex::new(res_rx), wake }
+    }
 
-static DECODER: OnceLock<Decoder> = OnceLock::new();
-
-pub fn decoder() -> &'static Decoder {
-    DECODER.get_or_init(decoder_impl)
-}
-
-impl Decoder {
     /// Called once by the app so decoded frames wake the UI promptly.
     pub fn set_wake(&self, ctx: egui::Context) {
         *self.wake.lock().unwrap() = Some(ctx);
