@@ -17,8 +17,10 @@ After=default.target
 
 [Service]
 Type=simple
-# Adjust the binary path if `lmux` is not on the service's PATH.
-ExecStart=%h/.cargo/bin/lmux server --tmux-socket lmux --ws-addr 127.0.0.1:7878
+# `lmux` lives in ~/.local/bin, which is also on the login PATH, so the Claude
+# hooks (`lmux hooks claude …`) find the same binary inside panes.
+ExecStart=%h/.local/bin/lmux server --tmux-socket lmux --ws-addr 127.0.0.1:7878
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 RestartSec=2
 Environment=RUST_LOG=info

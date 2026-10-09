@@ -175,7 +175,11 @@ impl Tmux {
         surface: &str,
         workspace: &str,
     ) -> anyhow::Result<(String, String)> {
-        let session = shell_quote(&self.session);
+        // `name:` always means the session (and, for options, its current
+        // window). A bare `name` is also matched against window names, so a
+        // workspace titled like the session made new-window pick that window's
+        // index ("index 1 in use") and the options land on the wrong window.
+        let session = shell_quote(&format!("{}:", self.session));
         let mut line = format!(
             "new-window -t {session} -P -F \"#{{window_id}} #{{pane_id}}\" -n {} -c {}",
             shell_quote(&sanitize_window_name(title)),
@@ -855,5 +859,46 @@ mod tests {
         assert!(saw_after, "expected output to continue after invalid UTF-8");
         assert!(alive, "control client should still accept commands");
     }
-}
 
+    /// A window titled like the session (a workspace named `lmux`) must not
+    /// capture `-t lmux`: the next terminal is created at a free index, and its
+    /// tags land on its own window, not on the namesake.
+    #[tokio::test]
+    async fn a_window_named_like_the_session_does_not_capture_new_terminals() {
+        if !tmux_available().await {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        let socket = format!("lmux-test-name-{}", std::process::id());
+        let cfg = TmuxConfig { socket: socket.clone(), session: "lmux".into() };
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let tmux = match Tmux::spawn(cfg, ev_tx).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping: could not start tmux ({e})");
+                return;
+            }
+        };
+        let first = tmux
+            .new_terminal("/tmp", None, &[], 80, 24, "lmux", "surface:1", "workspace:1")
+            .await;
+        let second = tmux
+            .new_terminal("/tmp", None, &[], 80, 24, "other", "surface:2", "workspace:2")
+            .await;
+        let wins = tmux.list_windows().await;
+
+        let _ = Command::new("tmux")
+            .args(["-L", &socket, "kill-server"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+
+        let (w1, _) = first.expect("first terminal");
+        let (w2, _) = second.expect("second terminal, beside a window named like the session");
+        let wins = wins.expect("list windows");
+        let tag = |id: &str| wins.iter().find(|w| w.window == id).and_then(|w| w.surface.clone());
+        assert_eq!(tag(&w1).as_deref(), Some("surface:1"));
+        assert_eq!(tag(&w2).as_deref(), Some("surface:2"));
+    }
+}
