@@ -38,6 +38,8 @@ struct HostSession {
 }
 
 pub struct LmuxApp {
+    /// The unread count last put on the Dock icon.
+    dock_badge: u32,
     hosts: Vec<HostSession>,
     /// The host whose workspace is on screen; keys and the top strip act on it.
     active: usize,
@@ -102,7 +104,7 @@ impl LmuxApp {
             eprintln!("[local] {err}");
             h.state.banner = Some((err, true));
         }
-        Self { hosts, active }
+        Self { hosts, active, dock_badge: 0 }
     }
 
     fn ctxs(&mut self) -> Vec<ui::Ctx<'_>> {
@@ -206,6 +208,13 @@ impl eframe::App for LmuxApp {
             let active = self.active;
             let mut hosts = self.ctxs();
             render_hosts(ui, &mut hosts, active);
+        }
+
+        // Unread notifications on every host, on the Dock icon.
+        let unread: u32 = self.hosts.iter().map(|h| h.state.unread_total()).sum();
+        if unread != self.dock_badge {
+            self.dock_badge = unread;
+            set_dock_badge(unread);
         }
 
         // A host the user acted on (selected or created in) comes on screen.
@@ -1043,3 +1052,19 @@ fn confirm_close_dialog(ctx: &egui::Context, c: &mut ui::Ctx) {
         c.state.answer_close(close);
     }
 }
+
+/// Show `count` on the app's Dock icon (nothing when 0).
+#[cfg(target_os = "macos")]
+fn set_dock_badge(count: u32) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    use objc2_foundation::NSString;
+    // AppKit is main-thread only; eframe calls `ui` on the main thread.
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let app = NSApplication::sharedApplication(mtm);
+    let label = (count > 0).then(|| NSString::from_str(&count.to_string()));
+    app.dockTile().setBadgeLabel(label.as_deref());
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dock_badge(_count: u32) {}

@@ -23,6 +23,12 @@ notify-rust = "4"
 dirs = "6"
 log = "0.4"
 
+# The Dock badge (unread count), as cmux shows it.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["snapshot", "wgpu"] }
 
