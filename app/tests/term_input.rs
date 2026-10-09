@@ -217,7 +217,39 @@ fn a_plain_click_clears_the_selection() {
     assert_eq!(copy(&mut h), None, "nothing selected copies nothing");
 }
 
-fn wheel(h: &mut Harness<Fixture>, pos: Pos2, lines: f32) {
+#[test]
+fn cmd_click_opens_the_url_under_the_pointer() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let opened = Rc::new(RefCell::new(Vec::<String>::new()));
+    let sink = opened.clone();
+    lmux_app::termio::set_url_opener(Some(Box::new(move |u: &str| sink.borrow_mut().push(u.to_owned()))));
+
+    let mut h = harness(fixture());
+    // Even with mouse reporting on, Cmd+click is ours.
+    feed(&mut h, b"docs: https://example.com/a.\r\n\x1b]8;;https://b.dev/\x1b\\link\x1b]8;;\x1b\\\x1b[?1000h");
+    let cmd = Modifiers { command: true, mac_cmd: true, ..Default::default() };
+
+    let p = cell(&h, 0, 10);
+    click(&mut h, p, PointerButton::Primary, none());
+    assert!(opened.borrow().is_empty(), "a click without Cmd opens nothing");
+
+    h.input_mut().events.push(egui::Event::ModifiersChanged(cmd));
+    let p = cell(&h, 0, 10);
+    click(&mut h, p, PointerButton::Primary, cmd);
+    let p = cell(&h, 1, 2);
+    click(&mut h, p, PointerButton::Primary, cmd);
+    let p = cell(&h, 0, 2);
+    click(&mut h, p, PointerButton::Primary, cmd);
+    lmux_app::termio::set_url_opener(None);
+
+    assert_eq!(*opened.borrow(), vec!["https://example.com/a".to_owned(), "https://b.dev/".to_owned()]);
+    let reports = term_inputs(h.state());
+    assert_eq!(reports.len(), 4, "only the two clicks off a link reach the program: {reports:?}");
+}
+
+fn wheel(h:&mut Harness<Fixture>, pos: Pos2, lines: f32) {
     move_to(h, pos);
     h.input_mut().events.push(egui::Event::MouseWheel {
         unit: egui::MouseWheelUnit::Line,

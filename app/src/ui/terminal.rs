@@ -123,6 +123,14 @@ fn pointer_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Gri
                 }
                 let (row, col, right) = grid.cell_at(pos);
                 let Some(tv) = c.state.terms.get_mut(surface) else { continue };
+                // Cmd+click opens the link under the pointer, whatever the
+                // program asked for.
+                if modifiers.command && button == egui::PointerButton::Primary {
+                    if let Some(link) = tv.link_at(row, col) {
+                        termio::open_url(&link.url);
+                        continue;
+                    }
+                }
                 if termio::mouse_reporting(mode) && !modifiers.shift {
                     let Some(mb) = MouseButton::from_egui(button) else { continue };
                     report(MouseAction::Press, mb, (row, col), modifiers);
@@ -318,6 +326,18 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
         tv.cell_size = Vec2::new(metrics.w, metrics.h);
     }
     pointer_input(ui, &resp, surface, &grid, c);
+
+    // Cmd held over a link: underline it and show a hand.
+    let hover_link = match resp.hover_pos() {
+        Some(pos) if ui.input(|i| i.modifiers.command) && grid_contains(&grid, pos) => {
+            let (row, col, _) = grid.cell_at(pos);
+            c.state.terms.get(surface).and_then(|tv| tv.link_at(row, col)).map(|l| (row, l))
+        }
+        _ => None,
+    };
+    if hover_link.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     if resp.hovered() {
         // Raw wheel events, converted to points. `smooth_scroll_delta` is
         // low-pass filtered over frames, so a single notch can arrive as a
@@ -518,6 +538,13 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
             }
         }
         draw_run(&mut run, run_col, y, run_fg, run_underline, run_len);
+    }
+
+    if let Some((r, link)) = &hover_link {
+        let y = origin.y + (*r as f32 + 1.0) * metrics.h - 1.0;
+        let x0 = origin.x + link.start as f32 * metrics.w;
+        let x1 = origin.x + link.end.min(cols_usize) as f32 * metrics.w;
+        painter.line_segment([Pos2::new(x0, y), Pos2::new(x1, y)], Stroke::new(1.0, theme::ACCENT_HOVER));
     }
 
     // Cursor.

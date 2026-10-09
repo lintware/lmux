@@ -220,6 +220,32 @@ impl TermView {
             })
             .collect()
     }
+
+    /// The link under viewport cell `(row, col)`: an OSC 8 hyperlink the
+    /// program set, else an http(s) URL in the row's text.
+    pub fn link_at(&self, row: usize, col: usize) -> Option<crate::termio::UrlSpan> {
+        let point = self.grid_point(row, col);
+        let grid = self.term.grid();
+        if point.line < grid.topmost_line() || point.line > grid.bottommost_line() {
+            return None;
+        }
+        let r = &grid[point.line];
+        if let Some(link) = r[point.column].hyperlink() {
+            if crate::termio::openable_link(link.uri()) {
+                let same = |c: usize| r[Column(c)].hyperlink().as_ref() == Some(&link);
+                let mut start = point.column.0;
+                while start > 0 && same(start - 1) {
+                    start -= 1;
+                }
+                let mut end = point.column.0 + 1;
+                while end < self.size.cols && same(end) {
+                    end += 1;
+                }
+                return Some(crate::termio::UrlSpan { start, end, url: link.uri().to_owned() });
+            }
+        }
+        crate::termio::url_at(&self.row_chars(row), col)
+    }
 }
 
 fn side(right_half: bool) -> Side {
@@ -462,6 +488,19 @@ mod tests {
         t.start_selection(SelectionType::Lines, 0, 0, false);
         assert_eq!(t.selection_text().as_deref().map(str::trim_end), Some("line3"));
         assert_eq!(t.row_chars(0).iter().collect::<String>().trim_end(), "line3");
+    }
+
+    #[test]
+    fn links_from_text_and_osc8() {
+        let mut t = TermView::new(40, 3);
+        t.feed(b"go to https://a.dev/x now\r\n");
+        t.feed(b"\x1b]8;;https://b.dev/\x1b\\click me\x1b]8;;\x1b\\ plain");
+        let l = t.link_at(0, 8).expect("text url");
+        assert_eq!((l.start, l.end, l.url.as_str()), (6, 21, "https://a.dev/x"));
+        assert!(t.link_at(0, 2).is_none());
+        let l = t.link_at(1, 3).expect("osc 8 link");
+        assert_eq!((l.start, l.end, l.url.as_str()), (0, 8, "https://b.dev/"));
+        assert!(t.link_at(1, 10).is_none());
     }
 
     #[test]
