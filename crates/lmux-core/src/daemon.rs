@@ -818,6 +818,37 @@ impl Inner {
         self.mark_dirty();
     }
 
+    /// Open the browser tabs the state file kept, at their saved URLs. The
+    /// browser starts empty with the daemon: without this a restored browser
+    /// pane is in the tree but has no page, so it never shows a frame.
+    async fn reopen_browsers(self: &Arc<Self>) {
+        let Some(b) = self.browser.clone() else {
+            return;
+        };
+        let browsers: Vec<(Ref, String)> = {
+            let state = self.state.lock().await;
+            state
+                .all_surface_refs()
+                .into_iter()
+                .filter_map(|surf| match state.surface(&surf).map(|s| &s.kind) {
+                    Some(SurfaceKind::Browser { url, .. }) => Some((surf, url.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (surf, url) in browsers {
+            if let Err(e) = b.create_surface(&surf, Some(&url)).await {
+                tracing::warn!(surface = %surf, "reopening browser failed: {e}");
+                continue;
+            }
+            // A viewer that subscribed before its page was back got no stream.
+            if self.has_subscribers(&surf).await {
+                self.clear_streaming(&surf).await;
+                self.maybe_start_fallback_screencast(surf);
+            }
+        }
+    }
+
     /// Record a live pane's cwd, pick up an agent tag the state file lost, and
     /// forget an agent that has exited (its shell is back in the foreground).
     fn observe_live(&self, state: &mut SessionState, surf: &str, w: &WinInfo) {
@@ -1198,6 +1229,10 @@ pub async fn run(cfg: Config, browser: Option<Arc<dyn BrowserBackend>>) -> anyho
 
     tokio::spawn(tmux_event_loop(inner.clone(), ev_rx));
     inner.reconcile().await;
+    {
+        let me = inner.clone();
+        tokio::spawn(async move { me.reopen_browsers().await });
+    }
     inner.mark_dirty();
     inner.mark_all_scrollback_dirty().await;
 
@@ -1737,10 +1772,13 @@ impl Inner {
                     .unwrap()
                     .insert(surface.clone(), (width, height, device_scale_factor));
                 if let Some(b) = &self.browser {
-                    let _ = b
+                    if b
                         .start_screencast(&surface, width, height, device_scale_factor)
-                        .await;
-                    self.mark_streaming(&surface).await;
+                        .await
+                        .is_ok()
+                    {
+                        self.mark_streaming(&surface).await;
+                    }
                 }
             }
             ClientMsg::BrowserInput { surface, event } => {
@@ -1981,7 +2019,7 @@ mod tests {
     /// leave the browser marked as streaming: the next viewer, which subscribes
     /// without a resize, gets a stream at the size the pane was shown at.
     #[tokio::test]
-    async fn browser_stream_restarts_for_a_viewer_after_a_disconnect() {
+    async fn browser_reopens_and_streams_after_restart_and_disconnect() {
         let socket = format!("lmux-test-bs-{}", std::process::id());
         let state_dir = tempfile::tempdir().unwrap();
         let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
@@ -2047,6 +2085,10 @@ mod tests {
             scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
             prs: std::sync::Mutex::new(HashMap::new()),
         });
+
+        // A restart reopens the saved browser tab at its URL.
+        inner.reopen_browsers().await;
+        assert_eq!(fake.calls.lock().unwrap().clone(), vec![format!("create {surf} Some(\"about:blank\")")]);
 
         let a_sink = ClientSink::new(64);
         let a = inner.register(a_sink.clone()).await;
