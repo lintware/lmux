@@ -1084,3 +1084,61 @@ fn snapshot_cmd_hints_and_folded_unread() {
     assert!(h.state().state.digit_hints);
     h.snapshot("sidebar_cmd_hints");
 }
+
+/// What egui-winit delivers on macOS for one keystroke: a key press, then
+/// the text it typed (for printable keys).
+fn keystroke(h: &mut Harness<Fixture>, key: Key, mods: Modifiers, text: Option<&str>) {
+    h.input_mut().events.push(egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: mods,
+    });
+    if let Some(t) = text {
+        h.input_mut().events.push(egui::Event::Text(t.into()));
+    }
+    h.input_mut().events.push(egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: false,
+        repeat: false,
+        modifiers: mods,
+    });
+    h.run();
+}
+
+fn typed_bytes(fx: &Fixture) -> String {
+    fx.state
+        .pending
+        .iter()
+        .filter_map(|m| match m {
+            ClientMsg::TermInput { data, .. } => Some(data.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Typing a sentence sends each character once: a space used to arrive
+/// twice (from the Space key and from its text), which garbled prompts.
+#[test]
+fn typing_a_sentence_sends_each_character_once() {
+    let mut h = harness(fixture());
+    for ch in "and show me".chars() {
+        let key = if ch == ' ' { Key::Space } else { Key::from_name(&ch.to_uppercase().to_string()).unwrap() };
+        keystroke(&mut h, key, Modifiers::NONE, Some(&ch.to_string()));
+    }
+    assert_eq!(typed_bytes(h.state()), "and show me");
+}
+
+/// macOS editing keys reach the terminal as shells and Claude Code expect.
+#[test]
+fn mac_editing_keys_reach_the_terminal() {
+    let mut h = harness(fixture());
+    keystroke(&mut h, Key::Backspace, Modifiers::COMMAND, None);
+    keystroke(&mut h, Key::Backspace, Modifiers::ALT, None);
+    keystroke(&mut h, Key::Backspace, Modifiers::CTRL, None);
+    keystroke(&mut h, Key::ArrowLeft, Modifiers::COMMAND, None);
+    keystroke(&mut h, Key::ArrowRight, Modifiers::ALT, None);
+    assert_eq!(typed_bytes(h.state()), "\u{15}\u{1b}\u{7f}\u{17}\u{1}\u{1b}f");
+}
