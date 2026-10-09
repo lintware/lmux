@@ -34,6 +34,14 @@ const MONO_FACES: &[Face] = &[
     Face { file: "/System/Library/Fonts/Monaco.ttf", index: 0, weight: None },
 ];
 
+/// Fallback faces for symbols, in order.
+const SYMBOL_FACES: &[(&str, &str)] = &[
+    ("menlo-fallback", "/System/Library/Fonts/Menlo.ttc"),
+    ("apple-symbols", "/System/Library/Fonts/Apple Symbols.ttf"),
+    // CJK, last: it is large and only consulted for glyphs the others lack.
+    ("hiragino-sans-gb", "/System/Library/Fonts/Hiragino Sans GB.ttc"),
+];
+
 fn read_face(face: &Face) -> Option<FontData> {
     let bytes = std::fs::read(face.file).ok()?;
     let mut data = FontData { font: bytes.into(), index: face.index, tweak: Default::default() };
@@ -91,16 +99,34 @@ pub fn install(ctx: &egui::Context) -> (String, String) {
         &[FontFamily::Monospace, FontFamily::Name(theme::MONO_FAMILY.into())],
     );
 
-    // Append the built-in fallbacks after our faces.
-    for key in prop_fallbacks {
-        append_unique(defs.families.entry(FontFamily::Proportional).or_default(), &key);
-        append_unique(
-            defs.families.entry(FontFamily::Name(theme::UI_SEMIBOLD_FAMILY.into())).or_default(),
-            &key,
-        );
+    // Symbols SF lacks (◆ ⏺ ✻ ⎿ braille spinners, box drawing…) come from
+    // Menlo and Apple Symbols, then egui's own faces. Every family gets the
+    // whole chain, the named ones too: theme::ui() draws with a named family,
+    // so a family without fallbacks paints `?` for a glyph its face lacks.
+    let mut symbols: Vec<String> = Vec::new();
+    for (key, file) in SYMBOL_FACES {
+        if let Some(data) = read_face(&Face { file, index: 0, weight: None }) {
+            defs.font_data.insert((*key).to_owned(), Arc::new(data));
+            symbols.push((*key).to_owned());
+        }
     }
-    for key in mono_fallbacks {
-        append_unique(defs.families.entry(FontFamily::Monospace).or_default(), &key);
+    let ui_fams = [
+        FontFamily::Proportional,
+        FontFamily::Name(theme::UI_FAMILY.into()),
+        FontFamily::Name(theme::UI_SEMIBOLD_FAMILY.into()),
+    ];
+    let mono_fams = [FontFamily::Monospace, FontFamily::Name(theme::MONO_FAMILY.into())];
+    for fam in &ui_fams {
+        let list = defs.families.entry(fam.clone()).or_default();
+        for key in symbols.iter().chain(prop_fallbacks.iter()) {
+            append_unique(list, key);
+        }
+    }
+    for fam in &mono_fams {
+        let list = defs.families.entry(fam.clone()).or_default();
+        for key in symbols.iter().chain(mono_fallbacks.iter()).chain(prop_fallbacks.iter()) {
+            append_unique(list, key);
+        }
     }
 
     if ui.is_none() {
