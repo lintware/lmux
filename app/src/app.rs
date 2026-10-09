@@ -210,6 +210,12 @@ impl eframe::App for LmuxApp {
             render_hosts(ui, &mut hosts, active);
         }
 
+        // OSC 52: a program copied text, here or on a remote host.
+        let copied: Vec<String> = self.hosts.iter_mut().flat_map(|h| h.state.take_clipboard_requests()).collect();
+        if let Some(text) = copied.into_iter().last() {
+            ctx.copy_text(text);
+        }
+
         // Unread notifications on every host, on the Dock icon.
         let unread: u32 = self.hosts.iter().map(|h| h.state.unread_total()).sum();
         if unread != self.dock_badge {

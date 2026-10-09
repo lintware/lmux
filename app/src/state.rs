@@ -1561,6 +1561,13 @@ impl AppState {
 
     /// Send input bytes to a terminal: a local pane's PTY when this process
     /// owns one, otherwise the daemon.
+    /// Text terminals copied with OSC 52 since the last call: the app puts
+    /// it on the system clipboard. Remote panes included, since the escape
+    /// travels with their output.
+    pub fn take_clipboard_requests(&mut self) -> Vec<String> {
+        self.terms.values_mut().flat_map(|t| t.take_clipboard()).collect()
+    }
+
     pub fn send_term_input(&mut self, surface: &str, bytes: &[u8]) {
         if bytes.is_empty() {
             return;

@@ -3,7 +3,9 @@
 //! We never hand-write the emulator; we own a `Term`, feed it bytes from the
 //! daemon, and paint its grid ourselves with egui's painter (see `ui::terminal`).
 
-use alacritty_terminal::event::VoidListener;
+use std::sync::{Arc, Mutex};
+
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 pub use alacritty_terminal::selection::SelectionType;
@@ -37,8 +39,28 @@ impl Dimensions for TermSize {
     }
 }
 
+/// Collects what the terminal asks of the app. Today that is OSC 52 copy: a
+/// program (local, or on a remote host through tmux and the daemon) sets the
+/// clipboard, and the app puts the text on this machine's clipboard. OSC 52
+/// *reads* stay denied (alacritty's default), so no program can read it.
+#[derive(Clone, Default)]
+pub struct Listener {
+    clipboard: Arc<Mutex<Vec<String>>>,
+}
+
+impl EventListener for Listener {
+    fn send_event(&self, event: Event) {
+        if let Event::ClipboardStore(_, text) = event {
+            if let Ok(mut q) = self.clipboard.lock() {
+                q.push(text);
+            }
+        }
+    }
+}
+
 pub struct TermView {
-    term: Term<VoidListener>,
+    term: Term<Listener>,
+    listener: Listener,
     processor: Processor,
     size: TermSize,
     /// Wheel remainder: points that did not add up to a whole line yet, so a
@@ -82,8 +104,10 @@ pub struct PointerState {
 impl TermView {
     pub fn new(cols: u16, rows: u16) -> Self {
         let size = TermSize::new(cols as usize, rows as usize);
+        let listener = Listener::default();
         Self {
-            term: new_term(size),
+            term: new_term(size, listener.clone()),
+            listener,
             processor: Processor::new(),
             size,
             scroll_accum: 0.0,
@@ -127,11 +151,16 @@ impl TermView {
     /// the ANSI text into it (the daemon guarantees this reproduces the screen).
     pub fn apply_snapshot(&mut self, cols: u16, rows: u16, data: &str) {
         let size = TermSize::new(cols as usize, rows as usize);
-        self.term = new_term(size);
+        self.term = new_term(size, self.listener.clone());
         self.processor = Processor::new();
         self.size = size;
         self.feed(data.as_bytes());
         self.have_snapshot = true;
+    }
+
+    /// Text programs copied with OSC 52 since the last call, oldest first.
+    pub fn take_clipboard(&mut self) -> Vec<String> {
+        self.listener.clipboard.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
     }
 
     pub fn scroll(&mut self, lines: i32) {
@@ -164,7 +193,7 @@ impl TermView {
         self.term.renderable_content().cursor
     }
 
-    pub fn term(&self) -> &Term<VoidListener> {
+    pub fn term(&self) -> &Term<Listener> {
         &self.term
     }
 
@@ -264,9 +293,9 @@ fn side(right_half: bool) -> Side {
     }
 }
 
-fn new_term(size: TermSize) -> Term<VoidListener> {
+fn new_term(size: TermSize, listener: Listener) -> Term<Listener> {
     let config = Config { scrolling_history: 10_000, ..Config::default() };
-    Term::new(config, &size, VoidListener)
+    Term::new(config, &size, listener)
 }
 
 // --- colours ---------------------------------------------------------------

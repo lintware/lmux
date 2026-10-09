@@ -11,6 +11,10 @@
 //! client if it ever exits, so a broken stream can never be permanent.
 
 use std::collections::{HashMap, VecDeque};
+
+/// Bytes per `send-keys -H` command in `Tmux::send_bytes`: well under what
+/// tmux's command parser can take in one go.
+const SEND_CHUNK: usize = 1024;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -260,9 +264,14 @@ impl Tmux {
         if bytes.is_empty() {
             return Ok(());
         }
-        let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        self.command(format!("send-keys -t {} -H {}", pane, hex.join(" ")))
-            .await?;
+        // One `send-keys -H` argument per byte: a big paste in one command
+        // overflows tmux's parser ("yacc stack overflow") and the whole paste
+        // is lost, so it goes in chunks, in order.
+        for chunk in bytes.chunks(SEND_CHUNK) {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            self.command(format!("send-keys -t {} -H {}", pane, hex.join(" ")))
+                .await?;
+        }
         Ok(())
     }
 
@@ -961,5 +970,51 @@ mod tests {
             .await;
         assert!(alive, "a live window exists");
         assert!(!after, "a killed window does not");
+    }
+
+    /// A large paste reaches the pane whole and in order. One send-keys for
+    /// ~30 KB used to fail with "yacc stack overflow" and drop it all.
+    #[tokio::test]
+    async fn a_large_paste_reaches_the_pane_intact() {
+        if !tmux_available().await {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        let socket = format!("lmux-test-paste-{}", std::process::id());
+        let cfg = TmuxConfig { socket: socket.clone(), session: "lmux".into() };
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let tmux = match Tmux::spawn(cfg, ev_tx).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping: could not start tmux ({e})");
+                return;
+            }
+        };
+        let dir = std::env::temp_dir().join(format!("lmux-paste-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("out.txt");
+        let cmd = format!("stty -echo -icanon; head -c 65536 > {}; sleep 30", out.display());
+        let (_w, pane) = tmux
+            .new_terminal("/tmp", Some(&cmd), &[], 80, 24, "p", "surface:1", "workspace:1")
+            .await
+            .expect("new_terminal");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let payload: Vec<u8> = (0..65536u32).map(|i| b"abcdefghijklmnopqrstuvwxyz0123456789 \n"[(i % 38) as usize]).collect();
+        let sent = tmux.send_bytes(&pane, &payload).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0) < 65536 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let got = std::fs::read(&out).unwrap_or_default();
+        let _ = Command::new("tmux")
+            .args(["-L", &socket, "kill-server"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(sent.is_ok(), "send_bytes failed: {sent:?}");
+        assert_eq!(got.len(), payload.len(), "every byte arrives");
+        assert!(got == payload, "in order");
     }
 }
