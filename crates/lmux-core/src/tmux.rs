@@ -223,6 +223,13 @@ impl Tmux {
         ));
 
         let out = self.command(line).await?;
+        // Leave the control client on the idle window: tmux counts every
+        // client as focused, so whichever terminal it showed would always
+        // look focused to programs that ask (see `IDLE_WINDOW`). Separate so
+        // a missing idle window cannot fail the creation.
+        let _ = self
+            .command(format!("select-window -t {}", shell_quote(&format!("={}:={IDLE_WINDOW}", self.session))))
+            .await;
         let mut it = out.split_whitespace();
         let window = it
             .next()
@@ -559,6 +566,12 @@ fn keep_env(name: &str) -> bool {
     KEEP_ENV.contains(&name) || name.starts_with("LC_")
 }
 
+/// The session's placeholder window. The daemon's control client is attached
+/// to the session and tmux treats it as a focused client, so the session's
+/// current window reads as focused (`focus-events`); keeping that on a window
+/// with no terminal leaves focus to the app, which reports it per pane.
+const IDLE_WINDOW: &str = "_lmux_idle";
+
 /// Server-wide settings, applied to new servers and to ones an older daemon
 /// made.
 async fn server_defaults(cfg: &TmuxConfig) {
@@ -598,6 +611,23 @@ async fn server_defaults(cfg: &TmuxConfig) {
         }
     }
     tmux(v(&["set-environment", "-g", "COLORTERM", "truecolor"])).await;
+    // Programs that ask (Claude Code checks this option) get focus in/out.
+    tmux(v(&["set-option", "-s", "focus-events", "on"])).await;
+    // An idle window to keep the control client on (see `IDLE_WINDOW`).
+    let has_idle = Command::new("tmux")
+        .args(["-L", &cfg.socket, "list-windows", "-t", &format!("={}", cfg.session), "-F", "#{window_name}"])
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| l == IDLE_WINDOW));
+    if !has_idle {
+        tmux(v(&[
+            "new-window", "-d", "-t", &format!("={}:", cfg.session), "-n", IDLE_WINDOW,
+            "exec tail -f /dev/null",
+        ]))
+        .await;
+    }
+    tmux(v(&["select-window", "-t", &format!("={}:={IDLE_WINDOW}", cfg.session)])).await;
 }
 
 async fn ensure_session(cfg: &TmuxConfig) -> anyhow::Result<()> {
@@ -1132,6 +1162,55 @@ mod tests {
         }
         .await;
         result.unwrap();
+    }
+
+    /// focus-events is on (Claude Code checks it), yet the daemon's own
+    /// control client never makes a terminal look focused: creating another
+    /// terminal sends no focus in/out to the first one. Focus is the app's.
+    #[tokio::test]
+    async fn the_control_client_never_reports_focus() {
+        if !tmux_available().await {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        let socket = format!("lmux-test-focus-{}", std::process::id());
+        let _scratch = ScratchServer(socket.clone());
+        let cfg = TmuxConfig { socket: socket.clone(), session: "lmux".into() };
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let tmux = match Tmux::spawn(cfg, ev_tx).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping: could not start tmux ({e})");
+                return;
+            }
+        };
+        let opt = Command::new("tmux")
+            .args(["-L", &socket, "show", "-gv", "focus-events"])
+            .output()
+            .await
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default();
+        assert_eq!(opt, "on");
+        // `cat -v` shows a focus report as `^[[I` / `^[[O`.
+        let (_w, first) = tmux
+            .new_terminal("/tmp", Some("printf '\\033[?1004h'; printf READY; exec cat -v"), &[], 80, 24, "a", "surface:1", "workspace:1")
+            .await
+            .expect("first terminal");
+        let mut ready = false;
+        for _ in 0..50 {
+            if tmux.capture(&first, false, None).await.is_ok_and(|c| c.contains("READY")) {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "the first terminal never started");
+        tmux.new_terminal("/tmp", None, &[], 80, 24, "b", "surface:2", "workspace:1")
+            .await
+            .expect("second terminal");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let screen = tmux.capture(&first, false, None).await.unwrap_or_default();
+        assert!(!screen.contains("^[[O") && !screen.contains("^[[I"), "focus was reported: {screen:?}");
     }
 
     /// A window titled like the session (a workspace named `lmux`) must not

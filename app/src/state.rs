@@ -180,6 +180,10 @@ pub struct AppState {
     /// PTYs owned by this process, one per local terminal surface. Present only
     /// while the connected host is this machine (see [`AppState::local_mode`]).
     pub local_ptys: HashMap<Ref, LocalPty>,
+    /// Focus in/out last reported to each terminal that asked for focus
+    /// events (mode 1004). Missing means focused: what programs assume, and
+    /// what a fresh tmux client reports.
+    pub focus_reported: HashMap<Ref, bool>,
     /// True while the connected host is the machine the app runs on. Terminal
     /// panes then attach through a local PTY instead of the daemon's stream.
     pub local_mode: bool,
@@ -567,6 +571,7 @@ impl AppState {
             terms: HashMap::new(),
             browsers: HashMap::new(),
             local_ptys: HashMap::new(),
+            focus_reported: HashMap::new(),
             local_mode: false,
             local_wanted: HashSet::new(),
             local_retry: HashMap::new(),
@@ -1904,6 +1909,57 @@ impl AppState {
         }
     }
 
+    /// Tell terminals that asked for focus events (mode 1004, which Claude Code
+    /// uses) whether they have the keyboard: only the focused pane's terminal
+    /// does, and only while the window is focused. A local pane's mode is its
+    /// tmux client's, so the report goes to that client, which passes it on
+    /// to the pane; a streamed pane's mode is the program's own, and the
+    /// report goes straight to it. Hidden terminals are left alone: their
+    /// modes may be stale, and a report a program did not ask for would be
+    /// typed into it.
+    pub fn sync_focus_reports(&mut self, window_focused: bool) {
+        let focused = if window_focused {
+            self.focused_pane()
+                .and_then(|p| self.pane(&p).and_then(|p| self.active_surface(p)))
+        } else {
+            None
+        };
+        let ids: Vec<Ref> = self.terms.keys().cloned().collect();
+        for id in ids {
+            let local = self.local_terminal(&id);
+            let live = if local {
+                self.local_ptys.contains_key(&id)
+            } else {
+                self.terms.get(&id).is_some_and(|t| t.subscribed)
+            };
+            if !live {
+                // A reattached tmux client starts out focused.
+                if local {
+                    self.focus_reported.remove(&id);
+                }
+                continue;
+            }
+            if !self.term_mode(&id).contains(alacritty_terminal::term::TermMode::FOCUS_IN_OUT) {
+                continue;
+            }
+            let want = focused.as_deref() == Some(id.as_str());
+            if self.focus_reported.get(&id).copied().unwrap_or(true) == want {
+                continue;
+            }
+            self.focus_reported.insert(id.clone(), want);
+            let bytes: &[u8] = if want { b"\x1b[I" } else { b"\x1b[O" };
+            if local {
+                self.write_local(&id, bytes);
+            } else {
+                self.pending.push(ClientMsg::TermInput {
+                    surface: id.clone(),
+                    data: String::from_utf8_lossy(bytes).into_owned(),
+                });
+            }
+        }
+        self.focus_reported.retain(|id, _| self.terms.contains_key(id));
+    }
+
     /// The terminal modes the program in `surface` has set (empty if unknown).
     pub fn term_mode(&self, surface: &str) -> alacritty_terminal::term::TermMode {
         self.terms.get(surface).map(|t| t.mode()).unwrap_or_else(alacritty_terminal::term::TermMode::empty)
@@ -1998,6 +2054,37 @@ mod tests {
         assert_eq!(s.terms["surface:1"].display_offset(), 0);
     }
 
+
+    /// Terminals that asked for focus events hear when they gain or lose the
+    /// keyboard; the rest are never sent a report.
+    #[test]
+    fn focus_reports_go_to_terminals_that_asked() {
+        let mut s = state_with(&["a", "b", "c"], "a");
+        for id in ["a", "b", "c"] {
+            let tv = s.ensure_term(id);
+            tv.subscribed = true;
+            if id != "c" {
+                tv.feed(b"\x1b[?1004h");
+            }
+        }
+        let reports = |s: &mut AppState| -> Vec<(String, String)> {
+            std::mem::take(&mut s.pending)
+                .into_iter()
+                .filter_map(|m| match m {
+                    ClientMsg::TermInput { surface, data } => Some((surface, data)),
+                    _ => None,
+                })
+                .collect()
+        };
+        s.sync_focus_reports(true);
+        assert_eq!(reports(&mut s), vec![("b".to_owned(), "\x1b[O".to_owned())]);
+        s.sync_focus_reports(true);
+        assert!(reports(&mut s).is_empty(), "a report is sent once");
+        s.sync_focus_reports(false);
+        assert_eq!(reports(&mut s), vec![("a".to_owned(), "\x1b[O".to_owned())]);
+        s.sync_focus_reports(true);
+        assert_eq!(reports(&mut s), vec![("a".to_owned(), "\x1b[I".to_owned())]);
+    }
 
     fn term(id: &str) -> Surface {
         Surface {

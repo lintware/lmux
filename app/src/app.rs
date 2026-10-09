@@ -189,6 +189,10 @@ impl eframe::App for LmuxApp {
                 }
             }
 
+            for (i, h) in self.hosts.iter_mut().enumerate() {
+                h.state.sync_focus_reports(window_focused && i == active);
+            }
+
             // --- OS notifications ----------------------------------------
             let queue: Vec<_> = self
                 .hosts
