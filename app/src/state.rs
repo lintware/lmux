@@ -15,6 +15,17 @@ use crate::wire::{self, m, ClientMsg, Ref};
 /// died, so a tmux that cannot serve the pane is not respawned every frame.
 const LOCAL_PTY_RETRY: Duration = Duration::from_secs(1);
 
+/// What to do with the reply to a browser request.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BrowserReply {
+    /// `surface.new` for a blank tab: focus its address bar.
+    FocusAddressBar,
+    /// An eval returning the page's selected text: put it on the clipboard.
+    Copy,
+    /// `browser.link_at`: open the link, if any, as a new tab in `pane`.
+    OpenLink { pane: Ref },
+}
+
 pub struct BrowserView {
     pub url: String,
     pub title: String,
@@ -34,6 +45,9 @@ pub struct BrowserView {
     pub pending_size: Option<(u32, u32, f32)>,
     pub pending_since: Option<std::time::Instant>,
     pub url_draft: Option<String>,
+    /// Focus the address bar and select its text on the next draw (Cmd+L, a
+    /// new tab).
+    pub focus_url: bool,
     pub have_frame: bool,
 }
 
@@ -60,6 +74,7 @@ impl BrowserView {
             pending_size: None,
             pending_since: None,
             url_draft: None,
+            focus_url: false,
             have_frame: false,
         }
     }
@@ -181,6 +196,11 @@ pub struct AppState {
     pub folder_toggle: Option<FolderToggle>,
     /// `folder.new` requests whose result should open the rename editor.
     folder_rename_pending: Option<u64>,
+    /// Browser requests whose reply the app acts on, by RPC id.
+    browser_replies: HashMap<u64, BrowserReply>,
+    /// Text for the system clipboard, put there on the next frame (the reply to
+    /// a browser copy arrives without an egui context at hand).
+    pub clipboard_out: Option<String>,
     pub last_width: f32,
 
     // connection/status
@@ -459,6 +479,8 @@ impl AppState {
             digit_hints: false,
             animate: false,
             pending_closes: HashMap::new(),
+            browser_replies: HashMap::new(),
+            clipboard_out: None,
             confirm_close: None,
             term_font: crate::theme::FS_TERM,
             folder_toggle: None,
@@ -1076,13 +1098,68 @@ impl AppState {
         self.rpc(m::SURFACE_NEW, serde_json::json!({ "pane": pane, "type": "terminal" }));
     }
 
-    /// The globe / `Cmd+Shift+B`: a new browser chip in a pane.
+    /// The globe / `Cmd+Shift+B`: a new browser chip in a pane. It opens blank
+    /// with the address bar focused, so the user can type straight away.
     pub fn new_browser_chip(&mut self, pane: &str) {
         self.clear_tab_override(pane);
-        self.rpc(
+        self.browser_request(
             m::SURFACE_NEW,
-            serde_json::json!({ "pane": pane, "type": "browser", "url": "https://example.com/" }),
+            serde_json::json!({ "pane": pane, "type": "browser", "url": "about:blank" }),
+            BrowserReply::FocusAddressBar,
         );
+    }
+
+    /// A browser chip at `url` in a pane (middle- or Cmd-click on a link).
+    pub fn open_browser_tab(&mut self, pane: &str, url: &str) {
+        self.clear_tab_override(pane);
+        self.rpc(m::SURFACE_NEW, serde_json::json!({ "pane": pane, "type": "browser", "url": url }));
+    }
+
+    /// The focused pane's active surface, when it is a browser.
+    pub fn focused_browser(&self) -> Option<Ref> {
+        let pane = self.focused_pane()?;
+        let sid = self.pane(&pane).and_then(|p| self.active_surface(p))?;
+        matches!(self.surface(&sid).map(|s| &s.kind), Some(SurfaceKind::Browser { .. }))
+            .then_some(sid)
+    }
+
+    /// Cmd+L: edit the address, with all of it selected.
+    pub fn focus_address_bar(&mut self, surface: &str) {
+        let b = self.ensure_browser(surface, "");
+        if b.url_draft.is_none() {
+            b.url_draft = Some(if b.url == "about:blank" { String::new() } else { b.url.clone() });
+        }
+        b.focus_url = true;
+    }
+
+    /// Send a browser request whose reply the app acts on.
+    pub fn browser_request(&mut self, method: &str, params: serde_json::Value, reply: BrowserReply) {
+        let id = self.rpc_with_id(method, params);
+        self.browser_replies.insert(id, reply);
+    }
+
+    fn on_browser_reply(&mut self, reply: BrowserReply, result: Option<&serde_json::Value>) {
+        let Some(result) = result else { return };
+        match reply {
+            BrowserReply::FocusAddressBar => {
+                if let Some(sid) = result.get("surface").and_then(|v| v.as_str()) {
+                    self.ensure_browser(sid, "about:blank");
+                    self.focus_address_bar(sid);
+                }
+            }
+            BrowserReply::Copy => {
+                if let Some(text) = result.get("value").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        self.clipboard_out = Some(text.to_owned());
+                    }
+                }
+            }
+            BrowserReply::OpenLink { pane } => {
+                if let Some(href) = result.get("href").and_then(|v| v.as_str()) {
+                    self.open_browser_tab(&pane, href);
+                }
+            }
+        }
     }
 
     /// A new surface becomes the pane's active one, so drop any local tab
@@ -1225,6 +1302,9 @@ impl AppState {
             }
             ServerMsg::Log { .. } => {}
             ServerMsg::RpcResult { response } => {
+                if let Some(reply) = self.browser_replies.remove(&response.id) {
+                    self.on_browser_reply(reply, response.result.as_ref());
+                }
                 let close = self.pending_closes.remove(&response.id);
                 match (response.error, close) {
                     (Some(err), Some(target)) if err.code == lmux_proto::RpcErrorCode::Busy => {

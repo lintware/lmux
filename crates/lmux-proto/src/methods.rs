@@ -65,6 +65,9 @@ pub const BROWSER_GOTO: &str = "browser.goto"; // {surface?, url}
 pub const BROWSER_BACK: &str = "browser.back"; // {surface?}
 pub const BROWSER_FORWARD: &str = "browser.forward"; // {surface?}
 pub const BROWSER_RELOAD: &str = "browser.reload"; // {surface?}
+pub const BROWSER_STOP: &str = "browser.stop"; // {surface?} (stop loading the page)
+pub const BROWSER_ZOOM: &str = "browser.zoom"; // {surface?, step?: i32 (+1 in, -1 out, 0 reset), zoom?: f64} -> {zoom} (page zoom, as Cmd+= in a browser)
+pub const BROWSER_LINK_AT: &str = "browser.link_at"; // {surface?, x, y} (viewer CSS px) -> {href: string|null}
 pub const BROWSER_URL: &str = "browser.url"; // {surface?} -> {url, title}
 pub const BROWSER_SNAPSHOT: &str = "browser.snapshot"; // {surface?, interactive?: bool} -> {text, refs}
 pub const BROWSER_CLICK: &str = "browser.click"; // {surface?, target} target = "e12" ref or CSS selector

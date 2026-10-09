@@ -112,6 +112,75 @@ const ENCODER_SLACK: f32 = 0.95;
 /// level 1 cuts bytes while keeping full resolution (text stays legible); level 2
 /// also downscales the capture for a badly lagging client. The page's layout is
 /// never changed — only the captured frame size.
+/// Chrome's zoom levels, as Cmd+= / Cmd+- step through them.
+const ZOOM_LEVELS: [f64; 13] = [0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
+
+/// The next zoom level from `current` in direction `step` (+1 in, -1 out, 0 reset).
+fn step_zoom(current: f64, step: i64) -> f64 {
+    const EPS: f64 = 1e-6;
+    match step.signum() {
+        0 => 1.0,
+        1 => ZOOM_LEVELS
+            .iter()
+            .copied()
+            .find(|z| *z > current + EPS)
+            .unwrap_or(ZOOM_LEVELS[ZOOM_LEVELS.len() - 1]),
+        _ => ZOOM_LEVELS
+            .iter()
+            .rev()
+            .copied()
+            .find(|z| *z < current - EPS)
+            .unwrap_or(ZOOM_LEVELS[0]),
+    }
+}
+
+/// Device metrics for a viewer canvas of `width`×`height` CSS px at `dsf`, with
+/// the page zoomed by `zoom`. Zoom works as in Chrome: the page lays out in a
+/// viewport `1/zoom` as wide at `zoom` times the device scale, so it reflows and
+/// the captured frame keeps the same pixel size. Input coordinates from the
+/// viewer are divided by `zoom` to match (see `input`).
+fn zoomed_metrics(width: u32, height: u32, dsf: f32, zoom: f64) -> Value {
+    let z = if zoom > 0.0 { zoom } else { 1.0 };
+    json!({
+        "width": ((width as f64) / z).round().max(1.0) as u32,
+        "height": ((height as f64) / z).round().max(1.0) as u32,
+        "deviceScaleFactor": (dsf as f64) * z,
+        "mobile": false,
+    })
+}
+
+/// Editing commands for a Mac-style shortcut. Headless Chromium does not map
+/// Cmd+A, Cmd+Z, Option+Left and friends to editing on its own (the browser
+/// process normally does), so the key event names them via `commands`.
+fn edit_commands(key: &str, m: &Modifiers) -> Vec<&'static str> {
+    let sel = m.shift;
+    let pick = |plain: &'static str, extend: &'static str| vec![if sel { extend } else { plain }];
+    if m.meta && !m.ctrl && !m.alt {
+        return match key {
+            "a" | "A" => vec!["selectAll"],
+            "z" | "Z" if sel => vec!["redo"],
+            "z" | "Z" => vec!["undo"],
+            "ArrowLeft" => pick("moveToBeginningOfLine", "moveToBeginningOfLineAndModifySelection"),
+            "ArrowRight" => pick("moveToEndOfLine", "moveToEndOfLineAndModifySelection"),
+            "ArrowUp" => pick("moveToBeginningOfDocument", "moveToBeginningOfDocumentAndModifySelection"),
+            "ArrowDown" => pick("moveToEndOfDocument", "moveToEndOfDocumentAndModifySelection"),
+            "Backspace" => vec!["deleteToBeginningOfLine"],
+            "Delete" => vec!["deleteToEndOfLine"],
+            _ => vec![],
+        };
+    }
+    if m.alt && !m.meta && !m.ctrl {
+        return match key {
+            "ArrowLeft" => pick("moveWordLeft", "moveWordLeftAndModifySelection"),
+            "ArrowRight" => pick("moveWordRight", "moveWordRightAndModifySelection"),
+            "Backspace" => vec!["deleteWordBackward"],
+            "Delete" => vec!["deleteWordForward"],
+            _ => vec![],
+        };
+    }
+    vec![]
+}
+
 fn level_params(level: u32) -> (u32, f32) {
     match level {
         0 => (70, 1.0),
@@ -296,12 +365,7 @@ impl BrowserManager {
         self.page_call_a(
             &s,
             "Emulation.setDeviceMetricsOverride",
-            json!({
-                "width": width,
-                "height": height,
-                "deviceScaleFactor": device_scale_factor,
-                "mobile": false,
-            }),
+            zoomed_metrics(width, height, device_scale_factor, s.zoom()),
         )
         .await?;
         self.page_call_a(
@@ -426,6 +490,9 @@ impl BrowserManager {
     /// Forward a raw input event (mouse / wheel / key / IME) to the page.
     pub async fn input(&self, surface: &str, event: BrowserInputEvent) -> anyhow::Result<()> {
         let s = self.surface_anyhow(surface).await?;
+        // The viewer sends CSS px of its canvas; a zoomed page lays out smaller.
+        let z = s.zoom();
+        let z = if z > 0.0 { z } else { 1.0 };
         match event {
             BrowserInputEvent::Mouse {
                 action,
@@ -450,7 +517,7 @@ impl BrowserManager {
                     &s,
                     "Input.dispatchMouseEvent",
                     json!({
-                        "type": typ, "x": x, "y": y, "button": btn,
+                        "type": typ, "x": x / z, "y": y / z, "button": btn,
                         "clickCount": click_count, "buttons": buttons,
                         "modifiers": cdp_mods(&modifiers),
                     }),
@@ -468,7 +535,7 @@ impl BrowserManager {
                     &s,
                     "Input.dispatchMouseEvent",
                     json!({
-                        "type": "mouseWheel", "x": x, "y": y,
+                        "type": "mouseWheel", "x": x / z, "y": y / z,
                         "deltaX": delta_x, "deltaY": delta_y,
                         "button": "none", "clickCount": 0,
                         "modifiers": cdp_mods(&modifiers),
@@ -503,6 +570,12 @@ impl BrowserManager {
                     if !t.is_empty() {
                         p["text"] = json!(t);
                         p["unmodifiedText"] = json!(t);
+                    }
+                }
+                if matches!(action, KeyAction::Down) {
+                    let cmds = edit_commands(&key, &modifiers);
+                    if !cmds.is_empty() {
+                        p["commands"] = json!(cmds);
                     }
                 }
                 self.page_call_a(&s, "Input.dispatchKeyEvent", p).await?;
@@ -678,6 +751,16 @@ impl BrowserManager {
             down["text"] = json!(t);
             down["unmodifiedText"] = json!(t);
         }
+        let m = Modifiers {
+            alt: mods & 1 != 0,
+            ctrl: mods & 2 != 0,
+            meta: mods & 4 != 0,
+            shift: mods & 8 != 0,
+        };
+        let cmds = edit_commands(&spec.key, &m);
+        if !cmds.is_empty() {
+            down["commands"] = json!(cmds);
+        }
         self.page_call(s, "Input.dispatchKeyEvent", down).await?;
         let up = json!({
             "type": "keyUp", "key": spec.key, "code": spec.code,
@@ -791,6 +874,41 @@ impl BrowserManager {
             m::BROWSER_RELOAD => {
                 self.page_call(&s, "Page.reload", json!({ "ignoreCache": false })).await?;
                 Ok(json!({}))
+            }
+            m::BROWSER_STOP => {
+                self.page_call(&s, "Page.stopLoading", json!({})).await?;
+                s.loading.store(false, Ordering::SeqCst);
+                s.emit_meta(&self.inner.events).await;
+                Ok(json!({}))
+            }
+            m::BROWSER_ZOOM => {
+                let z = match params.get("zoom").and_then(Value::as_f64) {
+                    Some(z) if z.is_finite() && z > 0.0 => z.clamp(ZOOM_LEVELS[0], ZOOM_LEVELS[ZOOM_LEVELS.len() - 1]),
+                    Some(_) => return Err(err_invalid("zoom must be a positive number")),
+                    None => {
+                        let step = params.get("step").and_then(Value::as_i64).unwrap_or(0);
+                        step_zoom(s.zoom(), step)
+                    }
+                };
+                s.set_zoom(z);
+                let cfg = s.screencast.lock().await.as_ref().map(|c| (c.width, c.height, c.dsf));
+                let (w, h, dsf) = cfg.unwrap_or((s.default_width, s.default_height, 1.0));
+                self.page_call(&s, "Emulation.setDeviceMetricsOverride", zoomed_metrics(w, h, dsf, z))
+                    .await?;
+                Ok(json!({ "zoom": z }))
+            }
+            m::BROWSER_LINK_AT => {
+                let num = |k: &str| {
+                    params
+                        .get(k)
+                        .and_then(Value::as_f64)
+                        .ok_or_else(|| err_invalid(format!("missing `{k}`")))
+                };
+                let z = s.zoom();
+                let z = if z > 0.0 { z } else { 1.0 };
+                let (x, y) = (num("x")? / z, num("y")? / z);
+                let v = self.eval(&s, &js::link_at_expr(x, y)).await?;
+                Ok(json!({ "href": v }))
             }
             m::BROWSER_URL => {
                 let mut url = s.url.lock().await.clone();
@@ -1581,6 +1699,58 @@ fn key_vk(key: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zoom_steps_through_chromes_levels() {
+        assert_eq!(step_zoom(1.0, 1), 1.1);
+        assert_eq!(step_zoom(1.0, -1), 0.9);
+        assert_eq!(step_zoom(1.3, 0), 1.0);
+        // Off-grid values snap to the next level in the step's direction.
+        assert_eq!(step_zoom(1.3, 1), 1.5);
+        assert_eq!(step_zoom(1.3, -1), 1.25);
+        // Clamped at both ends.
+        assert_eq!(step_zoom(3.0, 1), 3.0);
+        assert_eq!(step_zoom(0.5, -1), 0.5);
+    }
+
+    #[test]
+    fn zoom_shrinks_the_layout_viewport_and_raises_the_scale() {
+        let m = zoomed_metrics(1000, 600, 1.0, 2.0);
+        assert_eq!(m["width"], 500);
+        assert_eq!(m["height"], 300);
+        assert_eq!(m["deviceScaleFactor"], 2.0);
+        let m = zoomed_metrics(1000, 600, 1.0, 1.0);
+        assert_eq!(m["width"], 1000);
+        assert_eq!(m["deviceScaleFactor"], 1.0);
+    }
+
+    #[test]
+    fn mac_editing_shortcuts_name_their_commands() {
+        let meta = Modifiers { meta: true, ..Default::default() };
+        let meta_shift = Modifiers { meta: true, shift: true, ..Default::default() };
+        let alt = Modifiers { alt: true, ..Default::default() };
+        assert_eq!(edit_commands("a", &meta), vec!["selectAll"]);
+        assert_eq!(edit_commands("z", &meta), vec!["undo"]);
+        assert_eq!(edit_commands("z", &meta_shift), vec!["redo"]);
+        assert_eq!(
+            edit_commands("ArrowLeft", &meta_shift),
+            vec!["moveToBeginningOfLineAndModifySelection"]
+        );
+        assert_eq!(edit_commands("ArrowRight", &alt), vec!["moveWordRight"]);
+        assert_eq!(edit_commands("Backspace", &alt), vec!["deleteWordBackward"]);
+        // Plain keys and unknown chords pass through untouched.
+        assert!(edit_commands("a", &Modifiers::default()).is_empty());
+        assert!(edit_commands("q", &meta).is_empty());
+    }
+
+    #[test]
+    fn link_at_expr_is_well_formed() {
+        let e = js::link_at_expr(12.5, 40.0);
+        assert!(e.contains("elementFromPoint(12.5,40)"));
+        assert!(e.contains("closest('a[href],area[href]')"));
+        // Non-finite input never reaches the page as `NaN`.
+        assert!(js::link_at_expr(f64::NAN, 1.0).contains("elementFromPoint(0,1)"));
+    }
 
     #[test]
     fn ref_detection() {

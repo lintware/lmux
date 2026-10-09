@@ -14,6 +14,71 @@ use super::icons::{self, Arrow};
 
 const TOOLBAR_H: f32 = 28.0;
 
+/// Shown in the address bar of a blank page.
+const PLACEHOLDER: &str = "Search or enter address";
+
+/// Where the address bar's text should go, as cmux's omnibar decides: a URL
+/// with a scheme as typed, a bare host (`example.com`, `localhost:3000`,
+/// `10.0.0.2/x`) with a scheme added, and anything else as a web search.
+/// `None` for blank input.
+pub fn address_to_url(input: &str) -> Option<String> {
+    let t = input.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.chars().any(char::is_whitespace) {
+        return Some(search_url(t));
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower.contains("://") {
+        return Some(t.to_owned());
+    }
+    const SCHEMES: [&str; 6] = ["about:", "data:", "file:", "view-source:", "chrome:", "mailto:"];
+    if SCHEMES.iter().any(|s| lower.starts_with(s)) {
+        return Some(t.to_owned());
+    }
+    // The host part: up to the first '/', '?' or '#', without a port or user.
+    let authority = lower.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (host_port, None),
+    };
+    if port.is_some_and(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit())) {
+        return Some(search_url(t));
+    }
+    let is_ipv4 = host.split('.').count() == 4
+        && host.split('.').all(|o| !o.is_empty() && o.len() <= 3 && o.chars().all(|c| c.is_ascii_digit()));
+    let local = host == "localhost" || host.ends_with(".localhost") || is_ipv4;
+    if local {
+        return Some(format!("http://{t}"));
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let tld = labels.last().copied().unwrap_or("");
+    let hostish = labels.len() >= 2
+        && labels
+            .iter()
+            .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        && tld.len() >= 2
+        && tld.chars().all(|c| c.is_ascii_alphabetic());
+    if hostish {
+        return Some(format!("https://{t}"));
+    }
+    Some(search_url(t))
+}
+
+fn search_url(query: &str) -> String {
+    let mut q = String::with_capacity(query.len() * 3);
+    for b in query.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => q.push(b as char),
+            b' ' => q.push('+'),
+            _ => q.push_str(&format!("%{b:02X}")),
+        }
+    }
+    format!("https://www.google.com/search?q={q}")
+}
+
 /// A window-edge drag sends a resize every frame; wait this long for the size to
 /// settle before telling the daemon, so the screencast is not restarted or
 /// stopped on every intermediate size (review #9).
@@ -118,12 +183,28 @@ pub fn show(ui: &mut Ui, rect: Rect, surface: &str, _focused: bool, c: &mut Ctx)
         (x as f64, y as f64)
     };
     let resp = ui.interact(image_rect, Id::new(("browser", surface)), Sense::click_and_drag());
-    if resp.clicked() {
+    let mods = ui.input(|i| i.modifiers);
+    let middle = resp.clicked_by(egui::PointerButton::Middle);
+    if resp.clicked() || middle {
         if let Some(pane) = c.state.pane_of_surface(surface) {
             c.state.focus_pane(&pane);
         }
     }
-    let mods = ui.input(|i| i.modifiers);
+    // Middle- or Cmd-click opens the link under the pointer as a new tab in this
+    // pane, as in cmux. The page never sees that click: headless Chromium would
+    // open the link in a window nobody can see.
+    let open_link = middle || (resp.clicked() && mods.command);
+    if open_link {
+        let p = resp.interact_pointer_pos().or_else(|| resp.hover_pos());
+        if let (Some(p), Some(pane)) = (p, c.state.pane_of_surface(surface)) {
+            let (x, y) = to_css(p);
+            c.state.browser_request(
+                m::BROWSER_LINK_AT,
+                serde_json::json!({ "surface": surface, "x": x, "y": y }),
+                crate::state::BrowserReply::OpenLink { pane },
+            );
+        }
+    }
     let egui_mods = Modifiers {
         alt: mods.alt,
         ctrl: mods.ctrl,
@@ -137,7 +218,7 @@ pub fn show(ui: &mut Ui, rect: Rect, surface: &str, _focused: bool, c: &mut Ctx)
         if resp.double_clicked() {
             send_mouse(c, surface, MouseAction::Down, x, y, MouseButton::Left, 2, egui_mods);
             send_mouse(c, surface, MouseAction::Up, x, y, MouseButton::Left, 2, egui_mods);
-        } else if resp.clicked() {
+        } else if resp.clicked() && !open_link {
             send_mouse(c, surface, MouseAction::Down, x, y, MouseButton::Left, 1, egui_mods);
             send_mouse(c, surface, MouseAction::Up, x, y, MouseButton::Left, 1, egui_mods);
         } else if resp.dragged() || resp.drag_started() || resp.drag_stopped() {
@@ -191,7 +272,9 @@ fn paint_toolbar(ui: &mut Ui, rect: Rect, surface: &str, c: &mut Ctx) {
 
     let cy = rect.center().y;
     let mut x = rect.min.x + 8.0;
-    let buttons: [(&str, bool); 3] = [("back", can_back), ("forward", can_fwd), ("reload", true)];
+    // Reload turns into Stop while the page loads, as in cmux and Safari.
+    let reload = if loading { "stop" } else { "reload" };
+    let buttons: [(&str, bool); 3] = [("back", can_back), ("forward", can_fwd), (reload, true)];
     for (name, enabled) in buttons {
         let hit = Rect::from_center_size(egui::pos2(x + 10.0, cy), Vec2::splat(24.0));
         let resp = ui.interact(hit, Id::new(("browserbtn", surface, name)), Sense::click());
@@ -206,12 +289,14 @@ fn paint_toolbar(ui: &mut Ui, rect: Rect, surface: &str, c: &mut Ctx) {
         match name {
             "back" => icons::arrow(&painter, icon, color, Arrow::Left),
             "forward" => icons::arrow(&painter, icon, color, Arrow::Right),
+            "stop" => icons::close(&painter, icon, color),
             _ => reload_icon(&painter, icon, color),
         }
         if resp.clicked() && enabled {
             let method = match name {
                 "back" => m::BROWSER_BACK,
                 "forward" => m::BROWSER_FORWARD,
+                "stop" => m::BROWSER_STOP,
                 _ => m::BROWSER_RELOAD,
             };
             c.state.rpc(method, serde_json::json!({ "surface": surface }));
@@ -233,23 +318,36 @@ fn paint_toolbar(ui: &mut Ui, rect: Rect, surface: &str, c: &mut Ctx) {
         egui::pos2(rect.max.x - 8.0, rect.max.y - 4.0),
     );
     painter.rect_filled(field, CornerRadius::same(5), Color32::from_rgb(0x2A, 0x2A, 0x2A));
-    painter.text(
-        egui::pos2(field.min.x + 8.0, field.center().y),
-        Align2::LEFT_CENTER,
-        ellipsize(ui.ctx(), &url, &theme::ui(theme::FS_SMALL), field.width() - 16.0, false),
-        theme::ui(theme::FS_SMALL),
-        theme::TEXT_SOFT,
-    );
+    let draft = c.state.browsers.get(surface).and_then(|b| b.url_draft.clone());
+    if draft.is_none() {
+        let blank = url.is_empty() || url == "about:blank";
+        let (shown, color) = if blank {
+            (PLACEHOLDER, theme::DIM)
+        } else {
+            (url.as_str(), theme::TEXT_SOFT)
+        };
+        painter.text(
+            egui::pos2(field.min.x + 8.0, field.center().y),
+            Align2::LEFT_CENTER,
+            ellipsize(ui.ctx(), shown, &theme::ui(theme::FS_SMALL), field.width() - 16.0, false),
+            theme::ui(theme::FS_SMALL),
+            color,
+        );
+    }
 
-    // Clicking the field starts an edit.
+    // Clicking the field starts an edit with the whole address selected.
     let resp = ui.interact(field, Id::new(("browserurl", surface)), Sense::click());
     if resp.clicked() {
-        if let Some(b) = c.state.browsers.get_mut(surface) {
-            b.url_draft = Some(b.url.clone());
-        }
+        c.state.focus_address_bar(surface);
     }
     let draft = c.state.browsers.get(surface).and_then(|b| b.url_draft.clone());
     if let Some(mut text) = draft {
+        let focus_now = c
+            .state
+            .browsers
+            .get_mut(surface)
+            .map(|b| std::mem::take(&mut b.focus_url))
+            .unwrap_or(false);
         let mut submitted = false;
         let mut cancelled = false;
         let edit_rect = field;
@@ -258,13 +356,26 @@ fn paint_toolbar(ui: &mut Ui, rect: Rect, surface: &str, c: &mut Ctx) {
             |ui| {
                 ui.add_space(6.0);
                 ui.style_mut().visuals.extreme_bg_color = Color32::from_rgb(0x2A, 0x2A, 0x2A);
-                let out = ui.add(
-                    egui::TextEdit::singleline(&mut text)
-                        .font(theme::ui(theme::FS_SMALL))
-                        .text_color(theme::TEXT)
-                        .desired_width(edit_rect.width() - 12.0),
-                );
-                if out.lost_focus() {
+                let edit_id = Id::new(("browserurl-edit", surface));
+                let mut out = egui::TextEdit::singleline(&mut text)
+                    .id(edit_id)
+                    .hint_text(PLACEHOLDER)
+                    .font(theme::ui(theme::FS_SMALL))
+                    .text_color(theme::TEXT)
+                    .desired_width(edit_rect.width() - 12.0)
+                    .show(ui);
+                if focus_now {
+                    out.response.request_focus();
+                    let end = egui::text::CCursor::new(text.chars().count());
+                    out.state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        end,
+                    )));
+                    out.state.store(ui.ctx(), edit_id);
+                }
+                // Escape also drops focus, so both end the edit here; Enter
+                // navigates and Escape puts the current address back.
+                if out.response.lost_focus() {
                     if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         submitted = true;
                     } else {
@@ -277,7 +388,9 @@ fn paint_toolbar(ui: &mut Ui, rect: Rect, surface: &str, c: &mut Ctx) {
             },
         );
         if submitted {
-            c.state.rpc(m::BROWSER_GOTO, serde_json::json!({ "surface": surface, "url": text }));
+            if let Some(target) = address_to_url(&text) {
+                c.state.rpc(m::BROWSER_GOTO, serde_json::json!({ "surface": surface, "url": target }));
+            }
             if let Some(b) = c.state.browsers.get_mut(surface) {
                 b.url_draft = None;
             }
@@ -327,4 +440,47 @@ fn send_mouse(
         surface: surface.to_owned(),
         event: BrowserInputEvent::Mouse { action, x, y, button, click_count, modifiers },
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::address_to_url as u;
+
+    fn s(x: &str) -> Option<String> {
+        Some(x.to_owned())
+    }
+
+    #[test]
+    fn urls_with_a_scheme_go_as_typed() {
+        assert_eq!(u("https://example.com/a?b=1"), s("https://example.com/a?b=1"));
+        assert_eq!(u("  http://x.org  "), s("http://x.org"));
+        assert_eq!(u("about:blank"), s("about:blank"));
+        assert_eq!(u("file:///tmp/x.html"), s("file:///tmp/x.html"));
+    }
+
+    #[test]
+    fn bare_hosts_get_a_scheme() {
+        assert_eq!(u("example.com"), s("https://example.com"));
+        assert_eq!(u("docs.rs/egui"), s("https://docs.rs/egui"));
+        assert_eq!(u("sub.example.co.uk:8443/x"), s("https://sub.example.co.uk:8443/x"));
+        assert_eq!(u("localhost:3000"), s("http://localhost:3000"));
+        assert_eq!(u("localhost"), s("http://localhost"));
+        assert_eq!(u("127.0.0.1:8080/api"), s("http://127.0.0.1:8080/api"));
+    }
+
+    #[test]
+    fn words_search() {
+        assert_eq!(u("rust egui"), s("https://www.google.com/search?q=rust+egui"));
+        assert_eq!(u("hello"), s("https://www.google.com/search?q=hello"));
+        assert_eq!(u("c++ & go"), s("https://www.google.com/search?q=c%2B%2B+%26+go"));
+        // A version number is not a host.
+        assert_eq!(u("1.2"), s("https://www.google.com/search?q=1.2"));
+        assert_eq!(u("what:is"), s("https://www.google.com/search?q=what%3Ais"));
+    }
+
+    #[test]
+    fn blank_input_goes_nowhere() {
+        assert_eq!(u(""), None);
+        assert_eq!(u("   "), None);
+    }
 }

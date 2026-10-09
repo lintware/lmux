@@ -458,6 +458,10 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
     // Chip / browser-frame rects are recorded per frame so tests can drive the
     // real geometry.
     for h in hosts.iter_mut() {
+        // A browser copy's reply, waiting for the clipboard.
+        if let Some(text) = h.state.clipboard_out.take() {
+            ctx.copy_text(text);
+        }
         h.state.chip_rects.clear();
         h.state.card_rects.clear();
         h.state.folder_rects.clear();
@@ -645,6 +649,9 @@ pub fn shortcuts(ctx: &egui::Context, c: &mut ui::Ctx) {
         .as_deref()
         .and_then(|p| c.state.pane(p))
         .and_then(|p| c.state.active_surface(p));
+    // With a browser focused, Cmd+L, Cmd+[ ], Cmd+R and Cmd+= - 0 act on the
+    // page, as in cmux.
+    let browser = c.state.focused_browser();
 
     // Most specific modifiers first: consume_key ignores extra Shift/Alt.
     // Panes: split, move focus.
@@ -734,28 +741,48 @@ pub fn shortcuts(ctx: &egui::Context, c: &mut ui::Ctx) {
     if key(cmd, Key::I) {
         c.state.notif_open = !c.state.notif_open;
     }
+    if let Some(b) = &browser {
+        if key(cmd, Key::L) {
+            c.state.focus_address_bar(b);
+        }
+    }
     if key(cmd, Key::R) {
-        if let Some(sid) = &active_surface {
+        if let Some(b) = &browser {
+            c.state.rpc(m::BROWSER_RELOAD, serde_json::json!({ "surface": b }));
+        } else if let Some(sid) = &active_surface {
             let title = c.state.surface(sid).map(|s| s.title.clone()).unwrap_or_default();
             c.state.begin_rename(sid, &title);
         }
     }
-    // History: back/forward through the workspaces you visited.
+    // History: the page's back/forward in a browser, otherwise back/forward
+    // through the workspaces you visited.
     if key(cmd, Key::OpenBracket) {
-        c.state.navigate(-1);
+        match &browser {
+            Some(b) => c.state.rpc(m::BROWSER_BACK, serde_json::json!({ "surface": b })),
+            None => c.state.navigate(-1),
+        }
     }
     if key(cmd, Key::CloseBracket) {
-        c.state.navigate(1);
+        match &browser {
+            Some(b) => c.state.rpc(m::BROWSER_FORWARD, serde_json::json!({ "surface": b })),
+            None => c.state.navigate(1),
+        }
     }
-    // Terminal font size.
-    if key(cmd, Key::Plus) || key(cmd, Key::Equals) {
-        c.state.zoom_terminal(1.0);
-    }
-    if key(cmd, Key::Minus) {
-        c.state.zoom_terminal(-1.0);
-    }
-    if key(cmd, Key::Num0) {
-        c.state.zoom_terminal(0.0);
+    // Page zoom in a browser, terminal font size elsewhere.
+    let zoom = if key(cmd, Key::Plus) || key(cmd, Key::Equals) {
+        Some(1)
+    } else if key(cmd, Key::Minus) {
+        Some(-1)
+    } else if key(cmd, Key::Num0) {
+        Some(0)
+    } else {
+        None
+    };
+    if let Some(step) = zoom {
+        match &browser {
+            Some(b) => c.state.rpc(m::BROWSER_ZOOM, serde_json::json!({ "surface": b, "step": step })),
+            None => c.state.zoom_terminal(step as f32),
+        }
     }
 
     let digits = [
@@ -802,6 +829,20 @@ pub(crate) fn split(
     }
     c.state.rpc(m::SPLIT_NEW, params);
 }
+
+/// The page's selected text: from a focused text field, or the document's
+/// selection.
+const COPY_SELECTION_JS: &str = "(function(){var e=document.activeElement;\
+if(e&&(e.tagName==='INPUT'||e.tagName==='TEXTAREA')&&typeof e.selectionStart==='number')\
+{return e.value.substring(e.selectionStart,e.selectionEnd);}\
+var s=window.getSelection();return s?s.toString():'';})()";
+
+/// As [`COPY_SELECTION_JS`], then deletes the selection where it is editable.
+const CUT_SELECTION_JS: &str = "(function(){var e=document.activeElement;var t;\
+if(e&&(e.tagName==='INPUT'||e.tagName==='TEXTAREA')&&typeof e.selectionStart==='number')\
+{t=e.value.substring(e.selectionStart,e.selectionEnd);}\
+else{var s=window.getSelection();t=s?s.toString():'';}\
+if(t)document.execCommand('delete');return t;})()";
 
 /// Route keyboard events to the focused surface. Public for tests.
 pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
@@ -862,13 +903,17 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
         }
         Some(SurfaceKind::Browser { .. }) => {
             let mut events: Vec<BrowserInputEvent> = Vec::new();
+            // The page's clipboard lives on the daemon's host, often another
+            // machine, so copy and paste go through this Mac's clipboard: copy
+            // asks the page for its selection, paste types the local text.
+            let mut copy: Option<&str> = None;
             ctx.input(|i| {
                 for ev in &i.events {
                     match ev {
-                        egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                            if modifiers.command {
-                                continue;
-                            }
+                        // Cmd chords the app did not take (Cmd+A, Cmd+Z,
+                        // Cmd+arrows…) reach the page with Meta held; the
+                        // daemon maps them to editing commands.
+                        egui::Event::Key { key, pressed: true, .. } => {
                             if let Some((k, code)) = keys::dom_key(*key) {
                                 events.push(BrowserInputEvent::Key {
                                     action: KeyAction::Down,
@@ -882,12 +927,24 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
                         egui::Event::Text(t) if !t.is_empty() => {
                             events.push(BrowserInputEvent::InsertText { text: t.clone() });
                         }
+                        egui::Event::Paste(t) if !t.is_empty() => {
+                            events.push(BrowserInputEvent::InsertText { text: t.clone() });
+                        }
+                        egui::Event::Copy => copy = Some(COPY_SELECTION_JS),
+                        egui::Event::Cut => copy = Some(CUT_SELECTION_JS),
                         _ => {}
                     }
                 }
             });
             for event in events {
                 c.state.pending.push(ClientMsg::BrowserInput { surface: sid.clone(), event });
+            }
+            if let Some(script) = copy {
+                c.state.browser_request(
+                    m::BROWSER_EVAL,
+                    serde_json::json!({ "surface": sid, "script": script }),
+                    crate::state::BrowserReply::Copy,
+                );
             }
         }
         _ => {}
@@ -1013,9 +1070,18 @@ pub fn run_command(c: &mut ui::Ctx, name: &str) {
             c.state.new_folder(parent);
         }
         "Add Remote Host…" => c.state.add_host_draft = Some(String::new()),
-        "Zoom In" => c.state.zoom_terminal(1.0),
-        "Zoom Out" => c.state.zoom_terminal(-1.0),
-        "Reset Zoom" => c.state.zoom_terminal(0.0),
+        "Zoom In" | "Zoom Out" | "Reset Zoom" => {
+            let step = match name {
+                "Zoom In" => 1,
+                "Zoom Out" => -1,
+                _ => 0,
+            };
+            // As Cmd+= / Cmd+- / Cmd+0: the page in a browser, else the font.
+            match c.state.focused_browser() {
+                Some(b) => c.state.rpc(m::BROWSER_ZOOM, serde_json::json!({ "surface": b, "step": step })),
+                None => c.state.zoom_terminal(step as f32),
+            }
+        }
         _ => {}
     }
 }

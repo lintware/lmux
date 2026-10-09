@@ -278,7 +278,8 @@ fn cmd_shift_b_opens_a_browser_chip_in_the_focused_pane() {
     let call = rpcs.iter().find(|(m, _)| m == "surface.new").expect("surface.new sent");
     assert_eq!(call.1["type"], "browser");
     assert_eq!(call.1["pane"], "pane:1");
-    assert!(call.1["url"].as_str().unwrap().starts_with("http"));
+    // Blank, with the address bar waiting for input (as cmux's new tab).
+    assert_eq!(call.1["url"], "about:blank");
 }
 
 #[test]

@@ -160,9 +160,20 @@ pub(crate) struct SurfaceState {
     pub evt_tx: Mutex<Option<mpsc::UnboundedSender<CdpEvent>>>,
     pub default_width: u32,
     pub default_height: u32,
+    /// Page zoom as `f64` bits (1.0 = 100%). Applied as a device-scale change, the
+    /// way Chrome zooms, so pages reflow; see `BrowserManager::apply_metrics`.
+    pub zoom: AtomicU64,
 }
 
 impl SurfaceState {
+    pub fn zoom(&self) -> f64 {
+        f64::from_bits(self.zoom.load(Ordering::SeqCst))
+    }
+
+    pub fn set_zoom(&self, z: f64) {
+        self.zoom.store(z.to_bits(), Ordering::SeqCst);
+    }
+
     pub fn new(id: &str, width: u32, height: u32) -> Self {
         Self {
             id: id.to_string(),
@@ -183,6 +194,7 @@ impl SurfaceState {
             evt_tx: Mutex::new(None),
             default_width: width,
             default_height: height,
+            zoom: AtomicU64::new(1.0f64.to_bits()),
         }
     }
 
