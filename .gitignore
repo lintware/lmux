@@ -1,5 +1,5 @@
 /target
-/app/src-tauri/target
+/app/target
 /app/node_modules
 /app/dist
 /scratchpad

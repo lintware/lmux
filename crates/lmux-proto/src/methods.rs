@@ -14,9 +14,10 @@ pub const IDENTIFY: &str = "system.identify"; // {} -> {workspace, pane, surface
 pub const TREE: &str = "system.tree"; // {} -> Tree
 
 // --- folders & workspaces ---
-pub const FOLDER_NEW: &str = "folder.new"; // {name} -> {folder}
+pub const FOLDER_NEW: &str = "folder.new"; // {name, parent?} -> {folder} (parent nests it inside another folder)
 pub const FOLDER_RENAME: &str = "folder.rename"; // {folder, name}
-pub const FOLDER_CLOSE: &str = "folder.close"; // {folder} (workspaces move to top level)
+pub const FOLDER_CLOSE: &str = "folder.close"; // {folder} (its workspaces and child folders move up to its parent)
+pub const FOLDER_MOVE: &str = "folder.move"; // {folder, parent?: Ref|null, index?} (reparent/reorder; a folder cannot move into itself or a descendant; `parent` null/absent is the top level, `index` counts the parent's child folders)
 pub const WORKSPACE_NEW: &str = "workspace.new"; // {name?, cwd?, command?, folder?} -> {workspace, pane, surface}
 pub const WORKSPACE_LIST: &str = "workspace.list"; // {} -> {workspaces: [..]}
 pub const WORKSPACE_SELECT: &str = "workspace.select"; // {workspace}
@@ -32,6 +33,11 @@ pub const PANE_RESIZE: &str = "pane.resize"; // {pane, ratio}
 pub const SURFACE_NEW: &str = "surface.new"; // {pane?, type?, url?, command?, cwd?} -> {surface} (new tab in pane)
 pub const SURFACE_CLOSE: &str = "surface.close"; // {surface?}
 pub const SURFACE_RENAME: &str = "surface.rename"; // {surface?, title}
+// Drag-and-drop rearranging in the client. Together these cover dragging a tab
+// within its strip, onto another pane, and onto a pane's edge to make a split.
+pub const SURFACE_MOVE: &str = "surface.move"; // {surface, pane, index?} -> {pane} (move a tab to another pane, or reorder it within its own; a pane left empty is removed and its split collapses; `index` defaults to the end)
+pub const SURFACE_SPLIT: &str = "surface.split"; // {surface, side: SplitSide, pane?} -> {pane} (move an existing tab into a new pane split off `pane`, or off the tab's own pane when `pane` is absent, on `side`; a source pane left empty collapses)
+pub const PANE_SWAP: &str = "pane.swap"; // {pane, other} -> {} (exchange two panes' positions in the workspace layout)
 
 // --- terminal control ---
 pub const TERM_SEND: &str = "term.send"; // {surface?, text} (text is sent literally; "\n" is Enter)

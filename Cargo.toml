@@ -1,7 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/lmux-proto", "crates/lmux-core", "crates/lmux-browser", "crates/lmux"]
-exclude = ["app/src-tauri"]
+# The client is a standalone native GUI crate (different target, macOS-only).
+exclude = ["app"]
 
 [workspace.package]
 version = "0.1.0"

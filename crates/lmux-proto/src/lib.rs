@@ -40,6 +40,9 @@ pub struct Tree {
 pub struct Folder {
     pub id: Ref,
     pub name: String,
+    /// The folder this one sits inside; `None` is a top-level folder.
+    #[serde(default)]
+    pub parent: Option<Ref>,
     pub collapsed: bool,
 }
 
@@ -390,6 +393,40 @@ pub struct Modifiers {
     pub meta: bool,
     #[serde(default)]
     pub shift: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Browser engine ⇄ daemon events
+// ---------------------------------------------------------------------------
+
+/// Events the browser engine pushes to the daemon.
+///
+/// This is not a wire type — the app never sees it, and it carries no serde
+/// derives. It lives here because the daemon must not depend on `lmux-browser`
+/// (so it builds and tests without Chromium) and the engine must not depend on
+/// `lmux-core` (so it stands alone). Sharing one definition keeps those two
+/// sides from drifting apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserEvent {
+    /// A screencast frame, forwarded to subscribers as a `frame::KIND_BROWSER_FRAME`.
+    Frame {
+        surface: Ref,
+        seq: u32,
+        width: u16,
+        height: u16,
+        jpeg: Vec<u8>,
+    },
+    /// Page metadata changed.
+    Meta {
+        surface: Ref,
+        url: String,
+        title: String,
+        loading: bool,
+        can_go_back: bool,
+        can_go_forward: bool,
+    },
+    /// The page or its target closed on its own.
+    Closed { surface: Ref },
 }
 
 #[cfg(test)]

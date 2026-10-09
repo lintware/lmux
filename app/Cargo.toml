@@ -1,0 +1,32 @@
+[package]
+name = "lmux-app"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "lmux native macOS client (egui/eframe)"
+license = "MIT"
+
+# Standalone crate: not a member of the root workspace (see root Cargo.toml exclude).
+[workspace]
+
+[dependencies]
+lmux-proto = { path = "../crates/lmux-proto" }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts"] }
+egui = "0.36"
+alacritty_terminal = "0.26"
+ewebsock = "0.8"
+zune-jpeg = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+notify-rust = "4"
+dirs = "6"
+log = "0.4"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["snapshot", "wgpu"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -7,3 +7,14 @@ license.workspace = true
 
 [dependencies]
 lmux-proto.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+# Pinned for rustc 1.88 MSRV (see scratchpad/notes-browser.md).
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+base64 = "0.22"
+# For process-group kill on shutdown (Chromium is multi-process).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
