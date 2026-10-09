@@ -87,6 +87,7 @@ fn fixture() -> (AppState, Net) {
         ssh_target: None,
         remote_port: 7878,
         browser_scale: None,
+        cloud: None,
     }]);
     (st, net)
 }

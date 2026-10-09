@@ -220,16 +220,19 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
         ConnState::Disconnected => (theme::RED, "offline".to_owned()),
     };
     // An install in progress (or failed) says so instead.
-    let install = c.state.install.as_ref().map(|s| s.lock().unwrap().clone());
+    // A cloud box being deleted says that instead.
+    let deleting = c.state.cloud_delete.is_some();
+    let install = c.state.cloud_delete.as_ref().or(c.state.install.as_ref()).map(|s| s.lock().unwrap().clone());
+    let (doing, failed) = if deleting { ("deleting", "delete failed") } else { ("installing", "install failed") };
     let mut status_color = theme::DIM_2;
     match &install {
         Some(crate::net::InstallStatus::Running(line)) => {
-            status = format!("installing · {line}");
+            status = format!("{doing} · {line}");
             status_color = theme::AMBER;
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
         }
         Some(crate::net::InstallStatus::Failed(_)) => {
-            status = "install failed".to_owned();
+            status = failed.to_owned();
             status_color = theme::RED;
         }
         _ => {}
@@ -258,7 +261,14 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
         );
     }
     if let Some(crate::net::InstallStatus::Failed(why)) = &install {
-        resp.clone().on_hover_text(format!("{why}\n(full log in ~/.local/state/lmux/install-*.log)"));
+        let log = if deleting {
+            "cloud-delete-*"
+        } else if c.net.current_host().is_some_and(|h| h.cloud.is_some()) {
+            "cloud-*"
+        } else {
+            "install-*"
+        };
+        resp.clone().on_hover_text(format!("{why}\n(full log in ~/.local/state/lmux/{log}.log)"));
     }
 
     if resp.clicked() {
@@ -270,6 +280,9 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
     let mut add_host = false;
     let mut remove = false;
     let mut install = false;
+    let mut new_cloud = false;
+    let mut delete_cloud = false;
+    let is_cloud = c.net.current_host().is_some_and(|h| h.cloud.is_some());
     resp.context_menu(|ui| {
         ui.set_min_width(170.0);
         if ui.button("New Session").clicked() {
@@ -293,8 +306,16 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
             install = true;
             ui.close();
         }
+        if ui.button("New Cloud Box…").clicked() {
+            new_cloud = true;
+            ui.close();
+        }
         if !c.net.is_local_host() && ui.button("Remove Host").clicked() {
             remove = true;
+            ui.close();
+        }
+        if is_cloud && ui.button("Delete Cloud Box…").clicked() {
+            delete_cloud = true;
             ui.close();
         }
     });
@@ -310,6 +331,10 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
         c.state.actions.push(crate::state::Action::RemoveHost);
     } else if install {
         c.state.actions.push(crate::state::Action::InstallHost);
+    } else if new_cloud {
+        c.state.cloud_draft = Some(crate::state::CloudDraft::new("aws"));
+    } else if delete_cloud {
+        c.state.confirm_cloud_delete = Some(c.net.host_name());
     }
     collapsed
 }
@@ -514,6 +539,7 @@ fn new_item_menu(resp: &egui::Response, c: &mut Ctx) {
     let mut session: Option<(usize, Option<String>)> = None;
     let mut folder: Option<(usize, Option<String>)> = None;
     let mut add_host = false;
+    let mut new_cloud = false;
     resp.context_menu(|ui| {
         ui.set_min_width(200.0);
         let mut close = false;
@@ -534,12 +560,20 @@ fn new_item_menu(resp: &egui::Response, c: &mut Ctx) {
             add_host = true;
             close = true;
         }
+        if ui.button("New Cloud Box…").clicked() {
+            new_cloud = true;
+            close = true;
+        }
         if close {
             ui.close();
         }
     });
     if add_host {
         c.state.add_host_draft = Some(String::new());
+        return;
+    }
+    if new_cloud {
+        c.state.cloud_draft = Some(crate::state::CloudDraft::new("aws"));
         return;
     }
 

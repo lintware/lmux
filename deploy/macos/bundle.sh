@@ -50,6 +50,8 @@ PLIST
 echo "==> remote installer and source"
 # "Add Remote Host" installs lmux on the host from these.
 cp "$repo/deploy/install-remote.sh" "$app/Contents/Resources/install-remote.sh"
+mkdir -p "$app/Contents/Resources/cloud"
+cp "$repo"/deploy/cloud/*.sh "$app/Contents/Resources/cloud/"
 git -C "$repo" archive --format=tar HEAD > "$app/Contents/Resources/lmux-src.tar"
 
 echo "==> icon"

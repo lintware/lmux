@@ -20,6 +20,7 @@ fn host(name: &str, url: &str) -> HostConfig {
         ssh_target: None,
         remote_port: 7878,
         browser_scale: None,
+        cloud: None,
     }
 }
 
@@ -258,6 +259,37 @@ fn the_add_host_dialog_queues_the_typed_target() {
     assert!(
         st.actions.iter().any(|a| matches!(a, lmux_app::state::Action::AddHost(t) if t == "cloud-box-1")),
         "AddHost queued: {:?}",
+        st.actions
+    );
+}
+
+/// The New Cloud Box dialog creates nothing until Create, and then queues
+/// the box with what was typed.
+#[test]
+fn the_cloud_dialog_queues_a_box_on_create() {
+    use egui_kittest::kittest::Queryable;
+    let mut fx = fixture();
+    fx.hosts[0].state.cloud_draft = Some(lmux_app::state::CloudDraft::new("aws"));
+    let mut h = harness(fx, 1.0);
+    h.run();
+    h.input_mut().events.push(egui::Event::Text("Dev".into()));
+    h.run();
+    assert!(h.state().hosts[0].state.actions.is_empty(), "nothing queued while typing");
+    h.get_by_label("Create").click();
+    h.run();
+    assert!(h.state().hosts[0].state.cloud_draft.is_some(), "an uppercase name is refused");
+    let d = h.state_mut().hosts[0].state.cloud_draft.as_mut().unwrap();
+    d.name = "dev".into();
+    h.run();
+    h.snapshot("cloud_dialog");
+    h.get_by_label("Create").click();
+    h.run();
+    let st = &h.state().hosts[0].state;
+    assert!(st.cloud_draft.is_none(), "the dialog closed");
+    assert!(
+        st.actions.iter().any(|a| matches!(a, lmux_app::state::Action::CreateCloud(d)
+            if d.provider == "aws" && d.name == "dev" && d.size == "t3.medium")),
+        "CreateCloud queued: {:?}",
         st.actions
     );
 }

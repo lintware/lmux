@@ -77,6 +77,7 @@ fn fixture() -> Fx {
         ssh_target: None,
         remote_port: 7878,
         browser_scale: None,
+        cloud: None,
     }]);
     Fx { state, net, ready: false }
 }
@@ -229,6 +230,7 @@ fn sidebar_fixture() -> Fx {
         ssh_target: None,
         remote_port: 7878,
         browser_scale: None,
+        cloud: None,
     }]);
     Fx { state, net, ready: false }
 }

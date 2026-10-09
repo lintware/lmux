@@ -34,6 +34,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("Jump to Latest Unread", "⇧⌘U"),
     ("New Folder", ""),
     ("Add Remote Host…", ""),
+    ("New Cloud Box…", ""),
     ("Zoom In", "⌘="),
     ("Zoom Out", "⌘-"),
     ("Reset Zoom", "⌘0"),

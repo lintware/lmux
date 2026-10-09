@@ -45,6 +45,20 @@ pub struct HostConfig {
     /// a fast link; `LMUX_BROWSER_SCALE` overrides for a run.
     #[serde(default)]
     pub browser_scale: Option<f32>,
+    /// Set for a cloud box lmux created, so the app can delete it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<CloudBox>,
+}
+
+/// A cloud box lmux created (`deploy/cloud/<provider>.sh`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CloudBox {
+    /// `aws` or `gcp`.
+    pub provider: String,
+    /// The box's name; its SSH alias is `lmux-<name>`.
+    pub name: String,
+    /// AWS region or GCP zone.
+    pub region: String,
 }
 
 fn default_remote_port() -> u16 {
@@ -61,6 +75,7 @@ pub fn default_hosts() -> Vec<HostConfig> {
             ssh_target: Some("my-server".into()),
             remote_port: DEFAULT_REMOTE_PORT,
             browser_scale: None,
+            cloud: None,
         },
         HostConfig {
             name: "mock".into(),
@@ -70,6 +85,7 @@ pub fn default_hosts() -> Vec<HostConfig> {
             ssh_target: None,
             remote_port: DEFAULT_REMOTE_PORT,
             browser_scale: None,
+            cloud: None,
         },
     ]
 }
@@ -89,6 +105,7 @@ fn local_host() -> HostConfig {
         ssh_target: None,
         remote_port: DEFAULT_REMOTE_PORT,
         browser_scale: None,
+        cloud: None,
     }
 }
 
@@ -292,10 +309,88 @@ pub fn installer() -> Option<(PathBuf, Option<PathBuf>)> {
 /// there, run it as the lmuxd user service, add the Claude hooks. The log
 /// goes to ~/.local/state/lmux/install-<target>.log.
 pub fn start_install(target: &str, wake: Option<egui::Context>) -> std::sync::Arc<std::sync::Mutex<InstallStatus>> {
+    let t = target.to_owned();
+    start_job(&format!("install-{target}"), wake, move || {
+        let (script, tar) = installer().ok_or("this build has no installer")?;
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script).arg(&t);
+        if let Some(tar) = &tar {
+            cmd.env("LMUX_SRC_TAR", tar);
+        }
+        Ok(cmd)
+    })
+}
+
+/// The cloud scripts (`deploy/cloud/<provider>.sh`): in the bundle's
+/// Resources/cloud, or the repo's when running from a checkout.
+pub fn cloud_script(provider: &str) -> Option<PathBuf> {
+    let name = format!("{provider}.sh");
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().and_then(|d| d.parent()).map(|c| c.join("Resources/cloud").join(&name)));
+    if let Some(p) = bundled.filter(|p| p.is_file()) {
+        return Some(p);
+    }
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deploy/cloud").join(&name);
+    dev.is_file().then_some(dev)
+}
+
+/// Create a cloud box (`<provider>.sh create`), then install lmux on it, in
+/// the background. The box is reachable as the SSH alias `lmux-<name>`.
+pub fn start_cloud_create(
+    provider: &str,
+    name: &str,
+    region: &str,
+    size: &str,
+    wake: Option<egui::Context>,
+) -> std::sync::Arc<std::sync::Mutex<InstallStatus>> {
+    let (provider, name, region, size) = (provider.to_owned(), name.to_owned(), region.to_owned(), size.to_owned());
+    start_job(&format!("cloud-{name}"), wake, move || {
+        let script = cloud_script(&provider).ok_or("this build has no cloud scripts")?;
+        let (installer_script, tar) = installer().ok_or("this build has no installer")?;
+        // Positional args keep every value out of the shell's parsing.
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg(r#"bash "$0" create "$1" "$2" "$3" && bash "$4" "lmux-$1""#)
+            .arg(&script)
+            .arg(&name)
+            .arg(&region)
+            .arg(&size)
+            .arg(&installer_script);
+        if let Some(tar) = &tar {
+            cmd.env("LMUX_SRC_TAR", tar);
+        }
+        Ok(cmd)
+    })
+}
+
+/// Delete a cloud box made by `start_cloud_create`.
+pub fn start_cloud_delete(
+    provider: &str,
+    name: &str,
+    region: &str,
+    wake: Option<egui::Context>,
+) -> std::sync::Arc<std::sync::Mutex<InstallStatus>> {
+    let (provider, name, region) = (provider.to_owned(), name.to_owned(), region.to_owned());
+    start_job(&format!("cloud-delete-{name}"), wake, move || {
+        let script = cloud_script(&provider).ok_or("this build has no cloud scripts")?;
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script).arg("delete").arg(&name).arg(&region);
+        Ok(cmd)
+    })
+}
+
+/// Run a command in the background, streaming its output lines as progress
+/// and its log to ~/.local/state/lmux/<log_name>.log.
+fn start_job(
+    log_name: &str,
+    wake: Option<egui::Context>,
+    build: impl FnOnce() -> Result<Command, &'static str> + Send + 'static,
+) -> std::sync::Arc<std::sync::Mutex<InstallStatus>> {
     use std::io::BufRead;
     let status = std::sync::Arc::new(std::sync::Mutex::new(InstallStatus::Running("starting…".into())));
     let out = status.clone();
-    let target = target.to_owned();
+    let target: String = log_name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect();
     std::thread::spawn(move || {
         let set = |s: InstallStatus| {
             if let Ok(mut g) = out.lock() {
@@ -305,20 +400,17 @@ pub fn start_install(target: &str, wake: Option<egui::Context>) -> std::sync::Ar
                 c.request_repaint();
             }
         };
-        let Some((script, tar)) = installer() else {
-            set(InstallStatus::Failed("this build has no installer".into()));
-            return;
+        let mut cmd = match build() {
+            Ok(c) => c,
+            Err(e) => {
+                set(InstallStatus::Failed(e.into()));
+                return;
+            }
         };
-        let log_path = dirs::home_dir().map(|h| {
-            let safe: String = target.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-            h.join(format!(".local/state/lmux/install-{safe}.log"))
-        });
+        let log_path = dirs::home_dir().map(|h| h.join(format!(".local/state/lmux/{target}.log")));
         let mut log = log_path.as_ref().and_then(|p| std::fs::File::create(p).ok());
-        let mut cmd = Command::new("bash");
-        cmd.arg(&script).arg(&target).env("PATH", daemon_path());
-        if let Some(t) = &tar {
-            cmd.env("LMUX_SRC_TAR", t);
-        }
+        // The cloud CLIs (aws, gcloud) live in Homebrew and the user's bins.
+        cmd.env("PATH", format!("{}:/opt/homebrew/bin:/usr/local/bin", daemon_path()));
         let child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
         let mut child = match child {
             Ok(c) => c,
@@ -381,6 +473,7 @@ pub fn ssh_host(target: &str) -> HostConfig {
         ssh_target: Some(target.to_owned()),
         remote_port: DEFAULT_REMOTE_PORT,
         browser_scale: None,
+        cloud: None,
     }
 }
 
@@ -410,6 +503,7 @@ pub fn load_hosts() -> Vec<HostConfig> {
             ssh_target: None,
             remote_port: DEFAULT_REMOTE_PORT,
             browser_scale: None,
+            cloud: None,
         }];
     }
     let Some(path) = config_path() else {

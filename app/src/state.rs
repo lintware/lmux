@@ -142,6 +142,12 @@ pub struct AppState {
     pub add_host_install: bool,
     /// An install of lmux on this host, while running or just finished.
     pub install: Option<std::sync::Arc<std::sync::Mutex<crate::net::InstallStatus>>>,
+    /// The "New Cloud Box" dialog, while it is open.
+    pub cloud_draft: Option<CloudDraft>,
+    /// The cloud box whose deletion is waiting for a yes: its host's name.
+    pub confirm_cloud_delete: Option<String>,
+    /// This host's cloud box being deleted; the host goes when it is done.
+    pub cloud_delete: Option<std::sync::Arc<std::sync::Mutex<crate::net::InstallStatus>>>,
     pub terms: HashMap<Ref, TermView>,
     pub browsers: HashMap<Ref, BrowserView>,
     /// PTYs owned by this process, one per local terminal surface. Present only
@@ -264,6 +270,59 @@ pub enum Action {
     RemoveHost,
     /// Install or update lmux on this host over SSH, then reconnect.
     InstallHost,
+    /// Create a cloud box, install lmux on it and add it as a host.
+    CreateCloud(CloudDraft),
+    /// Delete the cloud box behind the host with this name, then forget it.
+    DeleteCloud(String),
+}
+
+/// The fields of the "New Cloud Box" dialog.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CloudDraft {
+    /// `aws` or `gcp`.
+    pub provider: String,
+    pub name: String,
+    /// Empty means the CLI's configured default.
+    pub region: String,
+    pub size: String,
+}
+
+impl CloudDraft {
+    pub fn new(provider: &str) -> Self {
+        CloudDraft {
+            provider: provider.to_owned(),
+            name: String::new(),
+            region: String::new(),
+            size: Self::default_size(provider).to_owned(),
+        }
+    }
+
+    pub fn default_size(provider: &str) -> &'static str {
+        if provider == "gcp" {
+            "e2-standard-2"
+        } else {
+            "t3.medium"
+        }
+    }
+
+    /// Why the name can't be used, if it can't: it becomes a DNS-style label
+    /// (`lmux-<name>`) on both clouds.
+    pub fn name_problem(&self) -> Option<&'static str> {
+        let n = &self.name;
+        if n.is_empty() {
+            return Some("pick a name");
+        }
+        if n.len() > 40 {
+            return Some("at most 40 characters");
+        }
+        if !n.starts_with(|c: char| c.is_ascii_lowercase()) {
+            return Some("start with a lowercase letter");
+        }
+        if !n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') || n.ends_with('-') {
+            return Some("lowercase letters, digits and dashes only");
+        }
+        None
+    }
 }
 
 /// Something a close was asked for, kept until the daemon answers.
@@ -463,6 +522,9 @@ impl AppState {
             host_collapsed: false,
             add_host_draft: None,
             add_host_install: true,
+            cloud_draft: None,
+            confirm_cloud_delete: None,
+            cloud_delete: None,
             install: None,
             pending_create: None,
             terms: HashMap::new(),

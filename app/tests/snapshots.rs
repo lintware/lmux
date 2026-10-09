@@ -215,6 +215,7 @@ fn fixture(selected: &str, with_terms: bool) -> Fixture {
             ssh_target: None,
             remote_port: 7878,
             browser_scale: None,
+            cloud: None,
         },
         HostConfig {
             name: "my-server".into(),
@@ -224,6 +225,7 @@ fn fixture(selected: &str, with_terms: bool) -> Fixture {
             ssh_target: None,
             remote_port: 7878,
             browser_scale: None,
+            cloud: None,
         },
     ]);
     net.host_index = 1;

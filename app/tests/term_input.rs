@@ -60,6 +60,7 @@ fn fixture() -> Fixture {
         ssh_target: None,
         remote_port: 7878,
         browser_scale: None,
+        cloud: None,
     }]);
     net.state = ConnState::Connected;
     state.set_current_host("this mac");

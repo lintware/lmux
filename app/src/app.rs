@@ -173,7 +173,9 @@ impl eframe::App for LmuxApp {
                 // A dialog or the palette owns the keyboard while it is open.
                 let modal = c.state.confirm_close.is_some()
                     || c.state.palette.is_some()
-                    || c.state.add_host_draft.is_some();
+                    || c.state.add_host_draft.is_some()
+                    || c.state.cloud_draft.is_some()
+                    || c.state.confirm_cloud_delete.is_some();
                 if window_focused && !text_editing && !modal {
                     route_input(&ctx, &mut c);
                 }
@@ -273,6 +275,8 @@ impl eframe::App for LmuxApp {
                 }
                 Action::RemoveHost => removals.push(from),
                 Action::InstallHost => self.install_host(from, &ctx),
+                Action::CreateCloud(draft) => self.create_cloud(&draft, &ctx),
+                Action::DeleteCloud(name) => self.delete_cloud(&name, &ctx),
             }
         }
         removals.sort_unstable();
@@ -391,14 +395,25 @@ impl LmuxApp {
         if target.is_empty() {
             return;
         }
-        if let Some(i) = self.hosts.iter().position(|h| {
-            h.net.current_host().is_some_and(|c| c.name == target || c.ssh_target.as_deref() == Some(target))
-        }) {
+        if let Some(i) = self.host_by_target(target) {
             self.activate(i);
             return;
         }
+        self.push_host(crate::net::ssh_host(target), ctx);
+        let i = self.hosts.len() - 1;
+        self.hosts[i].net.begin_connect(ctx);
+    }
+
+    fn host_by_target(&self, target: &str) -> Option<usize> {
+        self.hosts.iter().position(|h| {
+            h.net.current_host().is_some_and(|c| c.name == target || c.ssh_target.as_deref() == Some(target))
+        })
+    }
+
+    /// Save a new host, give it a session and put it on screen.
+    fn push_host(&mut self, config: crate::net::HostConfig, ctx: &egui::Context) {
         let mut configs = self.host_configs();
-        configs.push(crate::net::ssh_host(target));
+        configs.push(config);
         if let Err(e) = crate::net::save_hosts(&configs) {
             self.hosts[self.active].state.banner = Some((format!("could not save hosts.json: {e}"), true));
         }
@@ -407,7 +422,6 @@ impl LmuxApp {
         let mut state = AppState::new();
         state.set_wake(ctx.clone());
         state.animate = true;
-        net.begin_connect(ctx);
         self.hosts.push(HostSession { state, net, was_connected: false });
         self.reindex(&configs);
         self.activate(self.hosts.len() - 1);
@@ -434,8 +448,61 @@ impl LmuxApp {
         h.state.install = Some(crate::net::start_install(&target, Some(ctx.clone())));
     }
 
+    /// Create a cloud box in the background and add it as a host straight
+    /// away; its header shows the progress, and it connects once lmux is
+    /// installed there.
+    fn create_cloud(&mut self, d: &crate::state::CloudDraft, ctx: &egui::Context) {
+        let target = format!("lmux-{}", d.name);
+        if let Some(i) = self.host_by_target(&target) {
+            self.activate(i);
+            self.hosts[i].state.banner = Some((format!("{target} is already a host"), true));
+            return;
+        }
+        let mut config = crate::net::ssh_host(&target);
+        config.cloud = Some(crate::net::CloudBox {
+            provider: d.provider.clone(),
+            name: d.name.clone(),
+            region: d.region.clone(),
+        });
+        self.push_host(config, ctx);
+        let i = self.hosts.len() - 1;
+        self.hosts[i].state.install =
+            Some(crate::net::start_cloud_create(&d.provider, &d.name, &d.region, &d.size, Some(ctx.clone())));
+    }
+
+    /// Delete the cloud box behind a host; `poll_installs` forgets the host
+    /// once the box is gone.
+    fn delete_cloud(&mut self, name: &str, ctx: &egui::Context) {
+        let Some(h) = self.hosts.iter_mut().find(|h| h.net.host_name() == name) else { return };
+        let Some(cloud) = h.net.current_host().and_then(|c| c.cloud.clone()) else { return };
+        let running = |s: &Option<std::sync::Arc<std::sync::Mutex<crate::net::InstallStatus>>>| {
+            s.as_ref().is_some_and(|s| matches!(*s.lock().unwrap(), crate::net::InstallStatus::Running(_)))
+        };
+        if running(&h.state.cloud_delete) || running(&h.state.install) {
+            h.state.banner = Some(("wait for the current job on this box to finish".into(), true));
+            return;
+        }
+        h.state.cloud_delete =
+            Some(crate::net::start_cloud_delete(&cloud.provider, &cloud.name, &cloud.region, Some(ctx.clone())));
+    }
+
     /// A finished install reconnects its host once, so the new daemon is used.
+    /// A deleted cloud box takes its host with it.
     fn poll_installs(&mut self, ctx: &egui::Context) {
+        let deleted: Vec<usize> = self
+            .hosts
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| {
+                h.state.cloud_delete.as_ref().is_some_and(|s| *s.lock().unwrap() == crate::net::InstallStatus::Done)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for i in deleted.into_iter().rev() {
+            let name = self.hosts[i].net.host_name().to_owned();
+            self.remove_host(i);
+            self.hosts[self.active].state.banner = Some((format!("deleted the cloud box {name}"), false));
+        }
         for h in &mut self.hosts {
             let done = h
                 .state
@@ -641,8 +708,16 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
         if let Some(draft) = other.state.add_host_draft.take() {
             c.state.add_host_draft = Some(draft);
         }
+        if let Some(draft) = other.state.cloud_draft.take() {
+            c.state.cloud_draft = Some(draft);
+        }
+        if let Some(name) = other.state.confirm_cloud_delete.take() {
+            c.state.confirm_cloud_delete = Some(name);
+        }
     }
     add_host_dialog(&ctx, c);
+    cloud_dialog(&ctx, c);
+    confirm_cloud_delete_dialog(&ctx, c);
     confirm_close_dialog(&ctx, c);
 
     // The palette draws over everything; what it picks runs on its host.
@@ -1087,6 +1162,129 @@ fn add_host_dialog(ctx: &egui::Context, c: &mut ui::Ctx) {
     }
 }
 
+/// The "New Cloud Box" dialog: provider, name, region and size. Create makes
+/// a Debian VM with this Mac's SSH key, installs lmux there and adds it as a
+/// host (`deploy/cloud/<provider>.sh`). Nothing is created before Create.
+fn cloud_dialog(ctx: &egui::Context, c: &mut ui::Ctx) {
+    let Some(mut d) = c.state.cloud_draft.clone() else { return };
+    let mut create = false;
+    let mut cancel = false;
+    let small = |t: &str| egui::RichText::new(t).font(theme::ui(theme::FS_SMALL)).color(theme::DIM);
+    egui::Window::new("New Cloud Box")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .fixed_size(Vec2::new(360.0, 0.0))
+        .show(ctx, |ui| {
+            ui.label(small("A Debian 12 VM with your SSH key, tmux, Rust and lmux, added to the sidebar."));
+            ui.add_space(6.0);
+            let before = d.provider.clone();
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut d.provider, "aws".to_owned(), "AWS EC2");
+                ui.selectable_value(&mut d.provider, "gcp".to_owned(), "Google Cloud");
+            });
+            if d.provider != before {
+                d.size = crate::state::CloudDraft::default_size(&d.provider).to_owned();
+                d.region.clear();
+            }
+            ui.add_space(4.0);
+            egui::Grid::new("cloud-grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("Name");
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut d.name)
+                        .id(Id::new("cloud-name"))
+                        .hint_text("dev")
+                        .desired_width(220.0),
+                );
+                if !edit.has_focus() && !edit.lost_focus() && d.name.is_empty() {
+                    edit.request_focus();
+                }
+                ui.end_row();
+                ui.label(if d.provider == "gcp" { "Zone" } else { "Region" });
+                ui.add(
+                    egui::TextEdit::singleline(&mut d.region)
+                        .hint_text(if d.provider == "gcp" { "CLI default, else us-central1-a" } else { "CLI default, else us-east-1" })
+                        .desired_width(220.0),
+                );
+                ui.end_row();
+                ui.label("Size");
+                ui.add(egui::TextEdit::singleline(&mut d.size).desired_width(220.0));
+                ui.end_row();
+            });
+            ui.add_space(4.0);
+            let cost = match (d.provider.as_str(), d.size.as_str()) {
+                ("aws", "t3.medium") => "About $0.04/hour (~$30/month) plus ~$2.40/month for the 30 GB disk, billed to your AWS account.",
+                ("gcp", "e2-standard-2") => "About $0.07/hour (~$49/month) plus ~$3/month for the 30 GB disk, billed to your GCP project.",
+                ("gcp", _) => "Billed to your GCP project by the hour until you delete it.",
+                _ => "Billed to your AWS account by the hour until you delete it.",
+            };
+            ui.label(small(cost));
+            ui.label(small(&format!(
+                "Uses the logged-in {} CLI. Delete the box from its host menu.",
+                if d.provider == "gcp" { "gcloud" } else { "aws" }
+            )));
+            let problem = d.name_problem();
+            if let (Some(p), false) = (problem, d.name.is_empty()) {
+                ui.label(egui::RichText::new(p).font(theme::ui(theme::FS_SMALL)).color(theme::RED));
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(problem.is_none() && !d.size.trim().is_empty(), egui::Button::new("Create")).clicked() {
+                    create = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                cancel = true;
+            }
+        });
+    if create {
+        d.region = d.region.trim().to_owned();
+        d.size = d.size.trim().to_owned();
+        c.state.actions.push(Action::CreateCloud(d));
+        c.state.cloud_draft = None;
+    } else if cancel {
+        c.state.cloud_draft = None;
+    } else {
+        c.state.cloud_draft = Some(d);
+    }
+}
+
+/// "Delete cloud box?": the VM and its disk go, with everything on them.
+fn confirm_cloud_delete_dialog(ctx: &egui::Context, c: &mut ui::Ctx) {
+    let Some(name) = c.state.confirm_cloud_delete.clone() else { return };
+    let mut yes = false;
+    let mut no = false;
+    egui::Window::new("Delete Cloud Box?")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .fixed_size(Vec2::new(320.0, 0.0))
+        .show(ctx, |ui| {
+            ui.label(format!("{name} and its disk will be deleted, with every terminal and file on it. This can't be undone."));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button(egui::RichText::new("Delete").color(theme::RED)).clicked() {
+                    yes = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    no = true;
+                }
+            });
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                no = true;
+            }
+        });
+    if yes {
+        c.state.actions.push(Action::DeleteCloud(name));
+    }
+    if yes || no {
+        c.state.confirm_cloud_delete = None;
+    }
+}
+
 /// Run a palette command on the host on screen. Names are those in
 /// `ui::palette::COMMANDS`.
 pub fn run_command(c: &mut ui::Ctx, name: &str) {
@@ -1140,6 +1338,7 @@ pub fn run_command(c: &mut ui::Ctx, name: &str) {
             c.state.new_folder(parent);
         }
         "Add Remote Host…" => c.state.add_host_draft = Some(String::new()),
+        "New Cloud Box…" => c.state.cloud_draft = Some(crate::state::CloudDraft::new("aws")),
         "Zoom In" | "Zoom Out" | "Reset Zoom" => {
             let step = match name {
                 "Zoom In" => 1,
