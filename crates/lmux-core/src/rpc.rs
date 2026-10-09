@@ -180,7 +180,23 @@ pub(crate) async fn spawn_terminal(
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<(String, String)> {
-    let env = vec![
+    spawn_terminal_env(inner, workspace, surface, title, cwd, command, &[], cols, rows).await
+}
+
+/// `spawn_terminal` with extra environment for the window's first process.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn spawn_terminal_env(
+    inner: &Arc<Inner>,
+    workspace: &str,
+    surface: &str,
+    title: &str,
+    cwd: &str,
+    command: Option<&str>,
+    extra_env: &[(String, String)],
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<(String, String)> {
+    let mut env = vec![
         (
             "LMUX_SOCKET".to_string(),
             inner.cfg.socket_path().to_string_lossy().to_string(),
@@ -188,6 +204,7 @@ pub(crate) async fn spawn_terminal(
         ("LMUX_WORKSPACE_ID".to_string(), workspace.to_string()),
         ("LMUX_SURFACE_ID".to_string(), surface.to_string()),
     ];
+    env.extend(extra_env.iter().cloned());
     let (window, pane) = inner
         .tmux
         .new_terminal(cwd, command, &env, cols, rows, title, surface, workspace)
@@ -1326,6 +1343,7 @@ async fn close_surface(inner: &Arc<Inner>, surface: &str) {
         let mut state = inner.state.lock().await;
         state.remove_surface(surface);
     }
+    inner.forget_scrollback(surface).await;
     inner
         .send_to_surface(
             surface,
@@ -1355,6 +1373,7 @@ async fn close_workspace(inner: &Arc<Inner>, ws: &str) {
             let _ = inner.tmux.kill_window(&term.window).await;
             inner.state.lock().await.remove_term(&surface);
         }
+        inner.forget_scrollback(&surface).await;
         if is_browser {
             if let Some(b) = &inner.browser {
                 let _ = b.close_surface(&surface).await;
