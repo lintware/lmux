@@ -357,7 +357,7 @@ fn double_clicking_the_tab_strip_opens_a_tab() {
 }
 
 #[test]
-fn double_clicking_a_workspace_card_opens_a_session_in_its_folder() {
+fn double_clicking_a_workspace_card_renames_it() {
     let mut h = harness(fixture());
     let card = *h
         .state()
@@ -371,9 +371,30 @@ fn double_clicking_a_workspace_card_opens_a_session_in_its_folder() {
         Some("workspace:2"),
         "the double click also selects the card"
     );
+    let editing = h.state().state.ws_rename.as_ref().map(|r| r.folder.clone());
+    assert_eq!(editing.as_deref(), Some("workspace:2"), "the title editor opens");
+    assert!(
+        !rpc_methods(h.state()).iter().any(|(m, _)| m == "workspace.new"),
+        "a double click no longer creates a session"
+    );
+
+    // Replace the title and commit with Enter.
+    h.input_mut().events.push(egui::Event::Key {
+        key: Key::A,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::COMMAND,
+    });
+    h.run();
+    h.input_mut().events.push(egui::Event::Text("api work".into()));
+    h.run();
+    press(&mut h, Modifiers::NONE, Key::Enter);
     let rpcs = rpc_methods(h.state());
-    let call = rpcs.iter().find(|(m, _)| m == "workspace.new").expect("workspace.new sent");
-    assert_eq!(call.1["folder"], "folder:2", "the card's own folder");
+    let call = rpcs.iter().find(|(m, _)| m == "workspace.rename").expect("workspace.rename sent");
+    assert_eq!(call.1["workspace"], "workspace:2");
+    assert_eq!(call.1["title"], "api work");
+    assert!(h.state().state.ws_rename.is_none());
 }
 
 #[test]
@@ -694,13 +715,94 @@ fn cmd_digit_selects_workspace() {
     assert_eq!(h.state().state.selected.as_deref(), Some("workspace:3"));
 }
 
+/// The sidebar shows folder `one`, its nested folder with `second`, then
+/// `first`, then the top-level `third`; Cmd+1 picks the first card on screen.
 #[test]
-fn cmd_shift_n_creates_notification() {
+fn cmd_digit_follows_sidebar_order() {
     let mut h = harness(fixture());
+    press(&mut h, Modifiers::COMMAND, Key::Num1);
+    assert_eq!(h.state().state.selected.as_deref(), Some("workspace:2"));
+    // Cmd+9 is always the last one.
+    press(&mut h, Modifiers::COMMAND, Key::Num9);
+    assert_eq!(h.state().state.selected.as_deref(), Some("workspace:3"));
+}
+
+#[test]
+fn cmd_ctrl_brackets_cycle_workspaces_in_sidebar_order() {
+    let mut h = harness(fixture());
+    let mods = Modifiers { command: true, ctrl: true, ..Default::default() };
+    // first (index 1 of [second, first, third]) → third → wraps to second.
+    press(&mut h, mods, Key::CloseBracket);
+    assert_eq!(h.state().state.selected.as_deref(), Some("workspace:3"));
+    press(&mut h, mods, Key::CloseBracket);
+    assert_eq!(h.state().state.selected.as_deref(), Some("workspace:2"));
+    press(&mut h, mods, Key::OpenBracket);
+    assert_eq!(h.state().state.selected.as_deref(), Some("workspace:3"));
+}
+
+#[test]
+fn cmd_shift_brackets_and_ctrl_digits_pick_tabs() {
+    let mut h = harness(fixture_three_chips());
+    let active = |h: &Harness<Fixture>| {
+        let st = &h.state().state;
+        st.pane("pane:1").and_then(|p| st.active_surface(p))
+    };
     let mods = Modifiers { command: true, shift: true, ..Default::default() };
-    press(&mut h, mods, Key::N);
-    let rpcs = rpc_methods(h.state());
-    assert!(rpcs.iter().any(|(m, _)| m == "notify.create"));
+    press(&mut h, mods, Key::CloseBracket);
+    assert_eq!(active(&h).as_deref(), Some("surface:3"));
+    press(&mut h, mods, Key::CloseBracket);
+    assert_eq!(active(&h).as_deref(), Some("surface:1"), "wraps around");
+    press(&mut h, Modifiers::CTRL, Key::Num2);
+    assert_eq!(active(&h).as_deref(), Some("surface:2"));
+    press(&mut h, Modifiers::CTRL, Key::Num9);
+    assert_eq!(active(&h).as_deref(), Some("surface:3"), "Ctrl+9 is the last tab");
+}
+
+#[test]
+fn cmd_b_toggles_the_sidebar_and_cmd_i_the_notifications() {
+    let mut h = harness(fixture());
+    press(&mut h, Modifiers::COMMAND, Key::B);
+    assert!(h.state().state.sidebar_hidden);
+    press(&mut h, Modifiers::COMMAND, Key::B);
+    assert!(!h.state().state.sidebar_hidden);
+    press(&mut h, Modifiers::COMMAND, Key::I);
+    assert!(h.state().state.notif_open);
+}
+
+#[test]
+fn cmd_plus_minus_zero_size_the_terminal_font() {
+    let mut h = harness(fixture());
+    let base = h.state().state.term_font;
+    press(&mut h, Modifiers::COMMAND, Key::Equals);
+    assert_eq!(h.state().state.term_font, base + 1.0);
+    press(&mut h, Modifiers::COMMAND, Key::Minus);
+    press(&mut h, Modifiers::COMMAND, Key::Minus);
+    assert_eq!(h.state().state.term_font, base - 1.0);
+    press(&mut h, Modifiers::COMMAND, Key::Num0);
+    assert_eq!(h.state().state.term_font, base);
+}
+
+#[test]
+fn cmd_shift_u_jumps_to_the_newest_unread() {
+    let mut fx = fixture();
+    for (id, ws, at) in [("n1", "workspace:2", 1u64), ("n2", "workspace:3", 2)] {
+        fx.state.notifications.push(lmux_proto::Notification {
+            id: id.into(),
+            title: "done".into(),
+            subtitle: None,
+            body: None,
+            workspace: Some(ws.into()),
+            surface: None,
+            created_at: at,
+            read: false,
+        });
+    }
+    let mut h = harness(fx);
+    let mods = Modifiers { command: true, shift: true, ..Default::default() };
+    press(&mut h, mods, Key::U);
+    assert_eq!(h.state().state.selected.as_deref(), Some("workspace:3"));
+    press(&mut h, mods, Key::U);
+    assert_eq!(h.state().state.selected.as_deref(), Some("workspace:2"));
 }
 
 #[test]

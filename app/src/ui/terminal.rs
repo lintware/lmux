@@ -109,7 +109,7 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme::TERM_BG);
 
-    let metrics = metrics_for(ui.ctx(), theme::FS_TERM);
+    let metrics = metrics_for(ui.ctx(), c.state.term_font);
     let usable = Vec2::new((rect.width() - 2.0 * PAD).max(1.0), (rect.height() - 2.0 * PAD).max(1.0));
     let cols = (usable.x / metrics.w).floor().max(2.0) as u16;
     let rows = (usable.y / metrics.h).floor().max(1.0) as u16;

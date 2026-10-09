@@ -7,7 +7,6 @@ pub mod icons;
 pub mod notifications;
 pub mod pane;
 pub mod sidebar;
-pub mod statusbar;
 pub mod tabstrip;
 pub mod terminal;
 

@@ -159,6 +159,10 @@ pub struct AppState {
     pub renaming: Option<Rename>,
     /// Inline rename of a folder row.
     pub folder_rename: Option<FolderRename>,
+    /// Inline rename of a workspace card's title (`folder` holds the workspace).
+    pub ws_rename: Option<FolderRename>,
+    /// Terminal font size in points (Cmd+= / Cmd+- / Cmd+0).
+    pub term_font: f32,
     /// The collapse flip the folder row's last click made, for the double click
     /// that follows it.
     pub folder_toggle: Option<FolderToggle>,
@@ -403,6 +407,8 @@ impl AppState {
             tab_drop: None,
             renaming: None,
             folder_rename: None,
+            ws_rename: None,
+            term_font: crate::theme::FS_TERM,
             folder_toggle: None,
             folder_rename_pending: None,
             last_width: 0.0,
@@ -718,6 +724,154 @@ impl AppState {
 
     pub fn can_go_forward(&self) -> bool {
         self.ws_history_pos + 1 < self.ws_history.len()
+    }
+
+    /// Workspaces in the order the sidebar shows them: each folder's nested
+    /// folders and then its own sessions, depth first, then the top level.
+    /// Cmd+1…9 and next/previous workspace follow this order.
+    pub fn sidebar_order(&self) -> Vec<Ref> {
+        fn walk(st: &AppState, parent: Option<&str>, out: &mut Vec<Ref>) {
+            for f in st.tree.folders.iter().filter(|f| f.parent.as_deref() == parent) {
+                walk(st, Some(&f.id), out);
+                out.extend(
+                    st.tree
+                        .workspaces
+                        .iter()
+                        .filter(|w| w.folder.as_deref() == Some(f.id.as_str()))
+                        .map(|w| w.id.clone()),
+                );
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, None, &mut out);
+        out.extend(self.tree.workspaces.iter().filter(|w| w.folder.is_none()).map(|w| w.id.clone()));
+        // A workspace whose folder is unknown still gets a place.
+        for w in &self.tree.workspaces {
+            if !out.contains(&w.id) {
+                out.push(w.id.clone());
+            }
+        }
+        out
+    }
+
+    /// Select the next (`delta` 1) or previous (-1) workspace in sidebar order,
+    /// wrapping around.
+    pub fn cycle_workspace(&mut self, delta: isize) {
+        let order = self.sidebar_order();
+        if order.is_empty() {
+            return;
+        }
+        let at = self
+            .selected
+            .as_ref()
+            .and_then(|s| order.iter().position(|w| w == s))
+            .map(|i| i as isize)
+            .unwrap_or(-delta.signum().min(0));
+        let next = (at + delta).rem_euclid(order.len() as isize) as usize;
+        let id = order[next].clone();
+        self.select_workspace(&id);
+    }
+
+    /// The focused pane's tabs and the index of the active one.
+    fn focused_tabs(&self) -> Option<(Ref, Vec<Ref>, usize)> {
+        let pane_id = self.focused_pane()?;
+        let pane = self.pane(&pane_id)?;
+        let tabs: Vec<Ref> = pane.surfaces.iter().map(|s| s.id.clone()).collect();
+        let active = self.active_surface(pane)?;
+        let at = tabs.iter().position(|t| *t == active)?;
+        Some((pane_id, tabs, at))
+    }
+
+    /// Next/previous tab in the focused pane, wrapping around.
+    pub fn cycle_tab(&mut self, delta: isize) {
+        let Some((pane, tabs, at)) = self.focused_tabs() else { return };
+        let next = (at as isize + delta).rem_euclid(tabs.len() as isize) as usize;
+        self.select_tab(&pane, &tabs[next]);
+    }
+
+    /// Ctrl+1…9: the n-th tab of the focused pane (0-based); 8 means the last.
+    pub fn select_tab_index(&mut self, index: usize) {
+        let Some((pane, tabs, _)) = self.focused_tabs() else { return };
+        let i = if index >= 8 { tabs.len() - 1 } else { index };
+        if let Some(t) = tabs.get(i) {
+            let t = t.clone();
+            self.select_tab(&pane, &t);
+        }
+    }
+
+    /// Cmd+Opt+arrow: focus the nearest pane in a direction, by the rects the
+    /// panes were drawn at last frame. `dir` is (dx, dy), one of them 0.
+    pub fn focus_direction(&mut self, dir: (i8, i8)) {
+        let Some(ws) = self.selected_workspace() else { return };
+        let panes: Vec<Ref> = ws.panes.iter().map(|p| p.id.clone()).collect();
+        let Some(cur) = self.focused_pane() else { return };
+        let Some(from) = self.pane_rects.get(&cur).copied() else { return };
+        let c = from.center();
+        let mut best: Option<(f32, Ref)> = None;
+        for p in panes.iter().filter(|p| **p != cur) {
+            let Some(r) = self.pane_rects.get(p) else { continue };
+            // Strictly beyond the current pane's edge in that direction.
+            let ahead = match dir {
+                (1, _) => r.min.x >= from.max.x - 1.0,
+                (-1, _) => r.max.x <= from.min.x + 1.0,
+                (_, 1) => r.min.y >= from.max.y - 1.0,
+                _ => r.max.y <= from.min.y + 1.0,
+            };
+            if !ahead {
+                continue;
+            }
+            let rc = r.center();
+            let (along, across) = if dir.0 != 0 {
+                ((rc.x - c.x).abs(), (rc.y - c.y).abs())
+            } else {
+                ((rc.y - c.y).abs(), (rc.x - c.x).abs())
+            };
+            let score = along + 2.0 * across;
+            if best.as_ref().is_none_or(|(b, _)| score < *b) {
+                best = Some((score, p.clone()));
+            }
+        }
+        if let Some((_, p)) = best {
+            self.focus_pane(&p);
+        }
+    }
+
+    /// Cmd+Shift+U: the newest unread notification's workspace, marked read.
+    pub fn jump_to_unread(&mut self) -> bool {
+        let Some(n) = self
+            .notifications
+            .iter()
+            .filter(|n| !n.read && n.workspace.is_some())
+            .max_by_key(|n| n.created_at)
+            .cloned()
+        else {
+            return false;
+        };
+        self.rpc(m::NOTIFY_MARK_READ, serde_json::json!({ "id": n.id }));
+        for item in self.notifications.iter_mut().filter(|i| i.id == n.id) {
+            item.read = true;
+        }
+        if let Some(ws) = n.workspace {
+            self.select_workspace(&ws);
+        }
+        true
+    }
+
+    /// Start editing the selected (or given) workspace's title in place.
+    pub fn begin_ws_rename(&mut self, ws: Option<&str>) {
+        let id = ws.map(str::to_owned).or_else(|| self.selected.clone());
+        let Some(id) = id else { return };
+        let Some(title) = self.workspace(&id).map(|w| w.title.clone()) else { return };
+        self.ws_rename = Some(FolderRename { folder: id, text: title, focus_requested: false });
+    }
+
+    /// Cmd+= / Cmd+- / Cmd+0. Sizes stay between 8 and 32 points.
+    pub fn zoom_terminal(&mut self, delta: f32) {
+        self.term_font = if delta == 0.0 {
+            crate::theme::FS_TERM
+        } else {
+            (self.term_font + delta).clamp(8.0, 32.0)
+        };
     }
 
     pub fn select_tab(&mut self, pane: &str, surface: &str) {

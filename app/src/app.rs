@@ -8,7 +8,7 @@ use lmux_proto::{BrowserInputEvent, ClientMsg, KeyAction, SurfaceKind};
 use crate::net::{ConnState, Net};
 use crate::state::{Action, AppState};
 use crate::theme;
-use crate::ui::{self, drag, icons, notifications, pane, sidebar, statusbar, tabstrip};
+use crate::ui::{self, drag, icons, notifications, pane, sidebar, tabstrip};
 use crate::util::ellipsize;
 use crate::{fonts, keys, wire};
 
@@ -383,11 +383,9 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
     let active = active.min(hosts.len().saturating_sub(1));
     ui.painter().rect_filled(full, 0.0, theme::MAIN_BG);
 
-    let status_rect = Rect::from_min_max(
-        egui::pos2(full.min.x, full.max.y - theme::STATUS_H),
-        full.max,
-    );
-    let body = Rect::from_min_max(full.min, egui::pos2(full.max.x, status_rect.min.y));
+    // No bottom bar, as in cmux: host and connection state live in the
+    // sidebar's host headers and the disconnected banner.
+    let body = full;
 
     let (sidebar_hidden, sidebar_w) = match hosts.get(active) {
         Some(h) => (h.state.sidebar_hidden, h.state.sidebar_w),
@@ -499,7 +497,6 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
         notifications::show_hosts(ui, nrect, &mut all);
     }
 
-    statusbar::show(ui, status_rect, c);
     // Opened from any host's menu; drawn once, on the host on screen.
     for other in left.iter_mut().chain(right.iter_mut()) {
         if let Some(draft) = other.state.add_host_draft.take() {
@@ -520,10 +517,15 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
     }
 }
 
-/// Global keybindings. Public so kittest interaction tests can drive it.
+/// Global keybindings, matching cmux's defaults. Public so kittest interaction
+/// tests can drive it.
 pub fn shortcuts(ctx: &egui::Context, c: &mut ui::Ctx) {
     let cmd = Modifiers::COMMAND;
     let cmd_shift = Modifiers { command: true, shift: true, ..Default::default() };
+    let cmd_alt = Modifiers { command: true, alt: true, ..Default::default() };
+    let cmd_ctrl = Modifiers { command: true, ctrl: true, ..Default::default() };
+    let ctrl = Modifiers::CTRL;
+    let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
 
     let focused_pane = c.state.focused_pane();
     let active_surface = focused_pane
@@ -531,33 +533,98 @@ pub fn shortcuts(ctx: &egui::Context, c: &mut ui::Ctx) {
         .and_then(|p| c.state.pane(p))
         .and_then(|p| c.state.active_surface(p));
 
-    // Most specific first (consume_key ignores extra Shift/Alt otherwise).
-    if ctx.input_mut(|i| i.consume_key(cmd_shift, Key::D)) {
+    // Most specific modifiers first: consume_key ignores extra Shift/Alt.
+    // Panes: split, move focus.
+    if key(cmd_shift, Key::D) {
         split(c, &focused_pane, &active_surface, "down");
     }
-    if ctx.input_mut(|i| i.consume_key(cmd_shift, Key::B)) {
+    for (k, dir) in [
+        (Key::ArrowLeft, (-1, 0)),
+        (Key::ArrowRight, (1, 0)),
+        (Key::ArrowUp, (0, -1)),
+        (Key::ArrowDown, (0, 1)),
+    ] {
+        if key(cmd_alt, k) {
+            c.state.focus_direction(dir);
+        }
+    }
+    // Tabs: browser tab, next/previous, rename.
+    if key(cmd_shift, Key::B) {
         // A browser chip (a tab in the focused pane), not a new pane.
         if let Some(pane) = &focused_pane {
             c.state.new_browser_chip(pane);
         }
     }
-    if ctx.input_mut(|i| i.consume_key(cmd_shift, Key::N)) {
-        c.state.rpc(
-            m::NOTIFY,
-            serde_json::json!({ "title": "lmux", "body": "Test notification from the app." }),
-        );
+    if key(cmd_shift, Key::CloseBracket) {
+        c.state.cycle_tab(1);
     }
-    if ctx.input_mut(|i| i.consume_key(cmd, Key::D)) {
+    if key(cmd_shift, Key::OpenBracket) {
+        c.state.cycle_tab(-1);
+    }
+    // Workspaces: next/previous, close, rename.
+    if key(cmd_ctrl, Key::CloseBracket) {
+        c.state.cycle_workspace(1);
+    }
+    if key(cmd_ctrl, Key::OpenBracket) {
+        c.state.cycle_workspace(-1);
+    }
+    if key(cmd_shift, Key::W) {
+        if let Some(ws) = c.state.selected.clone() {
+            c.state.rpc(m::WORKSPACE_CLOSE, serde_json::json!({ "workspace": ws }));
+        }
+    }
+    if key(cmd_shift, Key::R) {
+        c.state.begin_ws_rename(None);
+    }
+    // Notifications: jump to the newest unread.
+    if key(cmd_shift, Key::U) {
+        c.state.jump_to_unread();
+    }
+
+    if key(cmd, Key::D) {
         split(c, &focused_pane, &active_surface, "right");
     }
-    if ctx.input_mut(|i| i.consume_key(cmd, Key::T)) {
+    if key(cmd, Key::T) {
         if let Some(pane) = &focused_pane {
             c.state.new_terminal_chip(pane);
         }
     }
-    if ctx.input_mut(|i| i.consume_key(cmd, Key::W)) {
+    if key(cmd, Key::W) {
         // Closes the focused pane's active chip, with focus following the close.
         c.state.close_active_chip();
+    }
+    if key(cmd, Key::N) {
+        let folder = c.state.default_new_folder();
+        c.state.new_session(folder);
+    }
+    if key(cmd, Key::B) {
+        c.state.sidebar_hidden = !c.state.sidebar_hidden;
+    }
+    if key(cmd, Key::I) {
+        c.state.notif_open = !c.state.notif_open;
+    }
+    if key(cmd, Key::R) {
+        if let Some(sid) = &active_surface {
+            let title = c.state.surface(sid).map(|s| s.title.clone()).unwrap_or_default();
+            c.state.begin_rename(sid, &title);
+        }
+    }
+    // History: back/forward through the workspaces you visited.
+    if key(cmd, Key::OpenBracket) {
+        c.state.navigate(-1);
+    }
+    if key(cmd, Key::CloseBracket) {
+        c.state.navigate(1);
+    }
+    // Terminal font size.
+    if key(cmd, Key::Plus) || key(cmd, Key::Equals) {
+        c.state.zoom_terminal(1.0);
+    }
+    if key(cmd, Key::Minus) {
+        c.state.zoom_terminal(-1.0);
+    }
+    if key(cmd, Key::Num0) {
+        c.state.zoom_terminal(0.0);
     }
 
     let digits = [
@@ -571,12 +638,18 @@ pub fn shortcuts(ctx: &egui::Context, c: &mut ui::Ctx) {
         Key::Num8,
         Key::Num9,
     ];
-    for (i, key) in digits.iter().enumerate() {
-        if ctx.input_mut(|inp| inp.consume_key(cmd, *key)) {
-            if let Some(ws) = c.state.tree.workspaces.get(i) {
-                let id = ws.id.clone();
+    for (i, k) in digits.iter().enumerate() {
+        // Cmd+1…9: the n-th workspace as the sidebar shows them (9: the last).
+        if key(cmd, *k) {
+            let order = c.state.sidebar_order();
+            let pick = if i == 8 { order.last() } else { order.get(i) };
+            if let Some(id) = pick.cloned() {
                 c.state.select_workspace(&id);
             }
+        }
+        // Ctrl+1…9: the n-th tab of the focused pane.
+        if key(ctrl, *k) {
+            c.state.select_tab_index(i);
         }
     }
 }

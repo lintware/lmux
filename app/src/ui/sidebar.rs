@@ -640,14 +640,19 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
     let max_w = rect.width() - 2.0 * PAD_X;
     let mut y = rect.min.y + PAD_Y;
 
-    // Title.
-    p.text(
-        egui::pos2(x, y),
-        Align2::LEFT_TOP,
-        ellipsize(ui.ctx(), &ws.title, &theme::ui_semibold(theme::FS_TITLE), max_w - 18.0, false),
-        theme::ui_semibold(theme::FS_TITLE),
-        title_color,
-    );
+    // Title, or its inline editor.
+    if c.state.ws_rename.as_ref().is_some_and(|r| r.folder == ws.id) {
+        let edit = Rect::from_min_size(egui::pos2(x - 3.0, y - 2.0), Vec2::new(max_w - 14.0, 19.0));
+        ws_rename_editor(ui, edit, ws, c);
+    } else {
+        p.text(
+            egui::pos2(x, y),
+            Align2::LEFT_TOP,
+            ellipsize(ui.ctx(), &ws.title, &theme::ui_semibold(theme::FS_TITLE), max_w - 18.0, false),
+            theme::ui_semibold(theme::FS_TITLE),
+            title_color,
+        );
+    }
     y += 17.0;
 
     // Summary (up to three lines).
@@ -686,6 +691,17 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
                 faint,
             );
         }
+        y += LINE;
+    } else if let Some(branch) = ws.git_branch.as_deref() {
+        // No agent: the branch gets the line to itself, as on every cmux card.
+        icons::branch(&p, Rect::from_center_size(egui::pos2(x + 5.0, y + 7.0), Vec2::splat(12.0)), faint);
+        p.text(
+            egui::pos2(x + 14.0, y),
+            Align2::LEFT_TOP,
+            ellipsize(ui.ctx(), branch, &theme::ui(theme::FS_SMALL), max_w - 14.0, false),
+            theme::ui(theme::FS_SMALL),
+            faint,
+        );
         y += LINE;
     }
 
@@ -786,11 +802,9 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
     }
 
     if resp.double_clicked() {
-        // Double clicking a card selects it and starts a new session next to it,
-        // in the same folder — the sidebar's double click always means "new
-        // session here".
+        // Double clicking a card renames it in place, as in cmux.
         c.state.select_workspace(&ws.id);
-        c.state.new_session(ws.folder.clone());
+        c.state.begin_ws_rename(Some(&ws.id));
         return;
     }
     if resp.clicked() {
@@ -833,12 +847,22 @@ fn card_menu(resp: &egui::Response, ws: &Workspace, c: &mut Ctx) {
         .collect();
 
     let mut new_session = false;
+    let mut rename = false;
+    let mut mark_read = false;
     let mut close = false;
     let mut move_to: Option<Option<Ref>> = None;
     resp.context_menu(|ui| {
         ui.set_min_width(170.0);
         if ui.button("New Session Here").clicked() {
             new_session = true;
+            ui.close();
+        }
+        if ui.button("Rename Session…").clicked() {
+            rename = true;
+            ui.close();
+        }
+        if ws.unread_notifications > 0 && ui.button("Mark as Read").clicked() {
+            mark_read = true;
             ui.close();
         }
         ui.menu_button("Move to Folder", |ui| {
@@ -864,6 +888,13 @@ fn card_menu(resp: &egui::Response, ws: &Workspace, c: &mut Ctx) {
 
     if new_session {
         c.state.new_session(ws.folder.clone());
+    } else if rename {
+        c.state.begin_ws_rename(Some(&ws.id));
+    } else if mark_read {
+        c.state.rpc(lmux_proto::methods::NOTIFY_MARK_READ, serde_json::json!({ "workspace": ws.id }));
+        for n in c.state.notifications.iter_mut().filter(|n| n.workspace.as_deref() == Some(ws.id.as_str())) {
+            n.read = true;
+        }
     } else if let Some(folder) = move_to {
         c.state.rpc(
             lmux_proto::methods::WORKSPACE_MOVE,
@@ -874,6 +905,58 @@ fn card_menu(resp: &egui::Response, ws: &Workspace, c: &mut Ctx) {
     }
 }
 
+/// The inline editor over a card's title (double click, `Rename Session…`,
+/// Cmd+Shift+R). Enter commits, Escape or clicking away cancels.
+fn ws_rename_editor(ui: &mut Ui, rect: Rect, ws: &Workspace, c: &mut Ctx) {
+    let Some(ren) = c.state.ws_rename.clone() else { return };
+    let mut text = ren.text;
+    let mut commit = false;
+    let mut cancel = false;
+    let edit_id = Id::new(("ws-rename", &c.state.host_salt, &ws.id));
+    ui.scope_builder(
+        UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            ui.style_mut().visuals.extreme_bg_color = Color32::from_rgb(0x2A, 0x2A, 0x2A);
+            ui.style_mut().visuals.selection.bg_fill = theme::ACCENT;
+            let out = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .id(edit_id)
+                    .font(theme::ui_semibold(theme::FS_TITLE))
+                    .text_color(theme::TEXT)
+                    .desired_width(rect.width().max(24.0)),
+            );
+            if !ren.focus_requested {
+                out.request_focus();
+            }
+            if out.lost_focus() {
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    commit = true;
+                } else {
+                    cancel = true;
+                }
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                cancel = true;
+            }
+        },
+    );
+    if commit {
+        let title = text.trim().to_owned();
+        if !title.is_empty() && title != ws.title {
+            c.state.rpc(
+                lmux_proto::methods::WORKSPACE_RENAME,
+                serde_json::json!({ "workspace": ws.id, "title": title }),
+            );
+        }
+        c.state.ws_rename = None;
+    } else if cancel {
+        c.state.ws_rename = None;
+    } else if let Some(r) = c.state.ws_rename.as_mut() {
+        r.text = text;
+        r.focus_requested = true;
+    }
+}
+
 fn card_height(ctx: &egui::Context, ws: &Workspace, inner_w: f32, selected: bool) -> f32 {
     let _ = (ctx, selected);
     let mut h = PAD_Y + 17.0; // title
@@ -881,7 +964,7 @@ fn card_height(ctx: &egui::Context, ws: &Workspace, inner_w: f32, selected: bool
         let lines = wrap_lines(ctx, ws.summary.as_deref().unwrap_or(""), &theme::ui(theme::FS_SMALL), inner_w, 3).len();
         h += lines as f32 * LINE + 2.0;
     }
-    if agent_color(ws.agent).is_some() {
+    if agent_color(ws.agent).is_some() || ws.git_branch.is_some() {
         h += LINE;
     }
     if !ws.cwd.is_empty() {
