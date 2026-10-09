@@ -40,6 +40,8 @@ pub struct BrowserView {
     pub pending_ack: Option<u32>,
     pub wants_visible: bool,
     pub subscribed: bool,
+    /// The size last sent to the daemon. Cleared with `subscribed`, so a new
+    /// subscription (after a reconnect) sends it again.
     pub sent_size: Option<(u32, u32, f32)>,
     /// A size change waiting out the resize debounce (review #9).
     pub pending_size: Option<(u32, u32, f32)>,
@@ -1576,6 +1578,7 @@ impl AppState {
             }
             for b in self.browsers.values_mut() {
                 b.subscribed = false;
+                b.sent_size = None;
             }
             return;
         }
@@ -1598,6 +1601,7 @@ impl AppState {
                 self.pending.push(ClientMsg::Subscribe { surface: id.clone() });
             } else if !visible_now && b.subscribed {
                 b.subscribed = false;
+                b.sent_size = None;
                 self.pending.push(ClientMsg::Unsubscribe { surface: id.clone() });
             }
         }
@@ -1848,6 +1852,7 @@ impl AppState {
         for (id, b) in self.browsers.iter_mut() {
             if b.subscribed {
                 b.subscribed = false;
+                b.sent_size = None;
                 self.pending.push(ClientMsg::Unsubscribe { surface: id.clone() });
             }
         }
@@ -1860,6 +1865,7 @@ impl AppState {
         }
         for b in self.browsers.values_mut() {
             b.subscribed = false;
+            b.sent_size = None;
         }
     }
 
