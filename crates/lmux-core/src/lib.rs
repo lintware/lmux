@@ -4,6 +4,7 @@
 //! - [`tmux`]: the control-mode backend (one window per terminal surface).
 //! - [`keys`]: tmux key-name mapping and `%output` octal decoding.
 //! - [`browser`]: the [`browser::BrowserBackend`] trait boundary.
+//! - [`scrollback`]: saved terminal history, replayed into respawned panes.
 //! - [`rpc`]: RPC dispatch over the shared `lmux_proto` methods.
 //! - [`daemon`]: the daemon itself — unix socket, websocket server, persistence.
 
@@ -11,6 +12,7 @@ pub mod browser;
 pub mod daemon;
 pub mod keys;
 pub mod rpc;
+pub mod scrollback;
 pub mod tmux;
 pub mod tree;
 
