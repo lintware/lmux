@@ -1697,12 +1697,18 @@ impl AppState {
                 continue;
             }
             let Ok(bytes) = std::fs::read(&path) else { continue };
-            use base64::Engine;
-            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-            let id = self.rpc_with_id(m::FILE_PUT, serde_json::json!({ "name": "pasted-image.png", "data": data }));
-            self.pending_uploads.insert(id, surface);
+            self.upload_and_paste(&surface, "pasted-image.png", &bytes);
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// Save `bytes` on the host as a file and, once it answers, paste the
+    /// file's path into the terminal.
+    pub fn upload_and_paste(&mut self, surface: &str, name: &str, bytes: &[u8]) {
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let id = self.rpc_with_id(m::FILE_PUT, serde_json::json!({ "name": name, "data": data }));
+        self.pending_uploads.insert(id, surface.to_owned());
     }
 
     /// Paste text into a terminal as the keyboard would (bracketed when the

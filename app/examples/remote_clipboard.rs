@@ -218,6 +218,22 @@ fn main() {
         format!("row {row:?}, selection {selected:?}"),
     );
 
+    // 5. Image paste: the image is saved on the host and its path pasted, so
+    // a program there (Claude Code) can open it.
+    rig.type_text(&sid, "clear; wc -c < ");
+    rig.pump_for(Duration::from_millis(300));
+    let png: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8).collect();
+    rig.state.upload_and_paste(&sid, "pasted-image.png", &png);
+    rig.pump_for(Duration::from_millis(1500));
+    rig.type_text(&sid, "\r");
+    rig.pump_for(Duration::from_millis(1000));
+    let screen = rig.screen(&sid);
+    check(
+        "a pasted image is saved on the host and its path pasted",
+        screen.lines().any(|l| l.trim() == "4096"),
+        screen.clone(),
+    );
+
     rig.state.rpc("workspace.close", serde_json::json!({ "workspace": ws.id }));
     rig.pump_for(Duration::from_millis(500));
     println!("{}", if failures == 0 { "ALL PASSED" } else { "SOME FAILED" });
