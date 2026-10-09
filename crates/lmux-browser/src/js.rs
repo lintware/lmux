@@ -310,6 +310,18 @@ pub(crate) fn get_expr(what: &str, selector: Option<&str>, name: Option<&str>) -
     })
 }
 
+/// The absolute URL of the link under the viewport point (`x`, `y`), or null.
+/// `javascript:` links yield null: they cannot be opened in another tab.
+pub(crate) fn link_at_expr(x: f64, y: f64) -> String {
+    let (x, y) = (if x.is_finite() { x } else { 0.0 }, if y.is_finite() { y } else { 0.0 });
+    format!(
+        "(function(){{var el=document.elementFromPoint({x},{y});\
+var a=el&&el.closest?el.closest('a[href],area[href]'):null;if(!a)return null;\
+var h=a.href;if(h&&typeof h!=='string')h=h.baseVal?new URL(h.baseVal,document.baseURI).href:null;\
+if(!h||/^javascript:/i.test(h))return null;return h;}})()"
+    )
+}
+
 /// JSON-escape a string as a JS string literal (including quotes).
 pub(crate) fn json_string(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
