@@ -385,6 +385,21 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
     pointer_input(ui, &resp, surface, &grid, c);
     context_menu(ui, &resp, surface, c);
 
+    // Files dropped on the terminal paste their paths, shell-quoted and
+    // space-separated, as in cmux.
+    if resp.contains_pointer() {
+        let dropped: Vec<String> = ui.input(|i| {
+            i.raw.dropped_files.iter().map(|f| shell_quote(&f.path().to_string_lossy())).collect()
+        });
+        if !dropped.is_empty() {
+            let text = format!("{} ", dropped.join(" "));
+            c.state.send_term_input(surface, text.as_bytes());
+            if let Some(pane) = c.state.pane_of_surface(surface) {
+                c.state.focus_pane(&pane);
+            }
+        }
+    }
+
     // Cmd held over a link: underline it and show a hand.
     let hover_link = match resp.hover_pos() {
         Some(pos) if ui.input(|i| i.modifiers.command) && grid_contains(&grid, pos) => {
@@ -648,6 +663,29 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
     }
 
     SCRATCH.with(|s| s.borrow_mut().cells = cells);
+
+    // A thin scrollbar while there is history: where the view sits in it,
+    // brighter while scrolled back or hovered, as in cmux.
+    if let Some(tv) = c.state.terms.get(surface) {
+        use alacritty_terminal::grid::Dimensions;
+        let history = tv.term().grid().history_size();
+        if history > 0 {
+            let offset = tv.display_offset();
+            let total = (history + rows as usize) as f32;
+            let track = Rect::from_min_max(
+                Pos2::new(rect.max.x - 6.0, rect.min.y + 2.0),
+                Pos2::new(rect.max.x - 2.0, rect.max.y - 2.0),
+            );
+            // The view's first line is `history - offset` lines into the
+            // `history + rows` the terminal holds.
+            let h = (track.height() * rows as f32 / total).max(18.0);
+            let top = (history - offset.min(history)) as f32 / total;
+            let y = (track.min.y + track.height() * top).min(track.max.y - h);
+            let thumb = Rect::from_min_size(Pos2::new(track.min.x, y), Vec2::new(track.width(), h));
+            let alpha = if offset > 0 || resp.hovered() { 90 } else { 35 };
+            painter.rect_filled(thumb, egui::CornerRadius::same(2), egui::Color32::from_white_alpha(alpha));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -684,5 +722,27 @@ mod tests {
         let mut count = 0;
         for_each_bg_run(&row, Color32::BLACK, |_, _, _| count += 1);
         assert_eq!(count, 1, "a 200-cell bar must be a single rectangle, not 200");
+    }
+}
+
+/// Quote a path for a POSIX shell when it needs it: `'it'\''s here'`.
+fn shell_quote(path: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+,:@%=~".contains(c);
+    if !path.is_empty() && path.chars().all(safe) {
+        path.to_owned()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::shell_quote;
+
+    #[test]
+    fn paths_are_quoted_only_when_needed() {
+        assert_eq!(shell_quote("/tmp/a.txt"), "/tmp/a.txt");
+        assert_eq!(shell_quote("/tmp/my file.png"), "'/tmp/my file.png'");
+        assert_eq!(shell_quote("/tmp/it's"), "'/tmp/it'\\''s'");
     }
 }

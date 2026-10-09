@@ -574,3 +574,22 @@ fn snapshot_drag_edge_indicator() {
     press_drag(&mut h, chip_grab(s7), to);
     h.snapshot("drag_edge_split");
 }
+
+/// A terminal with history shows a thin scrollbar; scrolled back, it sits
+/// partway up and brightens.
+#[test]
+fn snapshot_terminal_scrollbar() {
+    let mut fx = fixture("workspace:1", false);
+    {
+        let ws = &mut fx.state.tree.workspaces[0];
+        ws.panes[0].active_surface = Some("surface:1".into());
+    }
+    let mut t = TermView::new(80, 24);
+    for i in 0..300 {
+        t.feed(format!("line {i}\r\n").as_bytes());
+    }
+    t.scroll(120);
+    fx.state.terms.insert("surface:1".into(), t);
+    let mut h = harness(fx, Vec2::new(900.0, 500.0));
+    h.snapshot("terminal_scrollbar");
+}
