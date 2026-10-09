@@ -1,4 +1,22 @@
 fn main() -> eframe::Result<()> {
+    // Launched from the Dock there is no terminal to see a panic in: keep it
+    // in ~/.local/state/lmux/app.log, with the time, then let it abort.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(dir) = dirs::home_dir().map(|h| h.join(".local/state/lmux")) {
+            let _ = std::fs::create_dir_all(&dir);
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("app.log")) {
+                use std::io::Write;
+                let when = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let bt = std::backtrace::Backtrace::force_capture();
+                let _ = writeln!(f, "[{when}] panic: {info}\n{bt}");
+            }
+        }
+        default_hook(info);
+    }));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("lmux")
