@@ -246,6 +246,8 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
     let mut new_session = false;
     let mut new_folder = false;
     let mut reconnect = false;
+    let mut add_host = false;
+    let mut remove = false;
     resp.context_menu(|ui| {
         ui.set_min_width(170.0);
         if ui.button("New Session").clicked() {
@@ -261,6 +263,14 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
             reconnect = true;
             ui.close();
         }
+        if ui.button("Add Remote Host…").clicked() {
+            add_host = true;
+            ui.close();
+        }
+        if !c.net.is_local_host() && ui.button("Remove Host").clicked() {
+            remove = true;
+            ui.close();
+        }
     });
     if new_session {
         c.state.new_session(None);
@@ -268,6 +278,10 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
         c.state.new_folder(None);
     } else if reconnect {
         c.state.actions.push(crate::state::Action::Reconnect);
+    } else if add_host {
+        c.state.add_host_draft = Some(String::new());
+    } else if remove {
+        c.state.actions.push(crate::state::Action::RemoveHost);
     }
     collapsed
 }
@@ -447,6 +461,7 @@ fn new_item_menu(resp: &egui::Response, c: &mut Ctx) {
 
     let mut session: Option<(usize, Option<String>)> = None;
     let mut folder: Option<(usize, Option<String>)> = None;
+    let mut add_host = false;
     resp.context_menu(|ui| {
         ui.set_min_width(200.0);
         let mut close = false;
@@ -462,10 +477,19 @@ fn new_item_menu(resp: &egui::Response, c: &mut Ctx) {
                 close = true;
             }
         }
+        ui.separator();
+        if ui.button("Add Remote Host…").clicked() {
+            add_host = true;
+            close = true;
+        }
         if close {
             ui.close();
         }
     });
+    if add_host {
+        c.state.add_host_draft = Some(String::new());
+        return;
+    }
 
     let pick = match (session, folder) {
         (Some(pick), _) => (CreateKind::Session, pick),

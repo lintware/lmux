@@ -204,6 +204,34 @@ pub fn app_hosts() -> Vec<HostConfig> {
     hosts.into_iter().filter(|h| !(h.kind == "direct" && h.name == "mock")).collect()
 }
 
+/// A remote host reached over SSH by `target` (an alias from ~/.ssh/config or
+/// `user@host`). Its daemon listens on the default port behind the tunnel.
+pub fn ssh_host(target: &str) -> HostConfig {
+    HostConfig {
+        name: target.to_owned(),
+        label: target.to_owned(),
+        kind: "ssh".into(),
+        url: None,
+        ssh_target: Some(target.to_owned()),
+        remote_port: DEFAULT_REMOTE_PORT,
+        browser_scale: None,
+    }
+}
+
+/// Write the configured hosts back to `hosts.json`. The local host is derived
+/// at runtime and never written.
+pub fn save_hosts(hosts: &[HostConfig]) -> Result<(), String> {
+    let path = config_path().ok_or("no config directory")?;
+    let keep: Vec<&HostConfig> = hosts.iter().filter(|h| h.name != LOCAL_HOST_NAME).collect();
+    let json = serde_json::to_string_pretty(&keep).map_err(|e| e.to_string())?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+}
+
 /// Load hosts, seeding the config file on first run. `LMUX_WS_URL` overrides
 /// everything and points at a single direct host (used for development).
 pub fn load_hosts() -> Vec<HostConfig> {
@@ -516,6 +544,13 @@ impl Net {
     /// this to ask which host a new session belongs to.
     pub fn hosts(&self) -> &[HostConfig] {
         &self.hosts
+    }
+
+    /// Replace the host list (a host was added or removed) and point this
+    /// connection at `index` in it, which must still be the same host.
+    pub fn set_hosts(&mut self, hosts: Vec<HostConfig>, index: usize) {
+        self.hosts = hosts;
+        self.host_index = index;
     }
 
     pub fn host_index(&self) -> usize {

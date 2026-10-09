@@ -186,14 +186,28 @@ impl eframe::App for LmuxApp {
         }
         self.flush();
 
-        for from in 0..self.hosts.len() {
-            for action in std::mem::take(&mut self.hosts[from].state.actions) {
-                match action {
-                    Action::SwitchHost(to) => self.create_on(from, to),
-                    Action::Reconnect => self.hosts[from].net.begin_connect(&ctx),
-                    Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                }
+        let actions: Vec<(usize, Action)> = self
+            .hosts
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(i, h)| std::mem::take(&mut h.state.actions).into_iter().map(move |a| (i, a)))
+            .collect();
+        // Removing a host shifts the indices after it, so removals go last,
+        // highest index first.
+        let mut removals: Vec<usize> = Vec::new();
+        for (from, action) in actions {
+            match action {
+                Action::SwitchHost(to) => self.create_on(from, to),
+                Action::Reconnect => self.hosts[from].net.begin_connect(&ctx),
+                Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Action::AddHost(target) => self.add_host(&target, &ctx),
+                Action::RemoveHost => removals.push(from),
             }
+        }
+        removals.sort_unstable();
+        removals.dedup();
+        for i in removals.into_iter().rev() {
+            self.remove_host(i);
         }
     }
 
@@ -258,6 +272,72 @@ impl LmuxApp {
                 h.net.send(&msg);
             }
         }
+    }
+
+    fn host_configs(&self) -> Vec<crate::net::HostConfig> {
+        self.hosts.first().map(|h| h.net.hosts().to_vec()).unwrap_or_default()
+    }
+
+    /// Point every connection at the new host list; each keeps its own host.
+    fn reindex(&mut self, configs: &[crate::net::HostConfig]) {
+        let multi = configs.len() > 1;
+        for (i, h) in self.hosts.iter_mut().enumerate() {
+            h.net.set_hosts(configs.to_vec(), i);
+            h.state.host_salt = if multi { h.net.host_name() } else { String::new() };
+        }
+    }
+
+    /// Add a remote host over SSH, connect to it and put it on screen. A host
+    /// that is already configured is just brought on screen.
+    fn add_host(&mut self, target: &str, ctx: &egui::Context) {
+        let target = target.trim();
+        if target.is_empty() {
+            return;
+        }
+        if let Some(i) = self.hosts.iter().position(|h| {
+            h.net.current_host().is_some_and(|c| c.name == target || c.ssh_target.as_deref() == Some(target))
+        }) {
+            self.activate(i);
+            return;
+        }
+        let mut configs = self.host_configs();
+        configs.push(crate::net::ssh_host(target));
+        if let Err(e) = crate::net::save_hosts(&configs) {
+            self.hosts[self.active].state.banner = Some((format!("could not save hosts.json: {e}"), true));
+        }
+        let mut net = Net::for_host(configs.clone(), configs.len() - 1);
+        net.set_wake(ctx.clone());
+        let mut state = AppState::new();
+        state.set_wake(ctx.clone());
+        net.begin_connect(ctx);
+        self.hosts.push(HostSession { state, net, was_connected: false });
+        self.reindex(&configs);
+        self.activate(self.hosts.len() - 1);
+    }
+
+    /// Forget a remote host: close its connection and drop it from hosts.json.
+    /// Its daemon and terminals keep running on that machine.
+    fn remove_host(&mut self, index: usize) {
+        if index >= self.hosts.len() || self.hosts[index].net.is_local_host() || self.hosts.len() == 1 {
+            return;
+        }
+        let mut configs = self.host_configs();
+        configs.remove(index);
+        if let Err(e) = crate::net::save_hosts(&configs) {
+            self.hosts[self.active].state.banner = Some((format!("could not save hosts.json: {e}"), true));
+        }
+        let was_active = self.active == index;
+        let (w, hidden) = (self.hosts[self.active].state.sidebar_w, self.hosts[self.active].state.sidebar_hidden);
+        self.hosts.remove(index);
+        if self.active > index || self.active >= self.hosts.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        if was_active {
+            let s = &mut self.hosts[self.active].state;
+            s.sidebar_w = w;
+            s.sidebar_hidden = hidden;
+        }
+        self.reindex(&configs);
     }
 
     /// A create picked on host `from`'s menu for host `to`: hand it over and
@@ -420,6 +500,13 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
     }
 
     statusbar::show(ui, status_rect, c);
+    // Opened from any host's menu; drawn once, on the host on screen.
+    for other in left.iter_mut().chain(right.iter_mut()) {
+        if let Some(draft) = other.state.add_host_draft.take() {
+            c.state.add_host_draft = Some(draft);
+        }
+    }
+    add_host_dialog(&ctx, c);
 
     // Drag feedback runs last, over everything a drag can land on. The sidebar
     // rows and the panes have both been drawn, so one pass resolves against the
@@ -594,5 +681,59 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
             }
         }
         _ => {}
+    }
+}
+
+/// The "Add Remote Host" dialog: one field for an SSH target. Adding it saves
+/// the host and connects; the daemon must already run there (see
+/// `deploy/install-remote.sh`).
+fn add_host_dialog(ctx: &egui::Context, c: &mut ui::Ctx) {
+    let Some(mut draft) = c.state.add_host_draft.clone() else { return };
+    let mut add = false;
+    let mut cancel = false;
+    egui::Window::new("Add Remote Host")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .fixed_size(Vec2::new(320.0, 0.0))
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new("SSH alias or user@host. The host needs lmux running (deploy/install-remote.sh).")
+                    .font(theme::ui(theme::FS_SMALL))
+                    .color(theme::DIM),
+            );
+            ui.add_space(6.0);
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut draft)
+                    .id(Id::new("add-host-field"))
+                    .hint_text("my-server")
+                    .desired_width(f32::INFINITY),
+            );
+            if !edit.has_focus() && !edit.lost_focus() {
+                edit.request_focus();
+            }
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                add = true;
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Add").clicked() {
+                    add = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                cancel = true;
+            }
+        });
+    if add && !draft.trim().is_empty() {
+        c.state.actions.push(Action::AddHost(draft.trim().to_owned()));
+        c.state.add_host_draft = None;
+    } else if cancel {
+        c.state.add_host_draft = None;
+    } else {
+        c.state.add_host_draft = Some(draft);
     }
 }

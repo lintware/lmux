@@ -121,6 +121,8 @@ pub struct AppState {
     pub activated: bool,
     /// The sidebar shows this host's group folded to its header.
     pub host_collapsed: bool,
+    /// The "Add Remote Host" field, while it is open: the SSH target typed so far.
+    pub add_host_draft: Option<String>,
     pub terms: HashMap<Ref, TermView>,
     pub browsers: HashMap<Ref, BrowserView>,
     /// PTYs owned by this process, one per local terminal surface. Present only
@@ -210,6 +212,10 @@ pub enum Action {
     SwitchHost(usize),
     Reconnect,
     Quit,
+    /// Add a remote host reached over SSH by this target, and connect to it.
+    AddHost(String),
+    /// Forget this host (the one whose state queued the action).
+    RemoveHost,
 }
 
 /// Inline rename of a surface chip.
@@ -374,6 +380,7 @@ impl AppState {
             host_salt: String::new(),
             activated: false,
             host_collapsed: false,
+            add_host_draft: None,
             pending_create: None,
             terms: HashMap::new(),
             browsers: HashMap::new(),
