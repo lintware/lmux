@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::browser::BrowserBackend;
+use crate::scrollback;
 use crate::tmux::{Tmux, TmuxConfig, TmuxEvent};
 use crate::tmux::WinInfo;
 use crate::tree::{terminal_surface, AgentSession, SessionState, TermMeta};
@@ -77,6 +78,12 @@ const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// How often live panes are checked for cwd changes and exited agents.
 const RESUME_REFRESH: Duration = Duration::from_secs(30);
+
+/// How often changed terminals have their scrollback saved to disk.
+const SCROLLBACK_INTERVAL: Duration = RESUME_REFRESH;
+
+/// Bound on the final scrollback capture at shutdown (tmux may already be gone).
+const SHUTDOWN_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// After typing `claude --resume`, the pane shows a shell until Claude starts.
 /// Within this window a shell foreground does not mean "Claude exited".
@@ -259,6 +266,8 @@ pub struct Inner {
     tree_dirty: Notify,
     /// Respawn bookkeeping (see `reconcile`).
     respawn: std::sync::Mutex<RespawnState>,
+    /// Terminals with output since their scrollback was last saved.
+    scrollback_dirty: std::sync::Mutex<HashSet<Ref>>,
 }
 
 #[derive(Default)]
@@ -779,14 +788,38 @@ impl Inner {
                 .filter(|d| is_dir(d))
                 .or_else(|| Some(r.workspace_cwd.clone()).filter(|d| is_dir(d)))
                 .unwrap_or_else(|| home.clone());
-            let spawned = crate::rpc::spawn_terminal(
-                &self, &r.workspace, &r.surface, &r.title, &cwd, None, r.cols, r.rows,
+            // Replay the saved screen: the window's first process prints a
+            // private copy of it, then execs the login shell in `cwd`.
+            let restore = scrollback::stage_restore(&self.cfg.state_dir, &r.surface).await;
+            let (command, env) = match &restore {
+                Some(p) => (
+                    Some(scrollback::restore_command()),
+                    vec![(
+                        scrollback::RESTORE_ENV.to_string(),
+                        p.to_string_lossy().into_owned(),
+                    )],
+                ),
+                None => (None, vec![]),
+            };
+            let spawned = crate::rpc::spawn_terminal_env(
+                &self,
+                &r.workspace,
+                &r.surface,
+                &r.title,
+                &cwd,
+                command.as_deref(),
+                &env,
+                r.cols,
+                r.rows,
             )
             .await;
             let (window, pane) = match spawned {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::warn!(surface = %r.surface, "respawn failed: {e}");
+                    if let Some(p) = &restore {
+                        let _ = tokio::fs::remove_file(p).await;
+                    }
                     self.respawn.lock().unwrap().in_flight.remove(&r.surface);
                     continue;
                 }
@@ -883,6 +916,103 @@ impl Inner {
         }
     }
 
+    // --- scrollback -------------------------------------------------------
+
+    /// Note output on a terminal, so the next capture saves it.
+    fn note_output(&self, surface: &str) {
+        let mut d = self.scrollback_dirty.lock().unwrap();
+        if !d.contains(surface) {
+            d.insert(surface.to_string());
+        }
+    }
+
+    /// Mark every terminal as changed (startup: the files may be stale).
+    async fn mark_all_scrollback_dirty(&self) {
+        let terms: Vec<Ref> = {
+            let state = self.state.lock().await;
+            state
+                .all_surface_refs()
+                .into_iter()
+                .filter(|s| state.term(s).is_some())
+                .collect()
+        };
+        self.scrollback_dirty.lock().unwrap().extend(terms);
+    }
+
+    /// Save the scrollback of every terminal with output since the last
+    /// capture (or of every terminal when `all`), and delete files of surfaces
+    /// that are gone. Returns how many files were written.
+    ///
+    /// A pane is only captured while tmux still tags it with the same surface:
+    /// after a tmux restart pane ids are reused, and a stale id must not write
+    /// one terminal's screen into another's file.
+    pub async fn capture_scrollback(&self, all: bool) -> usize {
+        let Ok(wins) = self.tmux.list_windows().await else {
+            return 0;
+        };
+        let dirty: HashSet<Ref> = std::mem::take(&mut *self.scrollback_dirty.lock().unwrap());
+        let in_flight = self.respawn.lock().unwrap().in_flight.clone();
+        let (targets, terminals) = {
+            let state = self.state.lock().await;
+            let terminals: Vec<Ref> = state
+                .all_surface_refs()
+                .into_iter()
+                .filter(|s| {
+                    matches!(
+                        state.surface(s).map(|x| &x.kind),
+                        Some(SurfaceKind::Terminal { .. })
+                    )
+                })
+                .collect();
+            let targets: Vec<(Ref, String)> = terminals
+                .iter()
+                .filter(|s| (all || dirty.contains(*s)) && !in_flight.contains(*s))
+                .filter_map(|s| {
+                    let t = state.term(s)?;
+                    wins.iter()
+                        .any(|w| w.pane == t.pane && w.surface.as_deref() == Some(s.as_str()))
+                        .then(|| (s.clone(), t.pane.clone()))
+                })
+                .collect();
+            (targets, terminals)
+        };
+        // Anything dirty that could not be captured now is retried next time.
+        {
+            let done: HashSet<&Ref> = targets.iter().map(|(s, _)| s).collect();
+            let mut d = self.scrollback_dirty.lock().unwrap();
+            d.extend(
+                dirty
+                    .iter()
+                    .filter(|s| !done.contains(s) && terminals.contains(s))
+                    .cloned(),
+            );
+        }
+        let mut written = 0;
+        for (surface, pane) in targets {
+            match self.tmux.capture_history(&pane, scrollback::CAPTURE_LINES).await {
+                Ok(cap) => {
+                    let body = scrollback::prepare(&cap);
+                    match scrollback::save(&self.cfg.state_dir, &surface, &body).await {
+                        Ok(()) => written += 1,
+                        Err(e) => tracing::warn!(%surface, "saving scrollback: {e}"),
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(%surface, "capturing scrollback: {e}");
+                    self.note_output(&surface);
+                }
+            }
+        }
+        scrollback::prune(&self.cfg.state_dir, &terminals).await;
+        written
+    }
+
+    /// Drop a closed terminal's saved scrollback.
+    pub async fn forget_scrollback(&self, surface: &str) {
+        self.scrollback_dirty.lock().unwrap().remove(surface);
+        scrollback::remove(&self.cfg.state_dir, surface).await;
+    }
+
     async fn handle_window_closed(self: &Arc<Self>, window: &str) {
         let surface = { self.state.lock().await.remove_window(window) };
         let Some(surface) = surface else { return };
@@ -890,6 +1020,7 @@ impl Inner {
             let mut state = self.state.lock().await;
             state.remove_surface(&surface);
         }
+        self.forget_scrollback(&surface).await;
         tracing::info!(%surface, "surface closed by tmux");
         self.send_to_surface(
             &surface,
@@ -936,11 +1067,13 @@ pub async fn run(cfg: Config, browser: Option<Arc<dyn BrowserBackend>>) -> anyho
         dirty: Notify::new(),
         tree_dirty: Notify::new(),
         respawn: std::sync::Mutex::new(RespawnState::default()),
+        scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
     });
 
     tokio::spawn(tmux_event_loop(inner.clone(), ev_rx));
     inner.reconcile().await;
     inner.mark_dirty();
+    inner.mark_all_scrollback_dirty().await;
 
     // One long-lived, debounced persist task (no per-change task, no `.tmp` race).
     {
@@ -998,6 +1131,19 @@ pub async fn run(cfg: Config, browser: Option<Arc<dyn BrowserBackend>>) -> anyho
         });
     }
 
+    // Scrollback of changed terminals, replayed if tmux is lost.
+    {
+        let me = inner.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SCROLLBACK_INTERVAL);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                me.capture_scrollback(false).await;
+            }
+        });
+    }
+
     // Branch labels on a background timer; tree sends never spawn `git`.
     {
         let me = inner.clone();
@@ -1043,10 +1189,35 @@ pub async fn run(cfg: Config, browser: Option<Arc<dyn BrowserBackend>>) -> anyho
         "lmuxd ready"
     );
 
-    tokio::signal::ctrl_c().await.ok();
+    shutdown_signal().await;
     tracing::info!("shutting down");
+    if tokio::time::timeout(SHUTDOWN_CAPTURE_TIMEOUT, inner.capture_scrollback(false))
+        .await
+        .is_err()
+    {
+        tracing::warn!("final scrollback capture timed out");
+    }
     inner.persist().await;
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM (a systemd or launchd stop).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+                return;
+            }
+            Err(e) => tracing::warn!("installing SIGTERM handler: {e}"),
+        }
+    }
+    tokio::signal::ctrl_c().await.ok();
 }
 
 fn load_state(cfg: &Config) -> Option<SessionState> {
@@ -1072,6 +1243,7 @@ async fn tmux_event_loop(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Tmux
                     tracing::trace!(%pane, "output for unknown pane");
                     continue;
                 };
+                inner.note_output(&surface);
                 // Skip the encode entirely when nobody is watching this surface.
                 if !inner.has_subscribers(&surface).await {
                     tracing::trace!(%pane, %surface, "output but no subscribers");
@@ -1614,6 +1786,218 @@ mod tests {
         match &drained[0] {
             Out::Msg(ServerMsg::TermSnapshot { data, .. }) => assert_eq!(data, "screen"),
             other => panic!("expected snapshot, got {other:?}"),
+        }
+    }
+
+    async fn tmux_cmd(socket: &str, args: &[&str]) -> bool {
+        tokio::process::Command::new("tmux")
+            .args(["-L", socket])
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Poll `f` until it returns true or `secs` pass.
+    async fn wait_for<F, Fut>(secs: u64, mut f: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            if f().await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        false
+    }
+
+    /// End to end: output in a terminal is saved to its scrollback file; after
+    /// the tmux server is killed, reconcile respawns the terminal in its old
+    /// directory and the new pane shows the saved output above a fresh shell.
+    #[tokio::test]
+    async fn scrollback_is_saved_and_replayed_after_tmux_is_lost() {
+        if !tmux_cmd("lmux-test-probe-unused", &["-V"]).await {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        let socket = format!("lmux-test-sb-{}", std::process::id());
+        let state_dir = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(work.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let tmux = match Tmux::spawn(
+            TmuxConfig {
+                socket: socket.clone(),
+                session: "lmux".into(),
+            },
+            ev_tx,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping: could not start tmux ({e})");
+                return;
+            }
+        };
+        // A plain shell keeps the test independent of the user's rc files.
+        tmux_cmd(&socket, &["set-option", "-g", "default-shell", "/bin/sh"]).await;
+
+        let mut state = SessionState::new("t");
+        let ws = state.next_workspace();
+        let pane_ref = state.next_pane();
+        let surf = state.next_surface();
+        state.add_workspace(Workspace {
+            id: ws.clone(),
+            title: "w".into(),
+            folder: None,
+            cwd: cwd.clone(),
+            git_branch: None,
+            agent: AgentState::None,
+            summary: None,
+            unread_notifications: 0,
+            status_pills: vec![],
+            progress: None,
+            layout: Layout::Pane {
+                pane: pane_ref.clone(),
+            },
+            panes: vec![Pane {
+                id: pane_ref.clone(),
+                surfaces: vec![terminal_surface(surf.clone(), "t", 80, 24)],
+                active_surface: Some(surf.clone()),
+            }],
+            focused_pane: Some(pane_ref),
+        });
+        let inner = Arc::new(Inner {
+            cfg: Config {
+                state_dir: state_dir.path().to_path_buf(),
+                tmux_socket: socket.clone(),
+                ws_addr: "127.0.0.1:1".into(),
+                host: "t".into(),
+            },
+            state: Mutex::new(state),
+            tmux,
+            browser: None,
+            browser_streaming: Mutex::new(HashSet::new()),
+            clients: Mutex::new(Clients::default()),
+            dirty: Notify::new(),
+            tree_dirty: Notify::new(),
+            respawn: std::sync::Mutex::new(RespawnState::default()),
+            scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
+        });
+
+        let result = async {
+            let (_w, pane) =
+                crate::rpc::spawn_terminal(&inner, &ws, &surf, "t", &cwd, None, 80, 24)
+                    .await
+                    .map_err(|e| format!("spawn: {e}"))?;
+            // The typed line holds `$((6*7))`; only the output holds `42`.
+            inner
+                .tmux
+                .send_bytes(&pane, b"printf 'SB_MARKER_%s\\n' $((6*7))\r")
+                .await
+                .map_err(|e| format!("send: {e}"))?;
+            let shown = wait_for(10, || async {
+                inner
+                    .tmux
+                    .capture(&pane, false, None)
+                    .await
+                    .is_ok_and(|c| c.contains("SB_MARKER_42"))
+            })
+            .await;
+            if !shown {
+                return Err("marker never appeared".to_string());
+            }
+
+            // Capture: only dirty terminals unless `all`.
+            if inner.capture_scrollback(false).await != 0 {
+                return Err("nothing was dirty, nothing should be written".into());
+            }
+            inner.note_output(&surf);
+            if inner.capture_scrollback(false).await != 1 {
+                return Err("dirty terminal was not captured".into());
+            }
+            let file = scrollback::path(state_dir.path(), &surf);
+            let saved = std::fs::read_to_string(&file).map_err(|e| format!("read: {e}"))?;
+            if !saved.contains("SB_MARKER_42") {
+                return Err(format!("saved scrollback lacks the marker: {saved:?}"));
+            }
+
+            // Lose tmux. The supervisor brings a fresh server back.
+            tmux_cmd(&socket, &["kill-server"]).await;
+            let back = wait_for(15, || async {
+                tmux_cmd(&socket, &["has-session", "-t", "lmux"]).await
+                    && inner.tmux.list_windows().await.is_ok()
+            })
+            .await;
+            if !back {
+                return Err("tmux did not come back".into());
+            }
+            tmux_cmd(&socket, &["set-option", "-g", "default-shell", "/bin/sh"]).await;
+
+            inner.reconcile().await;
+            let mut new_pane = String::new();
+            let mut replayed = false;
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !replayed && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let Ok(wins) = inner.tmux.list_windows().await else {
+                    continue;
+                };
+                let Some(w) = wins.iter().find(|w| w.surface.as_deref() == Some(surf.as_str()))
+                else {
+                    continue;
+                };
+                new_pane = w.pane.clone();
+                replayed = inner
+                    .tmux
+                    .capture(&w.pane, false, Some(-2000))
+                    .await
+                    .is_ok_and(|c| {
+                        c.contains("SB_MARKER_42") && c.contains(scrollback::RESTORE_BANNER)
+                    });
+            }
+            if !replayed {
+                let screen = inner.tmux.capture(&new_pane, false, Some(-2000)).await;
+                return Err(format!("respawned pane did not replay scrollback: {screen:?}"));
+            }
+            let pane_cwd = inner
+                .tmux
+                .display(&new_pane, "#{pane_current_path}")
+                .await
+                .map_err(|e| format!("display: {e}"))?;
+            if pane_cwd.trim() != cwd {
+                return Err(format!("respawned in {pane_cwd:?}, expected {cwd:?}"));
+            }
+            // The one-shot copy is consumed; the saved file stays until close.
+            let consumed = wait_for(5, || async {
+                !scrollback::restore_path(state_dir.path(), &surf).exists()
+            })
+            .await;
+            if !consumed {
+                return Err("restore copy was not removed".into());
+            }
+            inner.forget_scrollback(&surf).await;
+            if file.exists() {
+                return Err("closing the surface must delete its scrollback".into());
+            }
+            Ok(())
+        }
+        .await;
+
+        tmux_cmd(&socket, &["kill-server"]).await;
+        if let Err(e) = result {
+            panic!("{e}");
         }
     }
 

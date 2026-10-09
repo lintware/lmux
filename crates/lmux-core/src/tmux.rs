@@ -295,6 +295,13 @@ impl Tmux {
         self.command(line).await
     }
 
+    /// The last `lines` of history plus the visible screen, with colour escapes
+    /// and wrapped lines joined (`capture-pane -p -e -J -S -<lines>`).
+    pub async fn capture_history(&self, pane: &str, lines: u32) -> anyhow::Result<String> {
+        self.command(format!("capture-pane -p -e -J -t {pane} -S -{lines}"))
+            .await
+    }
+
     /// Human-facing plain screen capture.
     pub async fn read_screen(
         &self,
