@@ -57,6 +57,7 @@ pub const PROGRESS_CLEAR: &str = "progress.clear"; // {workspace?}
 pub const LOG: &str = "log.append"; // {message, level?, source?, workspace?}
 pub const LOG_LIST: &str = "log.list"; // {workspace?, limit?} -> {entries: [..]}
 pub const AGENT_STATE: &str = "agent.state"; // {state: AgentState, summary?, workspace?} (called by Claude Code hooks)
+pub const AGENT_SESSION: &str = "agent.session"; // {surface, agent, id, cwd?, source?} (SessionStart hook; resumed after a tmux restart)
 
 // --- browser (implemented by lmux-browser, routed by the daemon) ---
 pub const BROWSER_OPEN: &str = "browser.open"; // {url?, side?: SplitSide, surface?} -> {surface}

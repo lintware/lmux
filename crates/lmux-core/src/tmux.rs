@@ -57,6 +57,13 @@ pub struct WinInfo {
     pub title: Option<String>,
     pub cols: u16,
     pub rows: u16,
+    /// `pane_current_path`: where the pane's foreground process is.
+    pub cwd: Option<String>,
+    /// `pane_current_command`: the foreground process name (`zsh`, `claude`…).
+    pub command: Option<String>,
+    /// `@lmux_agent_session`, `<agent>:<id>`; mirrors the daemon's resume map so
+    /// a lost `state.json` does not lose it.
+    pub agent_session: Option<String>,
 }
 
 struct TmuxCmd {
@@ -374,7 +381,7 @@ impl Tmux {
     }
 
     pub async fn list_windows(&self) -> anyhow::Result<Vec<WinInfo>> {
-        let fmt = "#{window_id}\t#{pane_id}\t#{@lmux_surface}\t#{@lmux_workspace}\t#{@lmux_title}\t#{window_width}\t#{window_height}";
+        let fmt = "#{window_id}\t#{pane_id}\t#{@lmux_surface}\t#{@lmux_workspace}\t#{@lmux_title}\t#{window_width}\t#{window_height}\t#{pane_current_path}\t#{pane_current_command}\t#{@lmux_agent_session}";
         let out = self
             .command(format!(
                 "list-windows -t {} -F {}",
@@ -407,6 +414,9 @@ impl Tmux {
                 title: opt(f[4]),
                 cols: f[5].parse().unwrap_or(80),
                 rows: f[6].parse().unwrap_or(24),
+                cwd: f.get(7).and_then(|v| opt(v)),
+                command: f.get(8).and_then(|v| opt(v)),
+                agent_session: f.get(9).and_then(|v| opt(v)),
             });
         }
         Ok(wins)
@@ -525,6 +535,17 @@ async fn supervisor(shared: Arc<Shared>, first_tx: oneshot::Sender<anyhow::Resul
     let mut first = Some(first_tx);
     let mut backoff = Duration::from_millis(200);
     loop {
+        // The server may have died (killed, or the machine rebooted under a
+        // surviving daemon): recreate the session so `attach` has a target.
+        if first.is_none() {
+            let cfg = TmuxConfig {
+                socket: shared.socket.clone(),
+                session: shared.session.clone(),
+            };
+            if let Err(e) = ensure_session(&cfg).await {
+                tracing::warn!("tmux: recreating session failed: {e}");
+            }
+        }
         let started = run_control_client(&shared, &mut first).await;
         // The client is gone (or never came up): mark not-ready and retry.
         shared.install(None).await;

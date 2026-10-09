@@ -50,6 +50,34 @@ pub struct TermMeta {
     pub pane: String,
 }
 
+/// An agent session a terminal can resume after its tmux pane is lost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSession {
+    /// Which agent, e.g. `claude`. Decides the resume command.
+    pub agent: String,
+    /// The agent's own session id (a UUID for Claude).
+    pub id: String,
+}
+
+/// What a terminal needs to come back after its tmux pane is lost (tmux
+/// server killed, machine rebooted). Kept beside the tree rather than in
+/// `SurfaceKind`, so the wire format and the app are unaffected.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TermResume {
+    /// Last known working directory (tmux `pane_current_path`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Agent to resume when the terminal is respawned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentSession>,
+}
+
+/// Agent session ids are typed into a shell, so only a conservative alphabet
+/// is accepted (Claude's are UUIDs).
+pub fn valid_agent_session_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionState {
     pub host: String,
@@ -63,6 +91,10 @@ pub struct SessionState {
     pub notifications: Vec<Notification>,
     #[serde(default)]
     pub logs: Vec<LogEntry>,
+    /// Per terminal surface: cwd and agent session, for respawn after tmux is
+    /// lost. Pruned to live surfaces by `prune_resume`.
+    #[serde(default)]
+    pub resume: HashMap<Ref, TermResume>,
     // Runtime indexes over `workspaces` (not persisted; rebuilt on reconcile).
     // Keeping them here means one lock guards the whole session, rather than a
     // lock per index with an ordering hazard.
@@ -202,6 +234,18 @@ impl SessionState {
             .flat_map(|w| w.panes.iter())
             .flat_map(|p| p.surfaces.iter().map(|s| s.id.clone()))
             .collect()
+    }
+
+    // --- resume ----------------------------------------------------------
+
+    /// Drop resume entries for surfaces that no longer exist.
+    pub fn prune_resume(&mut self) {
+        let live: std::collections::HashSet<Ref> = self.all_surface_refs().into_iter().collect();
+        self.resume.retain(|k, _| live.contains(k));
+    }
+
+    pub fn resume_mut(&mut self, surface: &str) -> &mut TermResume {
+        self.resume.entry(surface.to_string()).or_default()
     }
 
     // --- tmux index ------------------------------------------------------
