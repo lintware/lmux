@@ -412,7 +412,11 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
     if c.state.notif_open {
         let w = notifications::WIDTH.min(content.width());
         let nrect = Rect::from_min_max(egui::pos2(content.max.x - w, content.min.y), content.max);
-        notifications::show(ui, nrect, c);
+        // The panel lists every host's notifications, newest first.
+        let mut all: Vec<&mut ui::Ctx> = left.iter_mut().collect();
+        all.push(&mut *c);
+        all.extend(right.iter_mut());
+        notifications::show_hosts(ui, nrect, &mut all);
     }
 
     statusbar::show(ui, status_rect, c);

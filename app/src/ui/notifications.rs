@@ -9,7 +9,16 @@ use crate::util::{ellipsize, wrap_lines};
 
 pub const WIDTH: f32 = 320.0;
 
+/// The panel for a single host.
 pub fn show(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
+    show_hosts(ui, rect, &mut [c]);
+}
+
+/// The panel for every host: one list, newest first, each item naming its host
+/// when there is more than one. Clicking an item selects its workspace on its
+/// own host, which puts that host on screen.
+pub fn show_hosts(ui: &mut Ui, rect: Rect, hosts: &mut [&mut Ctx]) {
+    let multi = hosts.len() > 1;
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 0.0, theme::SIDEBAR_BG);
     p.line_segment(
@@ -42,8 +51,10 @@ pub fn show(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
         if clear_resp.hovered() { theme::TEXT } else { theme::DIM },
     );
     if clear_resp.clicked() {
-        c.state.rpc_empty(m::NOTIFY_CLEAR);
-        c.state.notifications.clear();
+        for c in hosts.iter_mut() {
+            c.state.rpc_empty(m::NOTIFY_CLEAR);
+            c.state.notifications.clear();
+        }
     }
     p.line_segment(
         [
@@ -63,7 +74,17 @@ pub fn show(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
             .id_salt("notifications")
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                if c.state.notifications.is_empty() {
+                // (host index, host name, notification), newest first.
+                let mut items: Vec<(usize, String, lmux_proto::Notification)> = hosts
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, c)| {
+                        let name = c.net.host_name();
+                        c.state.notifications.iter().map(move |n| (i, name.clone(), n.clone()))
+                    })
+                    .collect();
+                items.sort_by(|a, b| b.2.created_at.cmp(&a.2.created_at));
+                if items.is_empty() {
                     ui.add_space(12.0);
                     ui.label(
                         egui::RichText::new("nothing yet")
@@ -72,9 +93,14 @@ pub fn show(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
                     );
                     return;
                 }
-                let items: Vec<_> = c.state.notifications.iter().rev().cloned().collect();
-                for n in items {
-                    let h = item_height(&n);
+                for (host, host_name, n) in items {
+                    let c = &mut hosts[host];
+                    let subtitle = match (multi, n.subtitle.as_deref()) {
+                        (true, Some(sub)) => Some(format!("{host_name} · {sub}")),
+                        (true, None) => Some(host_name.clone()),
+                        (false, sub) => sub.map(str::to_owned),
+                    };
+                    let h = item_height(&n, subtitle.is_some());
                     let w = ui.available_width();
                     let (row, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
                     let inner = row.shrink2(Vec2::new(10.0, 4.0));
@@ -91,7 +117,7 @@ pub fn show(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
                         theme::TEXT,
                     );
                     y += 16.0;
-                    if let Some(sub) = n.subtitle.as_deref() {
+                    if let Some(sub) = subtitle.as_deref() {
                         painter.text(
                             egui::pos2(inner.min.x, y),
                             Align2::LEFT_TOP,
@@ -141,9 +167,9 @@ pub fn show(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
     });
 }
 
-fn item_height(n: &lmux_proto::Notification) -> f32 {
+fn item_height(n: &lmux_proto::Notification, subtitle: bool) -> f32 {
     let mut h = 8.0 + 16.0;
-    if n.subtitle.is_some() {
+    if subtitle {
         h += 14.0;
     }
     if n.body.is_some() {

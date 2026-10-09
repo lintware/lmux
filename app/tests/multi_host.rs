@@ -208,3 +208,27 @@ fn snapshot_sidebar_multi_host() {
     let mut h = harness(fixture(), 2.0);
     h.snapshot("sidebar_multi_host");
 }
+
+fn notification(id: &str, title: &str, at: u64) -> lmux_proto::Notification {
+    lmux_proto::Notification {
+        id: id.into(),
+        title: title.into(),
+        subtitle: None,
+        body: Some("Claude finished and is waiting for you.".into()),
+        workspace: Some("workspace:1".into()),
+        surface: None,
+        created_at: at,
+        read: false,
+    }
+}
+
+/// One panel for every host, newest first, each item naming its host.
+#[test]
+fn snapshot_notifications_from_every_host() {
+    let mut fx = fixture();
+    fx.hosts[0].state.notifications.push(notification("n1", "Build finished", 1_000));
+    fx.hosts[1].state.notifications.push(notification("n2", "Claude needs input", 2_000));
+    fx.hosts[0].state.notif_open = true;
+    let mut h = harness(fx, 2.0);
+    h.snapshot("notifications_multi_host");
+}
