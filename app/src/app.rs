@@ -768,7 +768,7 @@ pub fn shortcuts(ctx: &egui::Context, c: &mut ui::Ctx) {
     }
 }
 
-fn split(
+pub(crate) fn split(
     c: &mut ui::Ctx,
     focused_pane: &Option<String>,
     active_surface: &Option<String>,
@@ -802,7 +802,11 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
 
     match kind {
         Some(SurfaceKind::Terminal { .. }) => {
+            let mode = c.state.term_mode(&sid);
+            let bracketed = mode.contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+            let app_cursor = mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR);
             let mut bytes: Vec<u8> = Vec::new();
+            let mut copy = false;
             ctx.input(|i| {
                 for ev in &i.events {
                     match ev {
@@ -818,24 +822,26 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
                             if modifiers.command {
                                 continue;
                             }
-                            if let Some(b) = keys::terminal_key(*key, *modifiers) {
+                            if let Some(b) = keys::terminal_key_mode(*key, *modifiers, app_cursor) {
                                 bytes.extend_from_slice(&b);
                             }
                         }
-                        egui::Event::Paste(t) => bytes.extend_from_slice(t.as_bytes()),
+                        // Cmd+V: egui-winit reads the clipboard and delivers it here.
+                        egui::Event::Paste(t) => {
+                            bytes.extend_from_slice(&crate::termio::paste_bytes(t, bracketed))
+                        }
+                        // Cmd+C: egui-winit turns it into Copy, never a key.
+                        egui::Event::Copy => copy = true,
                         _ => {}
                     }
                 }
             });
-            if !bytes.is_empty() {
-                // A local pane is attached by this process: its keys go straight
-                // to the PTY. Remote panes keep the daemon's input path.
-                let wrote = c.state.local_terminal(&sid) && c.state.write_local(&sid, &bytes);
-                if !wrote {
-                    let data = String::from_utf8_lossy(&bytes).into_owned();
-                    c.state.pending.push(ClientMsg::TermInput { surface: sid, data });
-                }
+            if copy {
+                copy_selection(ctx, c, &sid);
             }
+            // A local pane is attached by this process: its keys go straight to
+            // the PTY. Remote panes keep the daemon's input path.
+            c.state.send_term_input(&sid, &bytes);
         }
         Some(SurfaceKind::Browser { .. }) => {
             let mut events: Vec<BrowserInputEvent> = Vec::new();
@@ -868,6 +874,18 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
             }
         }
         _ => {}
+    }
+}
+
+/// Put the terminal's mouse selection on the system clipboard. Nothing
+/// selected copies nothing (the clipboard keeps what it had).
+pub fn copy_selection(ctx: &egui::Context, c: &mut ui::Ctx, surface: &str) -> bool {
+    match c.state.terms.get(surface).and_then(|t| t.selection_text()) {
+        Some(text) => {
+            ctx.copy_text(text);
+            true
+        }
+        None => false,
     }
 }
 

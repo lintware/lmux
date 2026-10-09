@@ -18,7 +18,8 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 
 use super::Ctx;
-use crate::term::{cell_colors, is_wide_spacer, viewport_point};
+use crate::term::{cell_colors, is_wide_spacer, viewport_point, SelectionType};
+use crate::termio::{self, MouseAction, MouseButton};
 use crate::theme;
 
 const PAD: f32 = 6.0;
@@ -44,6 +45,8 @@ struct CellInfo {
     spacer: bool,
     /// Combining marks that belong to `ch`.
     zw: Vec<char>,
+    /// Inside the mouse selection.
+    selected: bool,
 }
 
 impl CellInfo {
@@ -56,8 +59,257 @@ impl CellInfo {
             wide: false,
             spacer: false,
             zw: Vec::new(),
+            selected: false,
         }
     }
+}
+
+/// Translucent wash over selected cells; the text stays drawn on top.
+const SELECTION: Color32 = Color32::from_rgba_premultiplied(0x05, 0x42, 0x80, 0x80);
+
+/// Where the grid sits on screen, for mapping the pointer to a cell.
+struct Grid {
+    origin: Pos2,
+    w: f32,
+    h: f32,
+    cols: usize,
+    rows: usize,
+}
+
+impl Grid {
+    /// The cell under `pos`, clamped into the grid, and whether `pos` is on
+    /// the cell's right half (which decides if a selection includes it).
+    fn cell_at(&self, pos: Pos2) -> (usize, usize, bool) {
+        let x = (pos.x - self.origin.x) / self.w;
+        let y = (pos.y - self.origin.y) / self.h;
+        let max_col = self.cols.saturating_sub(1);
+        let col = (x.floor().max(0.0) as usize).min(max_col);
+        let right_half = if x < 0.0 {
+            false
+        } else if x >= self.cols as f32 {
+            true
+        } else {
+            x - col as f32 >= 0.5
+        };
+        let row = (y.floor().max(0.0) as usize).min(self.rows.saturating_sub(1));
+        (row, col, right_half)
+    }
+}
+
+/// Presses this close together (seconds) on the same cell count as a double
+/// or triple click.
+const MULTI_CLICK: f64 = 0.4;
+
+/// Mouse presses, drags and releases over the grid. When the program asked
+/// for mouse reports they go to it as escape sequences (Shift keeps them
+/// local, as in other terminals); otherwise they drive a local selection.
+fn pointer_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Grid, c: &mut Ctx) {
+    let (events, now, mods_now) = ui.input(|i| (i.events.clone(), i.time, i.modifiers));
+    let over = resp.contains_pointer();
+    let mode = c.state.term_mode(surface);
+    let mut out: Vec<u8> = Vec::new();
+    let mut report = |action, button, (row, col): (usize, usize), mods| {
+        if let Some(b) = termio::mouse_report(mode, action, button, col, row, mods) {
+            out.extend_from_slice(&b);
+        }
+    };
+    for ev in events {
+        match ev {
+            egui::Event::PointerButton { pos, button, pressed: true, modifiers }
+                if over && grid_contains(grid, pos) =>
+            {
+                if let Some(pane) = c.state.pane_of_surface(surface) {
+                    c.state.focus_pane(&pane);
+                }
+                let (row, col, right) = grid.cell_at(pos);
+                let Some(tv) = c.state.terms.get_mut(surface) else { continue };
+                // Cmd+click opens the link under the pointer, whatever the
+                // program asked for.
+                if modifiers.command && button == egui::PointerButton::Primary {
+                    if let Some(link) = tv.link_at(row, col) {
+                        termio::open_url(&link.url);
+                        continue;
+                    }
+                }
+                if termio::mouse_reporting(mode) && !modifiers.shift {
+                    let Some(mb) = MouseButton::from_egui(button) else { continue };
+                    report(MouseAction::Press, mb, (row, col), modifiers);
+                    let p = &mut tv.pointer;
+                    p.held = Some(button);
+                    p.reporting = true;
+                    p.last_cell = Some((row, col));
+                    continue;
+                }
+                if button != egui::PointerButton::Primary {
+                    continue;
+                }
+                let p = &mut tv.pointer;
+                p.clicks = if now - p.last_press_time < MULTI_CLICK && p.press_cell == (row, col) {
+                    p.clicks % 3 + 1
+                } else {
+                    1
+                };
+                p.last_press_time = now;
+                p.press_cell = (row, col);
+                p.held = Some(button);
+                p.reporting = false;
+                p.dragged = false;
+                let ty = match p.clicks {
+                    2 => SelectionType::Semantic,
+                    3 => SelectionType::Lines,
+                    _ => SelectionType::Simple,
+                };
+                tv.start_selection(ty, row, col, right);
+            }
+            egui::Event::PointerMoved(pos) => {
+                let Some(tv) = c.state.terms.get_mut(surface) else { continue };
+                let (row, col, right) = grid.cell_at(pos);
+                let p = &mut tv.pointer;
+                match p.held {
+                    Some(button) if p.reporting => {
+                        // Drag reports go out once per cell, not per pixel.
+                        if p.last_cell != Some((row, col)) {
+                            p.last_cell = Some((row, col));
+                            if let Some(mb) = MouseButton::from_egui(button) {
+                                report(MouseAction::Motion, mb, (row, col), mods_now);
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        if (row, col) != p.press_cell {
+                            p.dragged = true;
+                        }
+                        tv.update_selection(row, col, right);
+                    }
+                    None => {
+                        let hover = over && grid_contains(grid, pos);
+                        if hover
+                            && !mods_now.shift
+                            && mode.contains(TermMode::MOUSE_MOTION)
+                            && p.last_cell != Some((row, col))
+                        {
+                            p.last_cell = Some((row, col));
+                            report(MouseAction::Motion, MouseButton::None, (row, col), mods_now);
+                        }
+                    }
+                }
+            }
+            egui::Event::PointerButton { pos, button, pressed: false, modifiers } => {
+                let Some(tv) = c.state.terms.get_mut(surface) else { continue };
+                let p = &mut tv.pointer;
+                if p.held != Some(button) {
+                    continue;
+                }
+                p.held = None;
+                if p.reporting {
+                    let (row, col, _) = grid.cell_at(pos);
+                    if let Some(mb) = MouseButton::from_egui(button) {
+                        report(MouseAction::Release, mb, (row, col), modifiers);
+                    }
+                } else if p.clicks == 1 && !p.dragged {
+                    // A plain click (no drag, not a word or line pick) clears.
+                    tv.clear_selection();
+                }
+            }
+            _ => {}
+        }
+    }
+    c.state.send_term_input(surface, &out);
+}
+
+#[derive(Clone, Copy)]
+enum MenuAction {
+    Copy,
+    Paste,
+    ClearScrollback,
+    Split(&'static str),
+}
+
+/// Right-click menu. A program that takes mouse reports gets the right
+/// button instead, unless Shift is held.
+fn context_menu(ui: &egui::Ui, resp: &egui::Response, surface: &str, c: &mut Ctx) {
+    let mode = c.state.term_mode(surface);
+    let shift = ui.input(|i| i.modifiers.shift);
+    if !resp.context_menu_opened() && termio::mouse_reporting(mode) && !shift {
+        return;
+    }
+    let has_selection = c.state.terms.get(surface).is_some_and(|t| t.selection_text().is_some());
+    let mut action = None;
+    resp.context_menu(|ui| {
+        ui.set_min_width(150.0);
+        let mut item = |ui: &mut egui::Ui, label: &str, enabled: bool, a: MenuAction| {
+            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                action = Some(a);
+                ui.close();
+            }
+        };
+        item(ui, "Copy", has_selection, MenuAction::Copy);
+        item(ui, "Paste", true, MenuAction::Paste);
+        ui.separator();
+        item(ui, "Split Right", true, MenuAction::Split("right"));
+        item(ui, "Split Down", true, MenuAction::Split("down"));
+        ui.separator();
+        item(ui, "Clear Scrollback", true, MenuAction::ClearScrollback);
+    });
+    let Some(action) = action else { return };
+    match action {
+        MenuAction::Copy => {
+            crate::app::copy_selection(ui.ctx(), c, surface);
+        }
+        // The integration reads the clipboard and delivers it as
+        // `Event::Paste` next frame, which `route_input` sends to the focused
+        // pane: the one this click focused.
+        MenuAction::Paste => ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+        MenuAction::ClearScrollback => {
+            if let Some(tv) = c.state.terms.get_mut(surface) {
+                tv.clear_scrollback();
+            }
+        }
+        MenuAction::Split(side) => {
+            let pane = c.state.pane_of_surface(surface);
+            crate::app::split(c, &pane, &Some(surface.to_owned()), side);
+        }
+    }
+}
+
+/// Wheel input over a terminal, in whole lines (positive = back in history).
+fn wheel_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Grid, lines: i32, c: &mut Ctx) {
+    let mode = c.state.term_mode(surface);
+    let shift = ui.input(|i| i.modifiers.shift);
+    let count = lines.unsigned_abs() as usize;
+    if termio::mouse_reporting(mode) && !shift {
+        // The program scrolls itself (tmux with `mouse on` enters copy mode).
+        let Some(pos) = resp.hover_pos() else { return };
+        let (row, col, _) = grid.cell_at(pos);
+        let button = if lines > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
+        let mods = ui.input(|i| i.modifiers);
+        let mut bytes = Vec::new();
+        for _ in 0..count {
+            if let Some(b) = termio::mouse_report(mode, MouseAction::Press, button, col, row, mods) {
+                bytes.extend_from_slice(&b);
+            }
+        }
+        c.state.send_term_input(surface, &bytes);
+        return;
+    }
+    let pty_attached = c.state.local_ptys.contains_key(surface);
+    if pty_attached && mode.contains(TermMode::ALT_SCREEN) {
+        // tmux drives this PTY through the alternate screen, which keeps no
+        // history, so the local grid has nothing to scroll: arrow keys are
+        // what the pane's application (and tmux's own copy-mode) understands.
+        let key = if lines > 0 { egui::Key::ArrowUp } else { egui::Key::ArrowDown };
+        let app_cursor = mode.contains(TermMode::APP_CURSOR);
+        let seq = crate::keys::terminal_key_mode(key, egui::Modifiers::default(), app_cursor).unwrap_or_default();
+        c.state.write_local(surface, &seq.repeat(count));
+    } else if let Some(tv) = c.state.terms.get_mut(surface) {
+        tv.scroll(lines);
+    }
+}
+
+fn grid_contains(grid: &Grid, pos: Pos2) -> bool {
+    let size = Vec2::new(grid.cols as f32 * grid.w, grid.rows as f32 * grid.h);
+    // The padding around the grid counts as its nearest cell.
+    Rect::from_min_size(grid.origin, size).expand(PAD).contains(pos)
 }
 
 #[derive(Default)]
@@ -118,11 +370,31 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
     c.state.ensure_term(surface);
 
     // Click focuses this pane; the wheel scrolls scrollback when hovering.
-    let resp = ui.interact(rect, Id::new(("term", surface)), Sense::click());
+    let resp = ui.interact(rect, Id::new(("term", surface)), Sense::click_and_drag());
     if resp.clicked() {
         if let Some(pane) = c.state.pane_of_surface(surface) {
             c.state.focus_pane(&pane);
         }
+    }
+    let origin = Pos2::new(rect.min.x + PAD, rect.min.y + PAD);
+    let grid = Grid { origin, w: metrics.w, h: metrics.h, cols: cols as usize, rows: rows as usize };
+    if let Some(tv) = c.state.terms.get_mut(surface) {
+        tv.grid_origin = origin;
+        tv.cell_size = Vec2::new(metrics.w, metrics.h);
+    }
+    pointer_input(ui, &resp, surface, &grid, c);
+    context_menu(ui, &resp, surface, c);
+
+    // Cmd held over a link: underline it and show a hand.
+    let hover_link = match resp.hover_pos() {
+        Some(pos) if ui.input(|i| i.modifiers.command) && grid_contains(&grid, pos) => {
+            let (row, col, _) = grid.cell_at(pos);
+            c.state.terms.get(surface).and_then(|tv| tv.link_at(row, col)).map(|l| (row, l))
+        }
+        _ => None,
+    };
+    if hover_link.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     if resp.hovered() {
         // Raw wheel events, converted to points. `smooth_scroll_delta` is
@@ -150,26 +422,7 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
                 .map(|tv| tv.accumulate_scroll(wheel, metrics.h))
                 .unwrap_or(0);
             if lines != 0 {
-                let pty_attached = c.state.local_ptys.contains_key(surface);
-                let alt = c
-                    .state
-                    .terms
-                    .get(surface)
-                    .is_some_and(|tv| tv.mode().contains(TermMode::ALT_SCREEN));
-                if pty_attached && alt {
-                    // tmux drives this PTY through the alternate screen, which
-                    // keeps no history, so the local grid has nothing to scroll:
-                    // arrow keys are what the pane's application (and tmux's own
-                    // copy-mode) understands.
-                    let seq: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
-                    let mut bytes = Vec::with_capacity(3 * lines.unsigned_abs() as usize);
-                    for _ in 0..lines.unsigned_abs() {
-                        bytes.extend_from_slice(seq);
-                    }
-                    c.state.write_local(surface, &bytes);
-                } else if let Some(tv) = c.state.terms.get_mut(surface) {
-                    tv.scroll(lines);
-                }
+                wheel_input(ui, &resp, surface, &grid, lines, c);
             }
         }
     }
@@ -177,7 +430,6 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
     let default_fg = Rgb { r: theme::TERM_FG.r(), g: theme::TERM_FG.g(), b: theme::TERM_FG.b() };
     let default_bg = Rgb { r: theme::TERM_BG.r(), g: theme::TERM_BG.g(), b: theme::TERM_BG.b() };
     let bg_default = color32(default_bg);
-    let origin = Pos2::new(rect.min.x + PAD, rect.min.y + PAD);
 
     let (cols_usize, rows_usize) = (cols as usize, rows as usize);
     let n = cols_usize * rows_usize;
@@ -196,9 +448,12 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
         };
         let content = tv.term().renderable_content();
         let display_offset = content.display_offset;
+        let selection = content.selection;
 
         for cell in content.display_iter {
-            let row = cell.point.line.0;
+            // Grid lines run negative into history; the viewport row adds back
+            // how far the view is scrolled.
+            let row = cell.point.line.0 + display_offset as i32;
             if row < 0 || row as usize >= rows_usize {
                 continue;
             }
@@ -218,6 +473,7 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
             dst.underline = info.flags.intersects(Flags::ALL_UNDERLINES);
             dst.wide = info.flags.contains(Flags::WIDE_CHAR);
             dst.spacer = spacer;
+            dst.selected = selection.is_some_and(|s| s.contains(cell.point));
             dst.zw.clear();
             if !spacer && !hidden {
                 if let Some(zw) = info.zerowidth() {
@@ -245,6 +501,23 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
             );
             painter.rect_filled(cell_rect, 0.0, bg);
         });
+        // Selection: one wash per run of selected cells, under the text.
+        let mut col = 0;
+        while col < cols_usize {
+            if !row[col].selected {
+                col += 1;
+                continue;
+            }
+            let start = col;
+            while col < cols_usize && row[col].selected {
+                col += 1;
+            }
+            let sel_rect = Rect::from_min_size(
+                Pos2::new(origin.x + start as f32 * metrics.w, y),
+                Vec2::new((col - start) as f32 * metrics.w, metrics.h),
+            );
+            painter.rect_filled(sel_rect, 0.0, SELECTION);
+        }
     }
 
     let draw_run = |run: &mut String, col: usize, y: f32, fg: Color32, underline: bool, len: usize| {
@@ -323,6 +596,13 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
             }
         }
         draw_run(&mut run, run_col, y, run_fg, run_underline, run_len);
+    }
+
+    if let Some((r, link)) = &hover_link {
+        let y = origin.y + (*r as f32 + 1.0) * metrics.h - 1.0;
+        let x0 = origin.x + link.start as f32 * metrics.w;
+        let x1 = origin.x + link.end.min(cols_usize) as f32 * metrics.w;
+        painter.line_segment([Pos2::new(x0, y), Pos2::new(x1, y)], Stroke::new(1.0, theme::ACCENT_HOVER));
     }
 
     // Cursor.

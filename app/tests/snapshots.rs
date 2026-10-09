@@ -330,6 +330,28 @@ fn snapshot_terminal_grid() {
     h.snapshot("terminal");
 }
 
+/// A mouse selection (translucent wash under the text) and, with Cmd held,
+/// the URL under the pointer underlined.
+#[test]
+fn snapshot_terminal_selection_and_link() {
+    let mut fx = fixture("workspace:3", true);
+    if let Some(t) = fx.state.terms.get_mut("surface:5") {
+        t.start_selection(lmux_app::term::SelectionType::Simple, 1, 0, false);
+        t.update_selection(2, 8, true);
+    }
+    let mut h = harness(fx, Vec2::new(820.0, 460.0));
+    let (origin, cell) = {
+        let t = &h.state().state.terms["surface:5"];
+        (t.grid_origin, t.cell_size)
+    };
+    assert!(origin != Pos2::ZERO, "surface:5 is the terminal on screen");
+    let cmd = Modifiers { command: true, mac_cmd: true, ..Default::default() };
+    h.input_mut().events.push(egui::Event::ModifiersChanged(cmd));
+    h.input_mut().events.push(egui::Event::PointerMoved(origin + Vec2::new(cell.x * 22.5, cell.y * 3.5)));
+    h.run();
+    h.snapshot("terminal_selection_link");
+}
+
 #[test]
 fn snapshot_narrow_window() {
     let mut h = harness(fixture("workspace:4", true), Vec2::new(460.0, 600.0));

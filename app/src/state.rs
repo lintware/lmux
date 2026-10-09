@@ -1529,6 +1529,24 @@ impl AppState {
         true
     }
 
+    /// Send input bytes to a terminal: a local pane's PTY when this process
+    /// owns one, otherwise the daemon.
+    pub fn send_term_input(&mut self, surface: &str, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let wrote = self.local_terminal(surface) && self.write_local(surface, bytes);
+        if !wrote {
+            let data = String::from_utf8_lossy(bytes).into_owned();
+            self.pending.push(ClientMsg::TermInput { surface: surface.to_owned(), data });
+        }
+    }
+
+    /// The terminal modes the program in `surface` has set (empty if unknown).
+    pub fn term_mode(&self, surface: &str) -> alacritty_terminal::term::TermMode {
+        self.terms.get(surface).map(|t| t.mode()).unwrap_or_else(alacritty_terminal::term::TermMode::empty)
+    }
+
     /// Unsubscribe everything (window minimised/occluded): hidden panes must
     /// cost the daemon nothing.
     pub fn stop_all(&mut self) {

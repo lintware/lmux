@@ -5,7 +5,9 @@
 
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::Point;
+use alacritty_terminal::index::{Column, Line, Point, Side};
+pub use alacritty_terminal::selection::SelectionType;
+use alacritty_terminal::selection::Selection;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, RenderableCursor, Term};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
@@ -50,6 +52,31 @@ pub struct TermView {
     pub have_snapshot: bool,
     /// The surface reported exit.
     pub exited: bool,
+    /// Pointer gesture in progress over this terminal (see `ui::terminal`).
+    pub pointer: PointerState,
+    /// Where the grid was last painted, so tests and hit-testing can map a
+    /// cell to a screen position: the top-left of cell (0, 0) and one cell's size.
+    pub grid_origin: egui::Pos2,
+    pub cell_size: egui::Vec2,
+}
+
+/// What the pointer is doing to a terminal between frames.
+#[derive(Clone, Debug, Default)]
+pub struct PointerState {
+    /// The button held since a press inside the grid, if any.
+    pub held: Option<egui::PointerButton>,
+    /// That press went to the program as a mouse report, not to a selection.
+    pub reporting: bool,
+    /// The pointer left the press's cell while held.
+    pub dragged: bool,
+    /// Cell of the last press and of the last reported motion.
+    pub press_cell: (usize, usize),
+    pub last_cell: Option<(usize, usize)>,
+    /// Time and count of consecutive presses, for double and triple click.
+    pub last_press_time: f64,
+    pub clicks: u8,
+    /// The context menu was open last frame.
+    pub menu_open: bool,
 }
 
 impl TermView {
@@ -64,6 +91,9 @@ impl TermView {
             subscribed: false,
             have_snapshot: false,
             exited: false,
+            pointer: PointerState::default(),
+            grid_origin: egui::Pos2::ZERO,
+            cell_size: egui::Vec2::new(1.0, 1.0),
         }
     }
 
@@ -136,6 +166,101 @@ impl TermView {
 
     pub fn term(&self) -> &Term<VoidListener> {
         &self.term
+    }
+
+    /// The grid point under viewport cell `(row, col)`, accounting for how
+    /// far the view is scrolled back.
+    pub fn grid_point(&self, row: usize, col: usize) -> Point {
+        let line = row as i32 - self.display_offset() as i32;
+        let col = col.min(self.size.cols.saturating_sub(1));
+        Point::new(Line(line), Column(col))
+    }
+
+    /// Start a selection at viewport cell `(row, col)`; `right_half` says which
+    /// half of the cell the pointer is on.
+    pub fn start_selection(&mut self, ty: SelectionType, row: usize, col: usize, right_half: bool) {
+        let point = self.grid_point(row, col);
+        self.term.selection = Some(Selection::new(ty, point, side(right_half)));
+    }
+
+    /// Move the selection's moving end to viewport cell `(row, col)`.
+    pub fn update_selection(&mut self, row: usize, col: usize, right_half: bool) {
+        let point = self.grid_point(row, col);
+        if let Some(sel) = self.term.selection.as_mut() {
+            sel.update(point, side(right_half));
+        }
+    }
+
+    /// Drop the local history and return to the live screen. Only this
+    /// client's copy: the program and the daemon are not told.
+    pub fn clear_scrollback(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+        self.term.grid_mut().clear_history();
+        self.term.selection = None;
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    /// The selected text, `None` when nothing (or only an empty range) is selected.
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.selection_to_string().filter(|s| !s.is_empty())
+    }
+
+    /// The characters of viewport row `row`, one per column (a wide
+    /// character's spacer reads as a space).
+    pub fn row_chars(&self, row: usize) -> Vec<char> {
+        let line = Line(row as i32 - self.display_offset() as i32);
+        let grid = self.term.grid();
+        if line < grid.topmost_line() || line > grid.bottommost_line() {
+            return Vec::new();
+        }
+        let r = &grid[line];
+        (0..self.size.cols)
+            .map(|c| {
+                let cell = &r[Column(c)];
+                if is_wide_spacer(cell.flags) {
+                    ' '
+                } else {
+                    cell.c
+                }
+            })
+            .collect()
+    }
+
+    /// The link under viewport cell `(row, col)`: an OSC 8 hyperlink the
+    /// program set, else an http(s) URL in the row's text.
+    pub fn link_at(&self, row: usize, col: usize) -> Option<crate::termio::UrlSpan> {
+        let point = self.grid_point(row, col);
+        let grid = self.term.grid();
+        if point.line < grid.topmost_line() || point.line > grid.bottommost_line() {
+            return None;
+        }
+        let r = &grid[point.line];
+        if let Some(link) = r[point.column].hyperlink() {
+            if crate::termio::openable_link(link.uri()) {
+                let same = |c: usize| r[Column(c)].hyperlink().as_ref() == Some(&link);
+                let mut start = point.column.0;
+                while start > 0 && same(start - 1) {
+                    start -= 1;
+                }
+                let mut end = point.column.0 + 1;
+                while end < self.size.cols && same(end) {
+                    end += 1;
+                }
+                return Some(crate::termio::UrlSpan { start, end, url: link.uri().to_owned() });
+            }
+        }
+        crate::termio::url_at(&self.row_chars(row), col)
+    }
+}
+
+fn side(right_half: bool) -> Side {
+    if right_half {
+        Side::Right
+    } else {
+        Side::Left
     }
 }
 
@@ -340,6 +465,63 @@ mod tests {
         );
         assert_eq!(fg, dbg);
         assert_eq!(bg, dfg);
+    }
+
+    #[test]
+    fn selections_by_char_word_and_line() {
+        let mut t = TermView::new(20, 4);
+        t.feed(b"hello world\r\nnext");
+        t.start_selection(SelectionType::Simple, 0, 0, false);
+        t.update_selection(0, 4, true);
+        assert_eq!(t.selection_text().as_deref(), Some("hello"));
+        t.start_selection(SelectionType::Semantic, 0, 8, false);
+        assert_eq!(t.selection_text().as_deref(), Some("world"));
+        t.start_selection(SelectionType::Lines, 0, 2, false);
+        assert_eq!(t.selection_text().as_deref().map(str::trim_end), Some("hello world"));
+        // A press without a drag selects nothing.
+        t.start_selection(SelectionType::Simple, 0, 3, false);
+        assert_eq!(t.selection_text(), None);
+        t.clear_selection();
+        assert_eq!(t.selection_text(), None);
+    }
+
+    #[test]
+    fn selection_follows_the_scrolled_view() {
+        let mut t = TermView::new(10, 2);
+        for i in 0..6 {
+            t.feed(format!("line{i}\r\n").as_bytes());
+        }
+        t.scroll(2);
+        // Viewport row 0 is now two lines further back than the screen's top.
+        t.start_selection(SelectionType::Lines, 0, 0, false);
+        assert_eq!(t.selection_text().as_deref().map(str::trim_end), Some("line3"));
+        assert_eq!(t.row_chars(0).iter().collect::<String>().trim_end(), "line3");
+    }
+
+    #[test]
+    fn links_from_text_and_osc8() {
+        let mut t = TermView::new(40, 3);
+        t.feed(b"go to https://a.dev/x now\r\n");
+        t.feed(b"\x1b]8;;https://b.dev/\x1b\\click me\x1b]8;;\x1b\\ plain");
+        let l = t.link_at(0, 8).expect("text url");
+        assert_eq!((l.start, l.end, l.url.as_str()), (6, 21, "https://a.dev/x"));
+        assert!(t.link_at(0, 2).is_none());
+        let l = t.link_at(1, 3).expect("osc 8 link");
+        assert_eq!((l.start, l.end, l.url.as_str()), (0, 8, "https://b.dev/"));
+        assert!(t.link_at(1, 10).is_none());
+    }
+
+    #[test]
+    fn clearing_scrollback_keeps_the_screen() {
+        let mut t = TermView::new(10, 2);
+        for i in 0..10 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        t.scroll(3);
+        t.clear_scrollback();
+        assert_eq!(t.term().grid().history_size(), 0);
+        assert_eq!(t.display_offset(), 0);
+        assert_eq!(t.row_chars(0).iter().collect::<String>().trim_end(), "line 9");
     }
 
     #[test]
