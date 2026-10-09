@@ -1186,6 +1186,38 @@ impl AppState {
         );
     }
 
+    /// "New Terminal/Browser Tab to Right": a new chip right after `after`.
+    pub fn new_chip_after(&mut self, pane: &str, after: &str, browser: bool) {
+        self.clear_tab_override(pane);
+        if browser {
+            self.browser_request(
+                m::SURFACE_NEW,
+                serde_json::json!({ "pane": pane, "type": "browser", "url": "about:blank", "after": after }),
+                BrowserReply::FocusAddressBar,
+            );
+        } else {
+            self.rpc(m::SURFACE_NEW, serde_json::json!({ "pane": pane, "type": "terminal", "after": after }));
+        }
+    }
+
+    /// The pane beside `pane` on the left (`dx` < 0) or right, as laid out on
+    /// screen: the nearest one that shares some height with it.
+    pub fn pane_beside(&self, pane: &str, dx: i8) -> Option<Ref> {
+        let ws = self.selected_workspace()?;
+        let me = *self.pane_rects.get(pane)?;
+        ws.panes
+            .iter()
+            .filter(|p| p.id != pane)
+            .filter_map(|p| self.pane_rects.get(&p.id).map(|r| (p.id.clone(), *r)))
+            .filter(|(_, r)| r.max.y > me.min.y + 1.0 && r.min.y < me.max.y - 1.0)
+            .filter(|(_, r)| if dx < 0 { r.max.x <= me.min.x + 1.0 } else { r.min.x >= me.max.x - 1.0 })
+            .min_by(|a, b| {
+                let d = |r: &egui::Rect| if dx < 0 { me.min.x - r.max.x } else { r.min.x - me.max.x };
+                d(&a.1).total_cmp(&d(&b.1))
+            })
+            .map(|(id, _)| id)
+    }
+
     /// A browser chip at `url` in a pane (middle- or Cmd-click on a link).
     pub fn open_browser_tab(&mut self, pane: &str, url: &str) {
         self.clear_tab_override(pane);

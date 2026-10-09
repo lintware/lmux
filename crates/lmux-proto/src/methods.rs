@@ -32,7 +32,7 @@ pub const PANE_LIST: &str = "pane.list"; // {workspace?} -> {panes: [..]}
 pub const PANE_SURFACES: &str = "pane.surfaces"; // {pane?, workspace?} -> {workspace, pane, surfaces: [{id, title, type, selected, url?}]}
 pub const PANE_FOCUS: &str = "pane.focus"; // {pane}
 pub const PANE_RESIZE: &str = "pane.resize"; // {pane, ratio}
-pub const SURFACE_NEW: &str = "surface.new"; // {pane?, workspace?, type?, url?, command?, cwd?, focus?: bool} -> {surface} (new tab in pane)
+pub const SURFACE_NEW: &str = "surface.new"; // {pane?, workspace?, type?, url?, command?, cwd?, after?, focus?: bool} -> {surface} (new tab in pane, at the end or right after the `after` tab)
 pub const SURFACE_CLOSE: &str = "surface.close"; // {surface?, if_idle?} -> Busy error naming the program when if_idle and one runs
 pub const SURFACE_RENAME: &str = "surface.rename"; // {surface?, title}
 // Drag-and-drop rearranging in the client. Together these cover dragging a tab

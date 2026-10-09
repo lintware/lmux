@@ -1789,6 +1789,21 @@ async fn split_impl(
     ok(id, json!({"pane": pane_ref, "surface": surface_ref}))
 }
 
+/// A new tab goes at the end of its pane, or right after the `after` tab when
+/// that tab is in the same pane ("New Terminal Tab to Right").
+fn place_after(state: &mut crate::tree::SessionState, surface: &str, pane: &str, params: &Value) {
+    let Some(after) = s(params, "after") else { return };
+    let Some((wi, pi)) = state.locate_pane(pane) else { return };
+    let pos = state.workspaces[wi].panes[pi]
+        .surfaces
+        .iter()
+        .filter(|x| x.id != surface)
+        .position(|x| x.id == after);
+    if let Some(pos) = pos {
+        let _ = state.move_surface(surface, pane, Some(pos + 1));
+    }
+}
+
 async fn add_surface_impl(
     inner: &Arc<Inner>,
     id: u64,
@@ -1806,6 +1821,7 @@ async fn add_surface_impl(
             let surface_ref = state.next_surface();
             let surface = browser_surface(surface_ref.clone(), url.as_deref());
             state.add_surface(pane, surface);
+            place_after(&mut state, &surface_ref, pane, params);
             surface_ref
         };
         let backend = inner.browser.as_ref().unwrap();
@@ -1839,6 +1855,7 @@ async fn add_surface_impl(
         let title = s(params, "name").unwrap_or_else(|| "shell".to_string());
         let surface = terminal_surface(surface_ref.clone(), title.clone(), cols, rows);
         state.add_surface(pane, surface);
+        place_after(&mut state, &surface_ref, pane, params);
         let cwd = default_cwd(params, &state, Some(&ws));
         (
             surface_ref,
@@ -1992,6 +2009,18 @@ mod tests {
         assert!(resolve_surface(&s, &json!({"surface": "surface:9"})).is_none());
         assert!(resolve_pane(&s, &json!({"pane": "pane:9"})).is_none());
         assert!(resolve_workspace(&s, &json!({"workspace": "workspace:9"})).is_none());
+    }
+
+    #[test]
+    fn new_tab_after_a_tab() {
+        let (mut s, _, pane, term, web) = two_workspaces();
+        let new = s.next_surface();
+        s.add_surface(&pane, terminal_surface(new.clone(), "n", 80, 24));
+        place_after(&mut s, &new, &pane, &json!({"after": term}));
+        let (wi, pi) = s.locate_pane(&pane).unwrap();
+        let order: Vec<&str> = s.workspaces[wi].panes[pi].surfaces.iter().map(|x| x.id.as_str()).collect();
+        assert_eq!(order, [term.as_str(), new.as_str(), web.as_str()]);
+        assert_eq!(s.workspaces[wi].panes[pi].active_surface.as_deref(), Some(new.as_str()));
     }
 
     #[test]

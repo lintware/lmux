@@ -887,31 +887,70 @@ fn double_clicking_a_chip_starts_a_rename() {
     );
 }
 
+/// Right click a chip and pick a menu item by the start of its label.
+fn chip_menu(h: &mut Harness<'_, Fixture>, surface: &str, item: &str) {
+    use egui_kittest::kittest::Queryable;
+    let r = chip_rect(h, surface);
+    click_at(h, egui::pos2(r.min.x + 20.0, r.center().y), egui::PointerButton::Secondary);
+    h.get_by_label(item).click();
+    h.run();
+}
+
 #[test]
-fn right_clicking_a_chip_offers_close_and_rename() {
+fn right_clicking_a_chip_offers_the_tab_menu() {
     use egui_kittest::kittest::Queryable;
 
     let mut h = harness(fixture_three_chips());
     let r = chip_rect(&h, "surface:1");
     click_at(&mut h, egui::pos2(r.min.x + 20.0, r.center().y), egui::PointerButton::Secondary);
-
-    assert!(h.query_by_label("Close").is_some(), "the chip context menu must offer Close");
-    assert!(h.query_by_label("Rename").is_some(), "…and Rename");
+    for label in ["Rename Tab… ⌘R", "Close Tab ⌘W", "Close Other Tabs", "Move Tab ⏵", "New Terminal Tab to Right ⌘T", "Copy IDs"] {
+        assert!(h.query_by_label(label).is_some(), "the chip context menu must offer {label}");
+    }
 }
 
 #[test]
 fn the_context_menu_close_action_closes_the_chip() {
-    use egui_kittest::kittest::Queryable;
-
     let mut h = harness(fixture_three_chips());
-    let r = chip_rect(&h, "surface:1");
-    click_at(&mut h, egui::pos2(r.min.x + 20.0, r.center().y), egui::PointerButton::Secondary);
-    h.get_by_label("Close").click();
-    h.run();
-
+    chip_menu(&mut h, "surface:1", "Close Tab ⌘W");
     let rpcs = rpc_methods(h.state());
     let call = rpcs.iter().find(|(m, _)| m == "surface.close").expect("surface.close sent");
     assert_eq!(call.1["surface"], "surface:1");
+}
+
+#[test]
+fn close_other_tabs_closes_the_rest() {
+    let mut h = harness(fixture_three_chips());
+    chip_menu(&mut h, "surface:2", "Close Other Tabs");
+    let closed: Vec<String> = rpc_methods(h.state())
+        .into_iter()
+        .filter(|(m, _)| m == "surface.close")
+        .map(|(_, p)| p["surface"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(closed, ["surface:1", "surface:3"]);
+}
+
+#[test]
+fn new_terminal_tab_to_right_opens_after_the_tab() {
+    let mut h = harness(fixture_three_chips());
+    chip_menu(&mut h, "surface:1", "New Terminal Tab to Right ⌘T");
+    let rpcs = rpc_methods(h.state());
+    let call = rpcs.iter().find(|(m, _)| m == "surface.new").expect("surface.new sent");
+    assert_eq!(call.1["after"], "surface:1");
+    assert_eq!(call.1["type"], "terminal");
+}
+
+#[test]
+fn copy_ids_puts_the_refs_on_the_clipboard() {
+    let mut h = harness(fixture_three_chips());
+    chip_menu(&mut h, "surface:2", "Copy IDs");
+    let pane = h.state().state.pane_of_surface("surface:2").unwrap();
+    let ws = h.state().state.selected.clone().unwrap();
+    // Taken by the app on the next frame, or still waiting there.
+    let text = h.state().state.clipboard_out.clone();
+    assert!(
+        text.is_none() || text.as_deref() == Some(format!("{ws} {pane} surface:2").as_str()),
+        "{text:?}"
+    );
 }
 
 #[test]

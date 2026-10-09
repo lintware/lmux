@@ -264,23 +264,137 @@ fn chip_ui(
         }
     }
 
-    let mut menu_close = false;
-    let mut menu_rename = false;
+    if let Some(action) = tab_menu(&resp, surface, pane, c) {
+        run_tab_action(action, surface, pane, c);
+    }
+}
+
+/// What the tab's right-click menu asked for.
+enum TabAction {
+    Rename,
+    Close,
+    CloseLeft,
+    CloseRight,
+    CloseOthers,
+    MoveToWorkspace(String),
+    MoveToNewWorkspace,
+    MoveToPane(String),
+    NewTab { browser: bool },
+    FullWidth,
+    CopyIds,
+}
+
+fn tab_menu(resp: &egui::Response, surface: &Surface, pane: &Pane, c: &mut Ctx) -> Option<TabAction> {
+    let idx = pane.surfaces.iter().position(|s| s.id == surface.id).unwrap_or(0);
+    let count = pane.surfaces.len();
+    let left = c.state.pane_beside(&pane.id, -1);
+    let right = c.state.pane_beside(&pane.id, 1);
+    let current = c.state.selected.clone();
+    let others: Vec<(String, String)> = c
+        .state
+        .sidebar_order()
+        .into_iter()
+        .filter(|w| Some(w) != current.as_ref())
+        .filter_map(|w| c.state.workspace(&w).map(|ws| (w, ws.title.clone())))
+        .collect();
+    let split = c.state.selected_workspace().is_some_and(|w| w.panes.len() > 1);
+    let full = c.state.zoomed_pane.as_deref() == Some(pane.id.as_str());
+
+    let mut action = None;
     resp.context_menu(|ui| {
-        ui.set_min_width(130.0);
-        if ui.button("Close").clicked() {
-            menu_close = true;
-            ui.close();
+        ui.set_min_width(220.0);
+        item(ui, &mut action, "Rename Tab…", "⌘R", true, TabAction::Rename);
+        ui.separator();
+        item(ui, &mut action, "Close Tab", "⌘W", true, TabAction::Close);
+        item(ui, &mut action, "Close Tabs to Left", "", idx > 0, TabAction::CloseLeft);
+        item(ui, &mut action, "Close Tabs to Right", "", idx + 1 < count, TabAction::CloseRight);
+        item(ui, &mut action, "Close Other Tabs", "", count > 1, TabAction::CloseOthers);
+        ui.menu_button("Move Tab", |ui| {
+            ui.set_min_width(180.0);
+            for (id, title) in &others {
+                if ui.button(title).clicked() {
+                    action = Some(TabAction::MoveToWorkspace(id.clone()));
+                    ui.close();
+                }
+            }
+            if !others.is_empty() {
+                ui.separator();
+            }
+            if ui.button("New Workspace").clicked() {
+                action = Some(TabAction::MoveToNewWorkspace);
+                ui.close();
+            }
+        });
+        for (label, target) in [("Move to Left Pane", &left), ("Move to Right Pane", &right)] {
+            if ui.add_enabled(target.is_some(), egui::Button::new(label)).clicked() {
+                action = target.clone().map(TabAction::MoveToPane);
+                ui.close();
+            }
         }
-        if ui.button("Rename").clicked() {
-            menu_rename = true;
-            ui.close();
-        }
+        ui.separator();
+        item(ui, &mut action, "New Terminal Tab to Right", "⌘T", true, TabAction::NewTab { browser: false });
+        item(ui, &mut action, "New Browser Tab to Right", "", true, TabAction::NewTab { browser: true });
+        ui.separator();
+        let full_label = if full { "Exit Full Width" } else { "Full Width Tab" };
+        item(ui, &mut action, full_label, "⇧⌘↩", split || full, TabAction::FullWidth);
+        ui.separator();
+        item(ui, &mut action, "Copy IDs", "", true, TabAction::CopyIds);
     });
-    if menu_close {
-        c.state.close_surface(&pane.id, &surface.id);
-    } else if menu_rename {
-        c.state.begin_rename(&surface.id, &surface.title);
+    action
+}
+
+/// One menu row with its shortcut shown on the right.
+fn item(ui: &mut Ui, action: &mut Option<TabAction>, label: &str, key: &str, enabled: bool, a: TabAction) {
+    let mut b = egui::Button::new(label);
+    if !key.is_empty() {
+        b = b.shortcut_text(key);
+    }
+    if ui.add_enabled(enabled, b).clicked() {
+        *action = Some(a);
+        ui.close();
+    }
+}
+
+fn run_tab_action(action: TabAction, surface: &Surface, pane: &Pane, c: &mut Ctx) {
+    let ids: Vec<&str> = pane.surfaces.iter().map(|s| s.id.as_str()).collect();
+    let idx = ids.iter().position(|s| *s == surface.id).unwrap_or(0);
+    let close = |c: &mut Ctx, which: &[&str]| {
+        for s in which {
+            c.state.close_surface(&pane.id, s);
+        }
+    };
+    match action {
+        TabAction::Rename => c.state.begin_rename(&surface.id, &surface.title),
+        TabAction::Close => c.state.close_surface(&pane.id, &surface.id),
+        TabAction::CloseLeft => close(c, &ids[..idx]),
+        TabAction::CloseRight => close(c, &ids[idx + 1..]),
+        TabAction::CloseOthers => {
+            c.state.select_tab(&pane.id, &surface.id);
+            let rest: Vec<&str> = ids.iter().copied().filter(|s| *s != surface.id).collect();
+            close(c, &rest);
+        }
+        TabAction::MoveToWorkspace(ws) => {
+            c.state.rpc(m::SURFACE_MOVE, serde_json::json!({ "surface": surface.id, "workspace": ws }));
+        }
+        TabAction::MoveToNewWorkspace => {
+            c.state.rpc(m::SURFACE_MOVE_TO_NEW_WORKSPACE, serde_json::json!({ "surface": surface.id }));
+        }
+        TabAction::MoveToPane(to) => {
+            c.state.rpc(m::SURFACE_MOVE, serde_json::json!({ "surface": surface.id, "pane": to }));
+            c.state.focus_pane(&to);
+        }
+        TabAction::NewTab { browser } => c.state.new_chip_after(&pane.id, &surface.id, browser),
+        TabAction::FullWidth => {
+            c.state.focus_pane(&pane.id);
+            c.state.select_tab(&pane.id, &surface.id);
+            c.state.toggle_zoom();
+        }
+        TabAction::CopyIds => {
+            // The refs an agent passes to `lmux … --workspace/--pane/--surface`.
+            // A tab on screen is in the selected workspace.
+            let ws = c.state.selected.clone().map(|w| format!("{w} ")).unwrap_or_default();
+            c.state.clipboard_out = Some(format!("{ws}{} {}", pane.id, surface.id));
+        }
     }
 }
 
