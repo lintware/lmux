@@ -159,16 +159,31 @@ pub fn ensure_local_daemon() -> Result<(), String> {
     if !tmux_available() {
         return Err("local daemon needs tmux on PATH (install it, or set LMUX_SERVER_BIN)".to_owned());
     }
-    Command::new(&bin)
-        .arg("server")
-        .arg("--ws-addr")
-        .arg(LOCAL_WS_ADDR)
-        // No Chromium on a bare macOS box; browser panes are not the point here.
-        .arg("--no-browser")
-        .env("PATH", daemon_path())
+    let mut cmd = Command::new(&bin);
+    cmd.arg("server").arg("--ws-addr").arg(LOCAL_WS_ADDR);
+    // Browser panes need a Chromium the daemon can drive headless; without
+    // one the local host has terminals only.
+    match local_chromium() {
+        Some(path) => {
+            cmd.arg("--chromium-path").arg(path);
+        }
+        None => {
+            cmd.arg("--no-browser");
+        }
+    }
+    // The daemon outlives the app; its log goes beside its state.
+    let log = dirs::home_dir()
+        .map(|h| h.join(".local/state/lmux"))
+        .and_then(|d| std::fs::create_dir_all(&d).ok().map(|_| d.join("daemon.log")))
+        .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+    let (out, err) = match log.and_then(|f| f.try_clone().ok().map(|g| (f, g))) {
+        Some((f, g)) => (Stdio::from(f), Stdio::from(g)),
+        None => (Stdio::null(), Stdio::null()),
+    };
+    cmd.env("PATH", daemon_path())
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(out)
+        .stderr(err)
         .spawn()
         .map_err(|e| format!("spawn {}: {e}", bin.display()))?;
     for _ in 0..50 {
@@ -178,6 +193,59 @@ pub fn ensure_local_daemon() -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(100));
     }
     Err(format!("local daemon did not answer on {LOCAL_WS_ADDR}"))
+}
+
+/// A Chromium-family browser on this Mac the daemon can run headless for
+/// browser panes: `LMUX_CHROMIUM`, then Chrome, Chromium, the newest
+/// Playwright Chrome for Testing, then Brave.
+pub fn local_chromium() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("LMUX_CHROMIUM") {
+        let p = PathBuf::from(p);
+        return p.is_file().then_some(p);
+    }
+    let fixed = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ];
+    if let Some(p) = fixed.iter().map(PathBuf::from).find(|p| p.is_file()) {
+        return Some(p);
+    }
+    let playwright = dirs::home_dir()
+        .map(|h| h.join("Library/Caches/ms-playwright"))
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|entries| {
+            let mut dirs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("chromium-"))
+                })
+                .collect();
+            // chromium-1243 after chromium-1187: newest first.
+            dirs.sort_by_key(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.trim_start_matches("chromium-").parse::<u32>().ok())
+                    .unwrap_or(0)
+            });
+            dirs.reverse();
+            dirs
+        })
+        .unwrap_or_default();
+    for dir in playwright {
+        for arch in ["chrome-mac-arm64", "chrome-mac", "chrome-mac-x64"] {
+            let exe = dir
+                .join(arch)
+                .join("Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing");
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
+    let brave = PathBuf::from("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser");
+    brave.is_file().then_some(brave)
 }
 
 /// Hosts to offer, with the local daemon first. `LMUX_WS_URL` means a single
