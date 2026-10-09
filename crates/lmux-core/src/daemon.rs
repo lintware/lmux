@@ -33,6 +33,9 @@ pub struct Config {
     pub tmux_socket: String,
     pub ws_addr: String,
     pub host: String,
+    /// Browser panes are drawn and run by the app (WebKit), with no Chromium
+    /// here: the daemon keeps their URL and title so they come back.
+    pub app_browser: bool,
 }
 
 impl Default for Config {
@@ -43,6 +46,7 @@ impl Default for Config {
             tmux_socket: "lmux".to_string(),
             ws_addr: crate::default_ws_addr(),
             host: hostname(),
+            app_browser: false,
         }
     }
 }
@@ -822,6 +826,25 @@ impl Inner {
     /// browser starts empty with the daemon: without this a restored browser
     /// pane is in the tree but has no page, so it never shows a frame.
     async fn reopen_browsers(self: &Arc<Self>) {
+        // Tabs saved under the other kind of browser (Chromium here, or the
+        // app's WebKit) switch to this one, rather than waiting for a page
+        // nothing will draw.
+        if self.browser.is_some() || self.cfg.app_browser {
+            let in_app_now = self.browser.is_none();
+            let mut changed = false;
+            let mut state = self.state.lock().await;
+            for surf in state.all_surface_refs() {
+                if let Some(SurfaceKind::Browser { in_app, .. }) = state.surface_mut(&surf).map(|s| &mut s.kind) {
+                    changed |= *in_app != in_app_now;
+                    *in_app = in_app_now;
+                }
+            }
+            drop(state);
+            if changed {
+                self.tree_changed();
+                self.mark_dirty();
+            }
+        }
         let Some(b) = self.browser.clone() else {
             return;
         };
@@ -1489,6 +1512,7 @@ async fn browser_event_loop(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<B
                             loading: l,
                             can_go_back: b,
                             can_go_forward: f,
+                            ..
                         } = &mut s.kind
                         {
                             *u = url.clone();
@@ -1933,6 +1957,7 @@ mod tests {
             tmux_socket: "s".into(),
             ws_addr: "127.0.0.1:1".into(),
             host: "h".into(),
+            app_browser: false,
         };
         assert_eq!(cfg.socket_path(), PathBuf::from("/tmp/lmux-test/lmux.sock"));
         // An explicit socket wins over the state directory.
@@ -2015,6 +2040,98 @@ mod tests {
         false
     }
 
+    /// With `--app-browser` there is no Chromium: a browser pane is made for
+    /// the app to draw, and the app reports its page back.
+    #[tokio::test]
+    async fn app_browser_panes_are_drawn_by_the_app() {
+        let socket = format!("lmux-test-ab-{}", std::process::id());
+        let state_dir = tempfile::tempdir().unwrap();
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let tmux = match Tmux::spawn(TmuxConfig { socket: socket.clone(), session: "lmux".into() }, ev_tx).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping: could not start tmux ({e})");
+                return;
+            }
+        };
+        let mut state = SessionState::new("t");
+        let ws = state.next_workspace();
+        let pane = state.next_pane();
+        state.add_workspace(Workspace {
+            id: ws,
+            title: "w".into(),
+            folder: None,
+            cwd: "/tmp".into(),
+            git_branch: None,
+            agent: AgentState::None,
+            summary: None,
+            unread_notifications: 0,
+            status_pills: vec![],
+            progress: None,
+            layout: Layout::Pane { pane: pane.clone() },
+            panes: vec![Pane { id: pane.clone(), surfaces: vec![], active_surface: None }],
+            focused_pane: Some(pane.clone()),
+            ports: vec![],
+            pr: None,
+        });
+        let inner = Arc::new(Inner {
+            cfg: Config {
+                state_dir: state_dir.path().to_path_buf(),
+                socket: None,
+                tmux_socket: socket.clone(),
+                ws_addr: "127.0.0.1:1".into(),
+                host: "t".into(),
+                app_browser: true,
+            },
+            state: Mutex::new(state),
+            tmux,
+            browser: None,
+            browser_streaming: Mutex::new(HashSet::new()),
+            browser_sizes: Default::default(),
+            clients: Mutex::new(Clients::default()),
+            dirty: Notify::new(),
+            tree_dirty: Notify::new(),
+            respawn: std::sync::Mutex::new(RespawnState::default()),
+            scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
+            prs: std::sync::Mutex::new(HashMap::new()),
+        });
+        let call = |method: &str, params: serde_json::Value| RpcRequest { id: 1, method: method.into(), params };
+
+        // A tab saved while this host ran Chromium is the app's to draw now.
+        let old = inner.state.lock().await.next_surface();
+        inner.state.lock().await.add_surface(&pane, Surface {
+            id: old.clone(),
+            title: "old".into(),
+            kind: SurfaceKind::Browser { url: "https://a.test".into(), loading: false, can_go_back: false, can_go_forward: false, in_app: false },
+        });
+        inner.reopen_browsers().await;
+        assert!(matches!(
+            inner.state.lock().await.surface(&old).map(|s| s.kind.clone()),
+            Some(SurfaceKind::Browser { in_app: true, .. })
+        ));
+
+        let r = crate::rpc::dispatch(&inner, &call(methods::SURFACE_NEW, json!({"pane": pane, "type": "browser", "url": "https://example.com"}))).await;
+        assert!(r.error.is_none(), "{:?}", r.error);
+        let surf = r.result.unwrap()["surface"].as_str().unwrap().to_owned();
+        async fn kind(inner: &Inner, surf: &str) -> Option<(String, SurfaceKind)> {
+            inner.state.lock().await.surface(surf).map(|s| (s.title.clone(), s.kind.clone()))
+        }
+        assert!(matches!(kind(&inner, &surf).await, Some((_, SurfaceKind::Browser { in_app: true, .. }))));
+
+        let r = crate::rpc::dispatch(&inner, &call(methods::BROWSER_REPORT, json!({"surface": surf, "url": "https://example.com/x", "title": "Example", "can_go_back": true}))).await;
+        assert!(r.error.is_none(), "{:?}", r.error);
+        match kind(&inner, &surf).await {
+            Some((title, SurfaceKind::Browser { url, can_go_back, .. })) => {
+                assert_eq!((title.as_str(), url.as_str(), can_go_back), ("Example", "https://example.com/x", true));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let r = crate::rpc::dispatch(&inner, &call(methods::BROWSER_SNAPSHOT, json!({"surface": surf}))).await;
+        assert_eq!(r.error.map(|e| e.code), Some(RpcErrorCode::Unsupported));
+        tmux_cmd(&socket, &["kill-server"]).await;
+    }
+
     /// A viewer that drops mid-stream (its last frame never acked) must not
     /// leave the browser marked as streaming: the next viewer, which subscribes
     /// without a resize, gets a stream at the size the pane was shown at.
@@ -2056,6 +2173,7 @@ mod tests {
                         loading: false,
                         can_go_back: false,
                         can_go_forward: false,
+                        in_app: false,
                     },
                 }],
                 active_surface: Some(surf.clone()),
@@ -2072,6 +2190,7 @@ mod tests {
                 tmux_socket: socket.clone(),
                 ws_addr: "127.0.0.1:1".into(),
                 host: "t".into(),
+                app_browser: false,
             },
             state: Mutex::new(state),
             tmux,
@@ -2178,6 +2297,7 @@ mod tests {
                 tmux_socket: socket.clone(),
                 ws_addr: "127.0.0.1:1".into(),
                 host: "t".into(),
+                app_browser: false,
             },
             state: Mutex::new(state),
             tmux,

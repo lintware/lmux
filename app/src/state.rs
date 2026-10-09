@@ -120,6 +120,16 @@ impl BrowserView {
     }
 }
 
+/// What the toolbar asks of a browser the app draws itself (`crate::webview`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum NativeCmd {
+    Back,
+    Forward,
+    Reload,
+    Stop,
+    Goto(String),
+}
+
 pub struct AppState {
     pub tree: Tree,
     /// The host the tree came from, so a create can be aimed at another one.
@@ -234,6 +244,11 @@ pub struct AppState {
     pub desired_sizes: HashMap<Ref, (u16, u16)>,
     /// Surfaces visible this frame.
     pub visible: HashSet<Ref>,
+    /// Where each native browser goes this frame, in points; placed by
+    /// `crate::webview` after the frame.
+    pub native_rects: HashMap<Ref, egui::Rect>,
+    /// Toolbar commands for native browsers, run by `crate::webview`.
+    pub native_cmds: Vec<(Ref, NativeCmd)>,
     /// Where each chip was drawn last frame, keyed by surface. Kept so tests can
     /// click the real chip geometry rather than recomputing the layout.
     pub chip_rects: HashMap<Ref, egui::Rect>,
@@ -575,6 +590,8 @@ impl AppState {
             pending: Vec::new(),
             desired_sizes: HashMap::new(),
             visible: HashSet::new(),
+            native_rects: HashMap::new(),
+            native_cmds: Vec::new(),
             chip_rects: HashMap::new(),
             card_rects: HashMap::new(),
             folder_rects: HashMap::new(),
@@ -1883,6 +1900,20 @@ impl AppState {
 
     pub fn ensure_term(&mut self, surface: &str) -> &mut TermView {
         self.terms.entry(surface.to_owned()).or_insert_with(|| TermView::new(80, 24))
+    }
+
+    /// A browser the app draws as a native WebKit view: one its daemon made
+    /// for the app (`lmux server --app-browser`).
+    pub fn in_app_browser(&self, surface: &str) -> bool {
+        matches!(self.surface(surface).map(|s| &s.kind), Some(SurfaceKind::Browser { in_app: true, .. }))
+    }
+
+    /// The page a browser surface is at, as the daemon last heard.
+    pub fn browser_url(&self, surface: &str) -> Option<String> {
+        match &self.surface(surface)?.kind {
+            SurfaceKind::Browser { url, .. } => Some(url.clone()),
+            _ => None,
+        }
     }
 
     pub fn ensure_browser(&mut self, surface: &str, url: &str) -> &mut BrowserView {

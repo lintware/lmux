@@ -114,6 +114,10 @@ pub struct ServerArgs {
     /// Chromium binary (default /usr/bin/chromium).
     #[arg(long)]
     pub chromium_path: Option<PathBuf>,
+    /// Browser panes are native WebKit views in the lmux app instead of a
+    /// Chromium here (implies --no-browser).
+    #[arg(long)]
+    pub app_browser: bool,
 }
 
 /// `--surface` / `--workspace`, as most terminal commands take them.

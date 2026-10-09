@@ -168,6 +168,10 @@ pub enum SurfaceKind {
         loading: bool,
         can_go_back: bool,
         can_go_forward: bool,
+        /// Drawn and run by the lmux app (a native WebKit view), not by a
+        /// Chromium on the host: the daemon only keeps its URL and title.
+        #[serde(default)]
+        in_app: bool,
     },
 }
 

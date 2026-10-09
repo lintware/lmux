@@ -43,6 +43,9 @@ pub struct LmuxApp {
     hosts: Vec<HostSession>,
     /// The host whose workspace is on screen; keys and the top strip act on it.
     active: usize,
+    /// Browser panes drawn as native WebKit views.
+    #[cfg(target_os = "macos")]
+    webviews: crate::webview::Webviews,
 }
 
 impl LmuxApp {
@@ -103,7 +106,13 @@ impl LmuxApp {
             eprintln!("[local] {err}");
             h.state.banner = Some((err, true));
         }
-        Self { hosts, active, dock_badge: 0 }
+        Self {
+            hosts,
+            active,
+            dock_badge: 0,
+            #[cfg(target_os = "macos")]
+            webviews: Default::default(),
+        }
     }
 
     fn ctxs(&mut self) -> Vec<ui::Ctx<'_>> {
@@ -154,7 +163,7 @@ fn configure(ctx: &egui::Context) {
 }
 
 impl eframe::App for LmuxApp {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.pump(&ctx);
 
@@ -209,6 +218,24 @@ impl eframe::App for LmuxApp {
             let active = self.active;
             let mut hosts = self.ctxs();
             render_hosts(ui, &mut hosts, active);
+        }
+
+        // Native browsers go where this frame put them, unless something egui
+        // draws (a menu, dialog or drag) must show above them.
+        #[cfg(target_os = "macos")]
+        for h in &mut self.hosts {
+            let s = &h.state;
+            let over = ctx.any_popup_open()
+                || s.confirm_close.is_some()
+                || s.palette.is_some()
+                || s.add_host_draft.is_some()
+                || s.cloud_draft.is_some()
+                || s.confirm_cloud_delete.is_some()
+                || s.tab_drag.is_some();
+            if minimized {
+                h.state.native_rects.clear();
+            }
+            self.webviews.sync(frame, &ctx, &h.net.host_name(), &mut h.state, over);
         }
 
         self.poll_installs(&ctx);
@@ -584,6 +611,7 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
         h.state.folder_plus_rects.clear();
         h.state.pane_rects.clear();
         h.state.browser_image_rects.clear();
+        h.state.native_rects.clear();
     }
     let active = active.min(hosts.len().saturating_sub(1));
     ui.painter().rect_filled(full, 0.0, theme::MAIN_BG);

@@ -105,4 +105,5 @@ pub const BROWSER_SCREENSHOT: &str = "browser.screenshot"; // {surface?, path?} 
 pub const BROWSER_GET: &str = "browser.get"; // {surface?, what: "url"|"title"|"text"|"html"|"value"|"attr"|"count", target?, name?} -> {value}
 pub const BROWSER_CONSOLE: &str = "browser.console"; // {surface?, clear?: bool} -> {entries}
 pub const BROWSER_ERRORS: &str = "browser.errors"; // {surface?, clear?: bool} -> {entries}
+pub const BROWSER_REPORT: &str = "browser.report"; // {surface, url?, title?, loading?, can_go_back?, can_go_forward?} (the app reports an in-app browser's page)
 pub const BROWSER_TABS: &str = "browser.tabs"; // {surface?, action: "list"|"new"|"switch"|"close", index?, url?}

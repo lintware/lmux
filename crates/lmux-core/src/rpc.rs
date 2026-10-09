@@ -292,8 +292,9 @@ fn recount_unread(state: &mut crate::tree::SessionState) {
     }
 }
 
-/// A fresh browser surface (its page is created by the backend).
-fn browser_surface(id: Ref, url: Option<&str>) -> Surface {
+/// A fresh browser surface. Its page is created by the backend, or by the app
+/// when the browser is drawn there (`in_app`).
+fn browser_surface(id: Ref, url: Option<&str>, in_app: bool) -> Surface {
     Surface {
         id,
         title: url.unwrap_or("browser").to_string(),
@@ -302,7 +303,28 @@ fn browser_surface(id: Ref, url: Option<&str>) -> Surface {
             loading: false,
             can_go_back: false,
             can_go_forward: false,
+            in_app,
         },
+    }
+}
+
+/// Browser panes are drawn and run by the app here, not by a Chromium.
+fn browsers_in_app(inner: &Inner) -> bool {
+    inner.browser.is_none() && inner.cfg.app_browser
+}
+
+/// Make the page for a new browser surface: in Chromium, or nothing to do when
+/// the app draws it. On failure the surface is taken back out.
+async fn create_page(inner: &Inner, surface: &str, url: Option<&str>) -> Result<(), String> {
+    let Some(backend) = &inner.browser else {
+        return if inner.cfg.app_browser { Ok(()) } else { Err("browser backend not available".into()) };
+    };
+    match backend.create_surface(surface, url).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            inner.state.lock().await.remove_surface(surface);
+            Err(format!("browser: {e}"))
+        }
     }
 }
 
@@ -1585,7 +1607,7 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
 
         // --- browser -------------------------------------------------------
         methods::BROWSER_OPEN => {
-            if inner.browser.is_none() {
+            if inner.browser.is_none() && !inner.cfg.app_browser {
                 return err(id, RpcErrorCode::Unsupported, unsupported(&req.method).message);
             }
             let side = parse_side(params);
@@ -1611,8 +1633,43 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             };
             split_impl(inner, id, &ws, &target_pane, side, "browser", params).await
         }
+        methods::BROWSER_REPORT => {
+            let Some(surface) = s(params, "surface") else {
+                return err(id, RpcErrorCode::InvalidParams, "surface required");
+            };
+            {
+                let mut state = inner.state.lock().await;
+                let Some(sf) = state.surface_mut(&surface) else {
+                    return err(id, RpcErrorCode::NotFound, "surface not found");
+                };
+                let SurfaceKind::Browser { url, loading, can_go_back, can_go_forward, .. } = &mut sf.kind else {
+                    return err(id, RpcErrorCode::InvalidParams, "not a browser surface");
+                };
+                if let Some(v) = s(params, "url") {
+                    *url = v;
+                }
+                if let Some(v) = b(params, "loading") {
+                    *loading = v;
+                }
+                if let Some(v) = b(params, "can_go_back") {
+                    *can_go_back = v;
+                }
+                if let Some(v) = b(params, "can_go_forward") {
+                    *can_go_forward = v;
+                }
+                if let Some(v) = v_str(params, "title").filter(|t| !t.trim().is_empty()) {
+                    sf.title = v;
+                }
+            }
+            inner.tree_changed();
+            inner.mark_dirty();
+            ok(id, json!({"surface": surface}))
+        }
         m if m.starts_with("browser.") => {
             let Some(backend) = &inner.browser else {
+                if inner.cfg.app_browser {
+                    return err(id, RpcErrorCode::Unsupported, "browsers here run in the lmux app; agent control of them is not wired up yet");
+                }
                 return err(id, RpcErrorCode::Unsupported, unsupported(m).message);
             };
             let surface = {
@@ -1643,9 +1700,10 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
 /// `browser.open` with no workspace to put it in: a new workspace holding just
 /// the browser.
 async fn browser_workspace(inner: &Arc<Inner>, id: u64, params: &Value) -> RpcResponse {
-    let Some(backend) = inner.browser.clone() else {
+    if inner.browser.is_none() && !inner.cfg.app_browser {
         return err(id, RpcErrorCode::Unsupported, "browser backend not available");
-    };
+    }
+    let in_app = browsers_in_app(inner);
     let url = s(params, "url");
     let (ws_ref, pane_ref, surface_ref) = {
         let mut state = inner.state.lock().await;
@@ -1669,7 +1727,7 @@ async fn browser_workspace(inner: &Arc<Inner>, id: u64, params: &Value) -> RpcRe
             },
             panes: vec![Pane {
                 id: pane_ref.clone(),
-                surfaces: vec![browser_surface(surface_ref.clone(), url.as_deref())],
+                surfaces: vec![browser_surface(surface_ref.clone(), url.as_deref(), in_app)],
                 active_surface: Some(surface_ref.clone()),
             }],
             focused_pane: Some(pane_ref.clone()),
@@ -1681,10 +1739,9 @@ async fn browser_workspace(inner: &Arc<Inner>, id: u64, params: &Value) -> RpcRe
         }
         (ws_ref, pane_ref, surface_ref)
     };
-    if let Err(e) = backend.create_surface(&surface_ref, url.as_deref()).await {
-        // Removing its only surface closes the workspace too.
-        inner.state.lock().await.remove_surface(&surface_ref);
-        return err(id, RpcErrorCode::Internal, format!("browser: {e}"));
+    // Removing its only surface closes the workspace too.
+    if let Err(e) = create_page(inner, &surface_ref, url.as_deref()).await {
+        return err(id, RpcErrorCode::Internal, e);
     }
     inner.tree_changed();
     inner.mark_dirty();
@@ -1715,7 +1772,7 @@ async fn split_impl(
     };
 
     if kind == "browser" {
-        if inner.browser.is_none() {
+        if inner.browser.is_none() && !inner.cfg.app_browser {
             return err(id, RpcErrorCode::Unsupported, "browser backend not available");
         }
         let url = s(params, "url");
@@ -1723,7 +1780,7 @@ async fn split_impl(
             let mut state = inner.state.lock().await;
             let surface_ref = state.next_surface();
             let pane_ref = state.next_pane();
-            let surface = browser_surface(surface_ref.clone(), url.as_deref());
+            let surface = browser_surface(surface_ref.clone(), url.as_deref(), browsers_in_app(inner));
             let pane = Pane {
                 id: pane_ref.clone(),
                 surfaces: vec![surface],
@@ -1736,10 +1793,8 @@ async fn split_impl(
             state.workspace_mut(ws).unwrap().focused_pane = Some(pane_ref.clone());
             (surface_ref, pane_ref)
         };
-        let backend = inner.browser.as_ref().unwrap();
-        if let Err(e) = backend.create_surface(&surface_ref, url.as_deref()).await {
-            inner.state.lock().await.remove_surface(&surface_ref);
-            return err(id, RpcErrorCode::Internal, format!("browser: {e}"));
+        if let Err(e) = create_page(inner, &surface_ref, url.as_deref()).await {
+            return err(id, RpcErrorCode::Internal, e);
         }
         inner.tree_changed();
         inner.mark_dirty();
@@ -1812,22 +1867,20 @@ async fn add_surface_impl(
     params: &Value,
 ) -> RpcResponse {
     if kind == "browser" {
-        if inner.browser.is_none() {
+        if inner.browser.is_none() && !inner.cfg.app_browser {
             return err(id, RpcErrorCode::Unsupported, "browser backend not available");
         }
         let url = s(params, "url");
         let surface_ref = {
             let mut state = inner.state.lock().await;
             let surface_ref = state.next_surface();
-            let surface = browser_surface(surface_ref.clone(), url.as_deref());
+            let surface = browser_surface(surface_ref.clone(), url.as_deref(), browsers_in_app(inner));
             state.add_surface(pane, surface);
             place_after(&mut state, &surface_ref, pane, params);
             surface_ref
         };
-        let backend = inner.browser.as_ref().unwrap();
-        if let Err(e) = backend.create_surface(&surface_ref, url.as_deref()).await {
-            inner.state.lock().await.remove_surface(&surface_ref);
-            return err(id, RpcErrorCode::Internal, format!("browser: {e}"));
+        if let Err(e) = create_page(inner, &surface_ref, url.as_deref()).await {
+            return err(id, RpcErrorCode::Internal, e);
         }
         inner.tree_changed();
         inner.mark_dirty();
@@ -2078,7 +2131,7 @@ mod tests {
                 id: pane.clone(),
                 surfaces: vec![
                     terminal_surface(term.clone(), "t", 80, 24),
-                    browser_surface(web.clone(), Some("https://example.com")),
+                    browser_surface(web.clone(), Some("https://example.com"), false),
                 ],
                 active_surface: Some(term.clone()),
             }],

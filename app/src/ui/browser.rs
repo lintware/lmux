@@ -7,6 +7,7 @@ use lmux_proto::methods as m;
 use lmux_proto::{BrowserInputEvent, MouseAction, MouseButton, Modifiers};
 
 use super::Ctx;
+use crate::state::NativeCmd;
 use crate::theme;
 use crate::util::ellipsize;
 
@@ -94,6 +95,15 @@ pub fn show(ui: &mut Ui, rect: Rect, surface: &str, _focused: bool, c: &mut Ctx)
     let area = Rect::from_min_max(egui::pos2(rect.min.x, toolbar.max.y), rect.max);
     let painter = ui.painter_at(area);
     painter.rect_filled(area, 0.0, Color32::from_rgb(0x24, 0x24, 0x24));
+
+    // A browser the app runs itself: a native WebKit view covers the area,
+    // placed after the frame (`crate::webview`). Nothing is streamed.
+    if c.state.in_app_browser(surface) {
+        let url = c.state.browser_url(surface).unwrap_or_default();
+        c.state.ensure_browser(surface, &url);
+        c.state.native_rects.insert(surface.to_owned(), area);
+        return;
+    }
 
     // Upload any newly decoded frame before drawing, then ack it so the daemon
     // releases the next one.
@@ -254,6 +264,7 @@ pub fn show(ui: &mut Ui, rect: Rect, surface: &str, _focused: bool, c: &mut Ctx)
 }
 
 fn paint_toolbar(ui: &mut Ui, rect: Rect, surface: &str, c: &mut Ctx) {
+    let native = c.state.in_app_browser(surface);
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme::STRIP_BG);
     painter.line_segment(
@@ -270,6 +281,9 @@ fn paint_toolbar(ui: &mut Ui, rect: Rect, surface: &str, c: &mut Ctx) {
         .get(surface)
         .map(|b| (b.url.clone(), b.loading, b.can_back, b.can_fwd))
         .unwrap_or_default();
+    // WebKit does not say whether there is history; back and forward with
+    // none do nothing.
+    let (can_back, can_fwd) = if native { (true, true) } else { (can_back, can_fwd) };
 
     let cy = rect.center().y;
     let mut x = rect.min.x + 8.0;
@@ -293,7 +307,15 @@ fn paint_toolbar(ui: &mut Ui, rect: Rect, surface: &str, c: &mut Ctx) {
             "stop" => icons::close(&painter, icon, color),
             _ => reload_icon(&painter, icon, color),
         }
-        if resp.clicked() && enabled {
+        if resp.clicked() && enabled && native {
+            let cmd = match name {
+                "back" => NativeCmd::Back,
+                "forward" => NativeCmd::Forward,
+                "stop" => NativeCmd::Stop,
+                _ => NativeCmd::Reload,
+            };
+            c.state.native_cmds.push((surface.to_owned(), cmd));
+        } else if resp.clicked() && enabled {
             let method = match name {
                 "back" => m::BROWSER_BACK,
                 "forward" => m::BROWSER_FORWARD,
@@ -389,8 +411,10 @@ fn paint_toolbar(ui: &mut Ui, rect: Rect, surface: &str, c: &mut Ctx) {
             },
         );
         if submitted {
-            if let Some(target) = address_to_url(&text) {
-                c.state.rpc(m::BROWSER_GOTO, serde_json::json!({ "surface": surface, "url": target }));
+            match address_to_url(&text) {
+                Some(target) if native => c.state.native_cmds.push((surface.to_owned(), NativeCmd::Goto(target))),
+                Some(target) => c.state.rpc(m::BROWSER_GOTO, serde_json::json!({ "surface": surface, "url": target })),
+                None => {}
             }
             if let Some(b) = c.state.browsers.get_mut(surface) {
                 b.url_draft = None;

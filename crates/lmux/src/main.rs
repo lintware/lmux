@@ -98,11 +98,12 @@ async fn run() -> anyhow::Result<()> {
                 tmux_socket: args.tmux_socket,
                 ws_addr: args.ws_addr,
                 host: lmux_core::daemon::hostname(),
+                app_browser: args.app_browser,
             };
             // Browser backend is wired in here: this is the only crate that
             // sees both the daemon's trait and the engine.
-            let browser: Option<std::sync::Arc<dyn lmux_core::BrowserBackend>> = if args.no_browser {
-                tracing::info!("browser backend disabled (--no-browser)");
+            let browser: Option<std::sync::Arc<dyn lmux_core::BrowserBackend>> = if args.no_browser || args.app_browser {
+                tracing::info!("no Chromium here (--no-browser or --app-browser)");
                 None
             } else {
                 match browser_adapter::ChromiumBackend::launch(args.chromium_path.clone()).await {

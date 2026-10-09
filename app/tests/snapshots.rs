@@ -27,6 +27,7 @@ fn browser(id: &str, title: &str, url: &str) -> wire::Surface {
             loading: true,
             can_go_back: true,
             can_go_forward: false,
+            in_app: false,
         },
     }
 }

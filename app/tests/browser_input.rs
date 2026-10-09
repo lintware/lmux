@@ -18,6 +18,7 @@ fn browser_fixture() -> (AppState, Net) {
             loading: false,
             can_go_back: false,
             can_go_forward: false,
+            in_app: false,
         },
     };
     let pane = wire::Pane {

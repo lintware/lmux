@@ -15,3 +15,5 @@ pub mod theme;
 pub mod ui;
 pub mod util;
 pub mod wire;
+#[cfg(target_os = "macos")]
+pub mod webview;
