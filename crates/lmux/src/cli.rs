@@ -719,7 +719,8 @@ Without one, commands act on a browser in the caller's workspace.
 `open` with a surface navigates it, as in cmux; `open-split` always splits.
 Outside any workspace, `open` makes a new workspace for the browser.";
 
-/// `--surface` for browser commands.
+// `--surface` for browser commands. A plain comment: clap would show a doc
+// comment as the help line of every subcommand without its own.
 #[derive(Args, Debug, Clone, Default)]
 pub struct BrowserTarget {
     /// Browser surface (default: a browser in the caller's workspace).
@@ -764,14 +765,17 @@ pub enum BrowserCmd {
         #[command(flatten)]
         target: BrowserTarget,
     },
+    /// Go back in history.
     Back {
         #[command(flatten)]
         target: BrowserTarget,
     },
+    /// Go forward in history.
     Forward {
         #[command(flatten)]
         target: BrowserTarget,
     },
+    /// Reload the page.
     Reload {
         #[command(flatten)]
         target: BrowserTarget,
@@ -789,6 +793,7 @@ pub enum BrowserCmd {
         #[command(flatten)]
         target: BrowserTarget,
     },
+    /// Click an element.
     Click {
         /// Element ref (e12) or CSS selector.
         #[arg(value_name = "TARGET")]
@@ -798,6 +803,7 @@ pub enum BrowserCmd {
         #[command(flatten)]
         target: BrowserTarget,
     },
+    /// Double-click an element.
     Dblclick {
         #[arg(value_name = "TARGET")]
         selector_arg: Option<String>,
@@ -806,6 +812,7 @@ pub enum BrowserCmd {
         #[command(flatten)]
         target: BrowserTarget,
     },
+    /// Move the mouse over an element.
     Hover {
         #[arg(value_name = "TARGET")]
         selector_arg: Option<String>,
@@ -857,6 +864,7 @@ pub enum BrowserCmd {
         #[command(flatten)]
         target: BrowserTarget,
     },
+    /// Scroll the page, or an element into view: --dy 300, --selector S.
     Scroll {
         #[arg(value_name = "TARGET")]
         selector_arg: Option<String>,
@@ -896,6 +904,7 @@ pub enum BrowserCmd {
         #[command(flatten)]
         target: BrowserTarget,
     },
+    /// Save a PNG of the page.
     Screenshot {
         #[arg(long, alias = "out")]
         path: Option<String>,
