@@ -520,16 +520,60 @@ fn split_lines(s: &str) -> Vec<&str> {
     trimmed.split('\n').collect()
 }
 
-/// `set-clipboard on`: tmux passes programs' OSC 52 copies on to its
-/// clients, so a copy in a local pane reaches the app and this Mac's
-/// clipboard. With the default (`external`) tmux ignores them.
-async fn set_clipboard_on(cfg: &TmuxConfig) {
-    let _ = Command::new("tmux")
-        .args(["-L", &cfg.socket, "set-option", "-s", "set-clipboard", "on"])
-        .stdout(Stdio::null())
+/// Variables a pane may inherit from whoever started the tmux server. tmux
+/// copies its starting environment into the global one, so a daemon started
+/// from an agent's shell (which exports `NO_COLOR=1`, `TERM=dumb`, a `cat`
+/// pager and the like) would hand all of that to every pane: Claude Code then
+/// draws without colour. Everything else is dropped; the shell's rc files set
+/// the rest.
+const KEEP_ENV: &[&str] = &[
+    "HOME", "USER", "LOGNAME", "SHELL", "PATH", "LANG", "LANGUAGE", "TMPDIR",
+    "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "__CF_USER_TEXT_ENCODING",
+];
+
+fn keep_env(name: &str) -> bool {
+    KEEP_ENV.contains(&name) || name.starts_with("LC_")
+}
+
+/// Server-wide settings, applied to new servers and to ones an older daemon
+/// made.
+async fn server_defaults(cfg: &TmuxConfig) {
+    let tmux = |args: Vec<String>| {
+        let mut a = vec!["-L".to_owned(), cfg.socket.clone()];
+        a.extend(args);
+        async move {
+            let _ = Command::new("tmux")
+                .args(&a)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
+    };
+    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // `set-clipboard on`: tmux passes programs' OSC 52 copies on to its
+    // clients, so a copy in a local pane reaches the app and this Mac's
+    // clipboard. With the default (`external`) tmux ignores them.
+    tmux(v(&["set-option", "-s", "set-clipboard", "on"])).await;
+    // 256 colours in panes, and truecolor passed through to the app's
+    // clients (local panes attach with TERM=xterm-256color).
+    tmux(v(&["set-option", "-g", "default-terminal", "screen-256color"])).await;
+    tmux(v(&["set-option", "-s", "terminal-features[90]", "xterm*:RGB"])).await;
+    if let Ok(out) = Command::new("tmux")
+        .args(["-L", &cfg.socket, "show-environment", "-g"])
         .stderr(Stdio::null())
-        .status()
-        .await;
+        .output()
+        .await
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            // `-NAME` lines are already removed.
+            let name = line.split('=').next().unwrap_or("");
+            if !name.is_empty() && !name.starts_with('-') && !keep_env(name) {
+                tmux(v(&["set-environment", "-g", "-u", name])).await;
+            }
+        }
+    }
+    tmux(v(&["set-environment", "-g", "COLORTERM", "truecolor"])).await;
 }
 
 async fn ensure_session(cfg: &TmuxConfig) -> anyhow::Result<()> {
@@ -541,8 +585,8 @@ async fn ensure_session(cfg: &TmuxConfig) -> anyhow::Result<()> {
         .await
         .context("running tmux has-session")?;
     if has.success() {
-        // Servers made by an older daemon get the clipboard setting too.
-        set_clipboard_on(cfg).await;
+        // Servers made by an older daemon get the same settings.
+        server_defaults(cfg).await;
         return Ok(());
     }
     let new = Command::new("tmux")
@@ -577,9 +621,6 @@ async fn ensure_session(cfg: &TmuxConfig) -> anyhow::Result<()> {
         vec!["set-option", "-g", "destroy-unattached", "off"],
         vec!["set-option", "-g", "exit-empty", "off"],
         vec!["set-option", "-g", "window-size", "latest"],
-        // Let programs' OSC 52 copies through to attached clients (the app's
-        // local panes are tmux clients); the default `external` drops them.
-        vec!["set-option", "-s", "set-clipboard", "on"],
     ] {
         let mut a = vec!["-L", &cfg.socket];
         a.extend(args);
@@ -590,6 +631,7 @@ async fn ensure_session(cfg: &TmuxConfig) -> anyhow::Result<()> {
             .status()
             .await;
     }
+    server_defaults(cfg).await;
     Ok(())
 }
 
