@@ -70,6 +70,7 @@ Browser:
   browser                    Drive a browser pane: lmux browser --help
 
 Other:
+  import-cmux                Bring cmux's workspaces over (--move hands over their Claude sessions)
   rpc                        Call a daemon method: rpc <method> [json-params]
   ping                       Check the daemon answers
   hooks                      Claude Code hooks
@@ -693,6 +694,28 @@ pub enum Cmd {
     },
 
     // ----- other -------------------------------------------------------------
+    /// Rebuild cmux's workspaces in lmux: folders, splits, tabs, directories,
+    /// browser URLs and Claude sessions. With --move, each workspace is closed
+    /// in cmux and its Claude resumed in lmux; a Claude mid-turn is left alone.
+    /// Remote cmux workspaces are built by lmux on their own host.
+    ImportCmux {
+        /// Close each workspace in cmux and resume its Claude sessions here
+        /// (default: build a copy and leave cmux as it is).
+        #[arg(long = "move")]
+        move_: bool,
+        /// Also move workspaces whose Claude is working.
+        #[arg(long)]
+        force: bool,
+        /// Print what would happen without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Only this cmux workspace (its title or id); repeatable.
+        #[arg(long = "workspace")]
+        only: Vec<String>,
+        /// Read this `cmux restore-session --export` file instead of asking cmux.
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// Call a daemon method and print its JSON result: rpc <method> [json-params]
     Rpc {
         /// e.g. system.tree, term.read_screen

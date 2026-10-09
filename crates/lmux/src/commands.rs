@@ -683,6 +683,7 @@ fn build(cmd: Cmd) -> anyhow::Result<Req> {
         | Cmd::Hooks { .. }
         | Cmd::WsProbe { .. }
         | Cmd::Rpc { .. }
+        | Cmd::ImportCmux { .. }
         | Cmd::WaitFor { .. }
         | Cmd::NewWorkspace { .. }
         | Cmd::Paste { .. }

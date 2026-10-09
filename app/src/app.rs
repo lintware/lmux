@@ -748,12 +748,16 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
         if let Some(draft) = other.state.cloud_draft.take() {
             c.state.cloud_draft = Some(draft);
         }
+        if let Some(imp) = other.state.cmux_import.take() {
+            c.state.cmux_import = Some(imp);
+        }
         if let Some(name) = other.state.confirm_cloud_delete.take() {
             c.state.confirm_cloud_delete = Some(name);
         }
     }
     add_host_dialog(&ctx, c);
     cloud_dialog(&ctx, c);
+    crate::cmux_import::dialog(&ctx, c);
     confirm_cloud_delete_dialog(&ctx, c);
     confirm_close_dialog(&ctx, c);
 
@@ -1376,6 +1380,11 @@ pub fn run_command(c: &mut ui::Ctx, name: &str) {
         }
         "Add Remote Host…" => c.state.add_host_draft = Some(String::new()),
         "New Cloud Box…" => c.state.cloud_draft = Some(crate::state::CloudDraft::new("aws")),
+        "Import from cmux…" => {
+            if c.state.cmux_import.is_none() {
+                c.state.cmux_import = Some(crate::cmux_import::CmuxImport::new());
+            }
+        }
         "Zoom In" | "Zoom Out" | "Reset Zoom" => {
             let step = match name {
                 "Zoom In" => 1,

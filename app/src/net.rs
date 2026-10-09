@@ -112,7 +112,7 @@ fn local_host() -> HostConfig {
 /// PATH for the daemon we spawn. tmux may be a source build in `~/.local/bin`
 /// or a Homebrew one, and neither is guaranteed to be in the app's own
 /// environment when it is launched from Finder.
-fn daemon_path() -> String {
+pub fn daemon_path() -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(home) = dirs::home_dir() {
         parts.push(home.join(".local/bin").display().to_string());

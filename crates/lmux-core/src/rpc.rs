@@ -745,6 +745,7 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
                 json!({"workspace": ws_ref, "pane": pane_ref, "surface": surface_ref}),
             )
         }
+        methods::WORKSPACE_IMPORT => import_workspace(inner, id, params).await,
         methods::WORKSPACE_LIST => {
             let state = inner.state.lock().await;
             ok(id, json!({"workspaces": state.workspaces}))
@@ -951,21 +952,21 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
         }
         methods::PANE_RESIZE => {
             let ratio = f(params, "ratio").unwrap_or(0.5);
-            let ws = {
-                let state = inner.state.lock().await;
-                resolve_workspace(&state, params)
-            };
-            let pane = {
-                let state = inner.state.lock().await;
-                resolve_pane(&state, params)
-            };
-            let (Some(ws), Some(pane)) = (ws, pane) else {
-                return err(id, RpcErrorCode::NotFound, "pane not found");
-            };
-            {
+            let resized = {
                 let mut state = inner.state.lock().await;
-                state.resize_pane(&ws, &pane, ratio);
-            }
+                // The pane's own workspace, not the caller's or the selected
+                // one: a pane named from elsewhere would otherwise be missed.
+                resolve_pane(&state, params).and_then(|pane| {
+                    let (wi, _) = state.locate_pane(&pane)?;
+                    let ws = state.workspaces[wi].id.clone();
+                    state
+                        .resize_pane(&ws, &pane, ratio)
+                        .then_some((ws, pane))
+                })
+            };
+            let Some((ws, pane)) = resized else {
+                return err(id, RpcErrorCode::NotFound, "pane not found in a split");
+            };
             inner.tree_changed();
             ok(id, json!({"workspace": ws, "pane": pane, "ratio": ratio}))
         }
@@ -1756,6 +1757,190 @@ async fn browser_workspace(inner: &Arc<Inner>, id: u64, params: &Value) -> RpcRe
     inner.tree_changed();
     inner.mark_dirty();
     ok(id, json!({"workspace": ws_ref, "pane": pane_ref, "surface": surface_ref}))
+}
+
+/// Run another method from inside a handler, as its own request.
+async fn sub_call(inner: &Arc<Inner>, method: &str, params: Value) -> Result<Value, String> {
+    let req = RpcRequest { id: 0, method: method.to_string(), params };
+    let resp = Box::pin(dispatch(inner, &req)).await;
+    match (resp.result, resp.error) {
+        (_, Some(e)) => Err(format!("{method}: {}", e.message)),
+        (r, None) => Ok(r.unwrap_or(Value::Null)),
+    }
+}
+
+/// `workspace.import`: build a whole workspace from a spec (an imported cmux
+/// workspace): its folder, every pane and tab, the split tree with its ratios,
+/// which tab is selected, and the agent session each terminal held.
+async fn import_workspace(inner: &Arc<Inner>, id: u64, params: &Value) -> RpcResponse {
+    use lmux_proto::cmux::ImportWorkspace;
+    let spec: ImportWorkspace = match serde_json::from_value(params["workspace"].clone()) {
+        Ok(w) => w,
+        Err(e) => return err(id, RpcErrorCode::InvalidParams, format!("workspace: {e}")),
+    };
+    let resume = b(params, "resume").unwrap_or(false);
+    match build_import(inner, &spec, resume).await {
+        Ok(v) => ok(id, v),
+        Err(e) => err(id, RpcErrorCode::Internal, e),
+    }
+}
+
+async fn build_import(
+    inner: &Arc<Inner>,
+    spec: &lmux_proto::cmux::ImportWorkspace,
+    resume: bool,
+) -> Result<Value, String> {
+    use lmux_proto::cmux::{ImportLayout, ImportTab};
+
+    fn leaves<'a>(l: &'a ImportLayout, out: &mut Vec<(&'a [ImportTab], usize, bool)>) {
+        match l {
+            ImportLayout::Pane { tabs, selected, focused } => out.push((tabs, *selected, *focused)),
+            ImportLayout::Split { first, second, .. } => {
+                leaves(first, out);
+                leaves(second, out);
+            }
+        }
+    }
+    fn tree(l: &ImportLayout, panes: &mut std::slice::Iter<Ref>) -> Layout {
+        match l {
+            ImportLayout::Pane { .. } => Layout::Pane { pane: panes.next().cloned().unwrap_or_default() },
+            ImportLayout::Split { direction, ratio, first, second } => Layout::Split {
+                direction: *direction,
+                ratio: ratio.clamp(0.05, 0.95),
+                first: Box::new(tree(first, panes)),
+                second: Box::new(tree(second, panes)),
+            },
+        }
+    }
+    fn tab_params(t: &ImportTab) -> Value {
+        let mut p = json!({"type": t.kind, "focus": false});
+        if let Some(u) = &t.url {
+            p["url"] = json!(u);
+        }
+        if let Some(c) = &t.cwd {
+            p["cwd"] = json!(c);
+        }
+        if let Some(c) = &t.command {
+            p["command"] = json!(c);
+        }
+        p
+    }
+
+    let mut list = vec![];
+    leaves(&spec.layout, &mut list);
+    if list.is_empty() || list[0].0.is_empty() {
+        return Err("workspace has no tabs".into());
+    }
+
+    let folder = match &spec.folder {
+        Some(name) => {
+            let mut state = inner.state.lock().await;
+            let found = state.folders.iter().find(|f| &f.name == name && f.parent.is_none()).map(|f| f.id.clone());
+            Some(found.unwrap_or_else(|| state.add_folder(name.clone(), None).id))
+        }
+        None => None,
+    };
+
+    // The workspace starts with a terminal; a workspace whose first tab is a
+    // browser gets that browser added and the starting terminal closed.
+    let first = &list[0].0[0];
+    let mut p = json!({"name": spec.title});
+    if let Some(f) = &folder {
+        p["folder"] = json!(f);
+    }
+    if first.kind == "terminal" {
+        if let Some(c) = &first.cwd {
+            p["cwd"] = json!(c);
+        }
+        if let Some(c) = &first.command {
+            p["command"] = json!(c);
+        }
+    }
+    let made = sub_call(inner, methods::WORKSPACE_NEW, p).await?;
+    let ws = made["workspace"].as_str().unwrap_or_default().to_string();
+    let pane0 = made["pane"].as_str().unwrap_or_default().to_string();
+    let start = made["surface"].as_str().unwrap_or_default().to_string();
+    let placeholder = (first.kind != "terminal").then(|| start.clone());
+
+    let built: Result<_, String> = async {
+        let mut panes: Vec<Ref> = vec![];
+        let mut surfaces: Vec<Vec<Ref>> = vec![];
+        for (i, (tabs, _, _)) in list.iter().enumerate() {
+            let mut refs = vec![];
+            let mut rest = tabs.iter();
+            let pane = if i == 0 {
+                if placeholder.is_none() {
+                    refs.push(start.clone());
+                    rest.next();
+                }
+                pane0.clone()
+            } else {
+                let t = rest.next().unwrap();
+                let mut p = tab_params(t);
+                p["pane"] = json!(panes.last().unwrap());
+                p["side"] = json!("right");
+                let r = sub_call(inner, methods::SPLIT_NEW, p).await?;
+                refs.push(r["surface"].as_str().unwrap_or_default().to_string());
+                r["pane"].as_str().unwrap_or_default().to_string()
+            };
+            for t in rest {
+                let mut p = tab_params(t);
+                p["pane"] = json!(pane);
+                let r = sub_call(inner, methods::SURFACE_NEW, p).await?;
+                refs.push(r["surface"].as_str().unwrap_or_default().to_string());
+            }
+            panes.push(pane);
+            surfaces.push(refs);
+        }
+        Ok((panes, surfaces))
+    }
+    .await;
+    let (panes, surfaces) = match built {
+        Ok(v) => v,
+        Err(e) => {
+            // Leave nothing half-built behind.
+            close_workspace(inner, &ws).await;
+            return Err(e);
+        }
+    };
+    if let Some(ph) = &placeholder {
+        close_surface(inner, ph).await;
+    }
+
+    {
+        let mut state = inner.state.lock().await;
+        let layout = tree(&spec.layout, &mut panes.iter());
+        let focused = list.iter().position(|l| l.2).unwrap_or(0);
+        for (i, (_, selected, _)) in list.iter().enumerate() {
+            if let Some(s) = surfaces[i].get(*selected).or(surfaces[i].first()) {
+                state.set_active_surface(s);
+            }
+        }
+        if let Some(w) = state.workspace_mut(&ws) {
+            w.layout = layout;
+            w.focused_pane = panes.get(focused).cloned();
+        }
+    }
+
+    let mut agents = vec![];
+    for (i, (tabs, _, _)) in list.iter().enumerate() {
+        for (t, surface) in tabs.iter().zip(&surfaces[i]) {
+            let Some(a) = &t.agent else { continue };
+            let mut p = json!({"surface": surface, "agent": a.agent, "id": a.id});
+            if let Some(c) = &t.cwd {
+                p["cwd"] = json!(c);
+            }
+            sub_call(inner, methods::AGENT_SESSION, p).await?;
+            let command = a.resume_command();
+            if resume {
+                sub_call(inner, methods::TERM_SEND, json!({"surface": surface, "text": format!("{command}\n")})).await?;
+            }
+            agents.push(json!({"surface": surface, "agent": a.agent, "id": a.id, "command": command}));
+        }
+    }
+    inner.tree_changed();
+    inner.mark_dirty();
+    Ok(json!({"workspace": ws, "folder": folder, "panes": panes, "surfaces": surfaces.concat(), "agents": agents}))
 }
 
 async fn split_impl(

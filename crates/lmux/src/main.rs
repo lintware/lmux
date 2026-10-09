@@ -12,6 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 mod browser_adapter;
 mod cli;
 mod commands;
+mod import;
 mod wait;
 
 use cli::{ClaudeHook, Cli, Cmd, HooksCmd};
@@ -151,6 +152,10 @@ async fn run() -> anyhow::Result<()> {
         Cmd::WsProbe { surface, addr, timeout, resizes } => {
             ws_probe(&addr, &surface, timeout, resizes).await?;
             return Ok(());
+        }
+        Cmd::ImportCmux { move_, force, dry_run, only, from } => {
+            let opts = import::Opts { from, move_, force, dry_run, only };
+            return import::run(opts, &socket, json).await;
         }
         Cmd::Hooks { cmd } => {
             hooks(cmd, &socket, json).await?;

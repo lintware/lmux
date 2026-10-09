@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 pub mod frame;
 pub mod browser_js;
 pub mod methods;
+pub mod cmux;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 

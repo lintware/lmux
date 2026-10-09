@@ -44,7 +44,10 @@ impl Daemon {
         // Short path: unix socket paths are limited to ~100 bytes on macOS.
         let dir = tempfile::Builder::new().prefix("lmuxcli").tempdir_in("/tmp").unwrap();
         let socket = dir.path().join("s");
-        let tmux_socket = format!("lmux-cli-it-{}", std::process::id());
+        // One tmux server per daemon: tests in this file run in parallel.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmux_socket = format!("lmux-cli-it-{}-{n}", std::process::id());
         let child = Command::new(BIN)
             .arg("--socket")
             .arg(&socket)
@@ -193,4 +196,72 @@ fn cli_parity_commands_against_a_scratch_daemon() {
     // Without a browser backend, browser commands say so.
     let b = d.run(&["browser", "surface:1", "snapshot"]);
     assert!(String::from_utf8_lossy(&b.stderr).contains("Unsupported"));
+}
+
+/// `import-cmux --from <export>` without --move: the workspace is built whole
+/// (folder, split and ratio, tabs, directories, a re-attached command, the
+/// Claude session tag) and nothing is typed into it; a workspace on a host
+/// without lmux is skipped. No cmux is needed for this.
+#[test]
+fn import_cmux_builds_workspaces_from_an_export() {
+    let Some(d) = Daemon::start() else { return };
+    let work = tempfile::tempdir().unwrap();
+    let work = cwd(work.path());
+    let export = serde_json::json!({"windows": [{"tabManager": {
+        "workspaceGroups": [{"anchorWorkspaceId": "W1", "name": "Clients"}],
+        "workspaces": [
+            {"workspaceId": "W1", "customTitle": "imported", "currentDirectory": work,
+             "focusedPanelId": "c",
+             "layout": {"type": "split", "split": {"orientation": "horizontal", "dividerPosition": 0.66,
+                "first": {"type": "pane", "pane": {"panelIds": ["a", "b"], "selectedPanelId": "b"}},
+                "second": {"type": "pane", "pane": {"panelIds": ["c"]}}}},
+             "panels": [
+                {"id": "a", "type": "terminal", "directory": work,
+                 "terminal": {"resumeBinding": {"kind": "claude", "checkpointId": "abc-123",
+                    "permissionMode": "bypassPermissions", "launchCommand": {"arguments": ["claude"]}}}},
+                {"id": "b", "type": "terminal", "directory": work},
+                {"id": "c", "type": "terminal", "terminal": {"resumeBinding": {"kind": "tmux",
+                    "command": "sh -c 'echo REATTACHED; exec sh'",
+                    "launchCommand": {"arguments": ["tmux", "attach", "-t", "x"]}}}}]},
+            {"workspaceId": "W2", "customTitle": "far", "remote": {"destination": "lmux-no-such-host.invalid"},
+             "layout": {"type": "pane", "pane": {"panelIds": ["d"]}},
+             "panels": [{"id": "d", "type": "terminal"}]}
+        ]}}]});
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), export.to_string()).unwrap();
+
+    let out = d.json(&["import-cmux", "--from", &file.path().to_string_lossy()]);
+    let rows = out["workspaces"].as_array().unwrap();
+    assert_eq!(rows[0]["status"], "copied", "{out}");
+    assert_eq!((rows[0]["tabs"].as_u64(), rows[0]["agents"].as_u64()), (Some(3), Some(1)));
+    assert_eq!(rows[1]["status"], "skipped", "{out}");
+
+    let tree = d.json(&["tree"]);
+    let ws = tree["workspaces"].as_array().unwrap().iter().find(|w| w["title"] == "imported").unwrap();
+    let folder = tree["folders"].as_array().unwrap().iter().find(|f| f["name"] == "Clients").unwrap();
+    assert_eq!(ws["folder"], folder["id"]);
+    assert_eq!(ws["cwd"], work.as_str());
+    let layout = &ws["layout"];
+    assert_eq!(layout["direction"], "horizontal");
+    assert!((layout["ratio"].as_f64().unwrap() - 0.66).abs() < 1e-3, "{layout}");
+    let panes = ws["panes"].as_array().unwrap();
+    assert_eq!(panes.len(), 2);
+    let first = &panes[0];
+    assert_eq!(first["surfaces"].as_array().unwrap().len(), 2);
+    // cmux's selected tab and focused pane carry over.
+    assert_eq!(first["active_surface"], first["surfaces"][1]["id"]);
+    assert_eq!(ws["focused_pane"], panes[1]["id"]);
+
+    // The re-attached tab runs its command; the Claude tab got no input.
+    let reattached = panes[1]["surfaces"][0]["id"].as_str().unwrap();
+    d.ok(&["wait-for", "--text", "REATTACHED", "--surface", reattached, "--timeout", "10"]);
+    let claude_tab = first["surfaces"][0]["id"].as_str().unwrap();
+    let screen = d.ok(&["read-screen", "--surface", claude_tab]);
+    assert!(!screen.contains("claude --resume"), "{screen}");
+
+    // A second import puts the next workspace in the same folder.
+    d.json(&["import-cmux", "--from", &file.path().to_string_lossy(), "--workspace", "W1"]);
+    let tree = d.json(&["tree"]);
+    let clients = tree["folders"].as_array().unwrap().iter().filter(|f| f["name"] == "Clients").count();
+    assert_eq!(clients, 1);
 }

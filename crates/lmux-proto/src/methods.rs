@@ -24,6 +24,7 @@ pub const WORKSPACE_SELECT: &str = "workspace.select"; // {workspace}
 pub const WORKSPACE_RENAME: &str = "workspace.rename"; // {workspace?, title}
 pub const WORKSPACE_CLOSE: &str = "workspace.close"; // {workspace, if_idle?} -> Busy error as for surface.close
 pub const WORKSPACE_MOVE: &str = "workspace.move"; // {workspace, folder?: Ref|null, index?, before?, after?} (before/after: next to that workspace, in its folder)
+pub const WORKSPACE_IMPORT: &str = "workspace.import"; // {workspace: cmux::ImportWorkspace, resume?: bool} -> {workspace, agents: [{surface, command}]} (builds a whole workspace: folder by name, splits and ratios, tabs, agent sessions; `resume` types each agent's resume command now)
 pub const WORKSPACE_CURRENT: &str = "workspace.current"; // {} -> {workspace} (the caller's, else the selected one)
 
 // --- panes & surfaces ---
