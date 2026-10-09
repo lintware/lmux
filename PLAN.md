@@ -153,7 +153,7 @@ Each milestone ends with something you can run.
 - **Local host.** The app starts a daemon on this mac; local panes attach through a real PTY (~40 µs keystroke to echo).
 - **Agent resume.** Claude's session ID and each pane's directory are kept in `state.json`; when tmux is lost, panes are respawned and Claude resumed.
 
-**M4 One view for all hosts** — *next*
+**M4 One view for all hosts** — *first cut done on `feat/multi-host`: one connection and one state per host, grouped sidebar with host headers (fold, New Session/Folder, Reconnect), per-host egui ids, a host comes on screen when you act on it, only the host on screen streams. Still to do: notifications panel per host, cross-host drag, a host picker for split/new-tab shortcuts.*
 The app connects to every host at once, keeps a tree per host, and the sidebar shows them as labelled groups (this mac first). Refs are host-scoped, and every RPC, subscription and input goes to the host that owns its target. Create menus ("New Session Here", "New Folder") act on the host of the row they were opened from. A host that is offline shows as such without blocking the rest.
 *Done when:* a local workspace and a `my-server` workspace are both in the sidebar, you switch between them with one click, and typing in each runs on its own machine.
 

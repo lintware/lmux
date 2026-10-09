@@ -12,10 +12,18 @@ use crate::ui::{self, drag, icons, notifications, pane, sidebar, statusbar, tabs
 use crate::util::ellipsize;
 use crate::{fonts, keys, wire};
 
-pub struct LmuxApp {
+/// One host's connection and the state of its tree. The app holds one per
+/// host, all connected at once, and shows them in one sidebar.
+struct HostSession {
     state: AppState,
     net: Net,
     was_connected: bool,
+}
+
+pub struct LmuxApp {
+    hosts: Vec<HostSession>,
+    /// The host whose workspace is on screen; keys and the top strip act on it.
+    active: usize,
 }
 
 impl LmuxApp {
@@ -24,18 +32,59 @@ impl LmuxApp {
         configure(&cc.egui_ctx);
         theme::set_traffic_lights(cfg!(target_os = "macos"));
         eprintln!("[fonts] ui={ui_font} mono={mono_font}");
-        let mut net = Net::new();
-        net.set_wake(cc.egui_ctx.clone());
         crate::decode::decoder().set_wake(cc.egui_ctx.clone());
-        let mut state = AppState::new();
-        // Local PTY readers wake the UI when their pane produces output.
-        state.set_wake(cc.egui_ctx.clone());
-        if let Some(err) = net.take_local_error() {
+
+        let configs = crate::net::app_hosts();
+        let local_error = if std::env::var("LMUX_WS_URL").is_err() {
+            crate::net::ensure_local_daemon().err()
+        } else {
+            None
+        };
+        let multi = configs.len() > 1;
+        let mut hosts: Vec<HostSession> = (0..configs.len())
+            .map(|i| {
+                let mut net = Net::for_host(configs.clone(), i);
+                net.set_wake(cc.egui_ctx.clone());
+                let mut state = AppState::new();
+                // Local PTY readers wake the UI when their pane produces output.
+                state.set_wake(cc.egui_ctx.clone());
+                if multi {
+                    state.host_salt = net.host_name();
+                }
+                net.begin_connect(&cc.egui_ctx);
+                HostSession { state, net, was_connected: false }
+            })
+            .collect();
+        // Start on this machine: lmux is a local tool that can also reach out.
+        let active = hosts.iter().position(|h| h.net.is_local_host()).unwrap_or(0);
+        if let (Some(err), Some(h)) = (local_error, hosts.get_mut(active)) {
             eprintln!("[local] {err}");
-            state.banner = Some((err, true));
+            h.state.banner = Some((err, true));
         }
-        net.begin_connect(&cc.egui_ctx);
-        Self { state, net, was_connected: false }
+        Self { hosts, active }
+    }
+
+    fn ctxs(&mut self) -> Vec<ui::Ctx<'_>> {
+        self.hosts
+            .iter_mut()
+            .map(|h| ui::Ctx { state: &mut h.state, net: &mut h.net })
+            .collect()
+    }
+
+    /// Put `index` on screen. The sidebar's width and visibility are the
+    /// window's, not a host's, so they carry over.
+    fn activate(&mut self, index: usize) {
+        if index == self.active || index >= self.hosts.len() {
+            return;
+        }
+        let (w, hidden) = {
+            let s = &self.hosts[self.active].state;
+            (s.sidebar_w, s.sidebar_hidden)
+        };
+        self.active = index;
+        let s = &mut self.hosts[index].state;
+        s.sidebar_w = w;
+        s.sidebar_hidden = hidden;
     }
 }
 
@@ -71,15 +120,23 @@ impl eframe::App for LmuxApp {
         // --- input --------------------------------------------------------
         if !minimized {
             let window_focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-            let mut c = ui::Ctx { state: &mut self.state, net: &mut self.net };
-            shortcuts(&ctx, &mut c);
-            let text_editing = ctx.memory(|mem| mem.focused().is_some());
-            if window_focused && !text_editing {
-                route_input(&ctx, &mut c);
+            let active = self.active;
+            {
+                let h = &mut self.hosts[active];
+                let mut c = ui::Ctx { state: &mut h.state, net: &mut h.net };
+                shortcuts(&ctx, &mut c);
+                let text_editing = ctx.memory(|mem| mem.focused().is_some());
+                if window_focused && !text_editing {
+                    route_input(&ctx, &mut c);
+                }
             }
 
             // --- OS notifications ----------------------------------------
-            let queue = std::mem::take(&mut self.state.os_queue);
+            let queue: Vec<_> = self
+                .hosts
+                .iter_mut()
+                .flat_map(|h| std::mem::take(&mut h.state.os_queue))
+                .collect();
             if !window_focused {
                 for n in queue {
                     // Post from a worker thread: showing a macOS notification
@@ -100,23 +157,42 @@ impl eframe::App for LmuxApp {
             }
 
             // --- paint ----------------------------------------------------
-            let mut c = ui::Ctx { state: &mut self.state, net: &mut self.net };
-            render(ui, &mut c);
+            let active = self.active;
+            let mut hosts = self.ctxs();
+            render_hosts(ui, &mut hosts, active);
         }
 
-        // A minimised window shows nothing: stop all server-side streaming.
-        if minimized {
-            self.state.stop_all();
+        // A host the user acted on (selected or created in) comes on screen.
+        // The host already on screen wins a tie, so a click there is stable.
+        let acted = self
+            .hosts
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, h)| std::mem::take(&mut h.state.activated).then_some(i))
+            .collect::<Vec<_>>();
+        if !acted.contains(&self.active) {
+            if let Some(&i) = acted.first() {
+                self.activate(i);
+            }
         }
-        self.state
-            .sync_subscriptions(self.net.state == ConnState::Connected && !minimized);
+
+        // Only the host on screen has visible panes, so every other host
+        // unsubscribes and streams nothing. A minimised window stops them all.
+        for h in &mut self.hosts {
+            if minimized {
+                h.state.stop_all();
+            }
+            h.state.sync_subscriptions(h.net.state == ConnState::Connected && !minimized);
+        }
         self.flush();
 
-        for action in std::mem::take(&mut self.state.actions) {
-            match action {
-                Action::SwitchHost(i) => self.net.select_host(i, &ctx),
-                Action::Reconnect => self.net.begin_connect(&ctx),
-                Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        for from in 0..self.hosts.len() {
+            for action in std::mem::take(&mut self.hosts[from].state.actions) {
+                match action {
+                    Action::SwitchHost(to) => self.create_on(from, to),
+                    Action::Reconnect => self.hosts[from].net.begin_connect(&ctx),
+                    Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                }
             }
         }
     }
@@ -128,7 +204,9 @@ impl eframe::App for LmuxApp {
         // While minimised, `ui` may not run at all; keep the link alive here and
         // tell the daemon to stop streaming.
         if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
-            self.state.stop_all();
+            for h in &mut self.hosts {
+                h.state.stop_all();
+            }
             self.flush();
         }
     }
@@ -136,54 +214,93 @@ impl eframe::App for LmuxApp {
 
 impl LmuxApp {
     fn pump(&mut self, ctx: &egui::Context) {
-        // The tree that arrives belongs to whichever host is connected, which is
-        // how a create aimed at another host knows when it can go out.
-        self.state.set_current_host(&self.net.host_name());
-        self.state.set_local_mode(self.net.is_local_host());
-        for msg in self.net.poll(ctx) {
-            match msg {
-                WsMessage::Text(t) => {
-                    if let Some(sm) = wire::decode_server(&t) {
-                        self.state.handle_server_msg(sm);
+        for h in &mut self.hosts {
+            // Each host's tree carries its own name, which is how a create aimed
+            // at a host knows when it can go out.
+            h.state.set_current_host(&h.net.host_name());
+            h.state.set_local_mode(h.net.is_local_host());
+            for msg in h.net.poll(ctx) {
+                match msg {
+                    WsMessage::Text(t) => {
+                        if let Some(sm) = wire::decode_server(&t) {
+                            h.state.handle_server_msg(sm);
+                        }
                     }
+                    WsMessage::Binary(b) => h.state.handle_frame(&b),
+                    _ => {}
                 }
-                WsMessage::Binary(b) => self.state.handle_frame(&b),
-                _ => {}
+            }
+            // Output from the local PTYs, which never goes through the websocket.
+            h.state.pump_local_ptys();
+            h.state.poll_decoded();
+            let connected = h.net.state == ConnState::Connected;
+            if !connected && h.was_connected {
+                h.state.reset_subscriptions();
+            }
+            h.was_connected = connected;
+        }
+        // The create menu on any host lists every host's folders.
+        let folders: Vec<(String, Vec<lmux_proto::Folder>)> = self
+            .hosts
+            .iter()
+            .map(|h| (h.net.host_name(), h.state.tree.folders.clone()))
+            .collect();
+        for h in &mut self.hosts {
+            for (name, list) in &folders {
+                h.state.host_folders.insert(name.clone(), list.clone());
             }
         }
-        // Output from the local PTYs, which never goes through the websocket.
-        self.state.pump_local_ptys();
-        self.state.poll_decoded();
-        let connected = self.net.state == ConnState::Connected;
-        if !connected && self.was_connected {
-            self.state.reset_subscriptions();
-        }
-        self.was_connected = connected;
     }
 
     fn flush(&mut self) {
-        let pending = std::mem::take(&mut self.state.pending);
-        for msg in pending {
-            self.net.send(&msg);
+        for h in &mut self.hosts {
+            for msg in std::mem::take(&mut h.state.pending) {
+                h.net.send(&msg);
+            }
+        }
+    }
+
+    /// A create picked on host `from`'s menu for host `to`: hand it over and
+    /// put `to` on screen. It goes out now if `to` is connected, otherwise when
+    /// its tree arrives.
+    fn create_on(&mut self, from: usize, to: usize) {
+        if to >= self.hosts.len() {
+            return;
+        }
+        let pending = self.hosts[from].state.pending_create.take();
+        self.activate(to);
+        let h = &mut self.hosts[to];
+        h.state.pending_create = pending;
+        if h.net.state == ConnState::Connected {
+            h.state.fire_pending_create();
         }
     }
 }
 
-/// Paint the whole window into `ui`. Public so kittest snapshot tests can drive
-/// the same code path as the running app.
+/// Paint the whole window into `ui` for a single host. Public so kittest
+/// snapshot tests can drive the same code path as the running app.
 pub fn render(ui: &mut Ui, c: &mut ui::Ctx) {
+    render_hosts(ui, std::slice::from_mut(c), 0);
+}
+
+/// Paint the whole window: every host in the sidebar, and the workspace of
+/// `hosts[active]` in the main area. Public for tests.
+pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
     let ctx = ui.ctx().clone();
     let full = ui.max_rect();
     // Chip / browser-frame rects are recorded per frame so tests can drive the
     // real geometry.
-    c.state.chip_rects.clear();
-    c.state.card_rects.clear();
-    c.state.folder_rects.clear();
-    c.state.sidebar_rows.clear();
-    c.state.sidebar_list_rect = None;
-    c.state.folder_plus_rects.clear();
-    c.state.pane_rects.clear();
-    c.state.browser_image_rects.clear();
+    for h in hosts.iter_mut() {
+        h.state.chip_rects.clear();
+        h.state.card_rects.clear();
+        h.state.folder_rects.clear();
+        h.state.sidebar_rows.clear();
+        h.state.sidebar_list_rect = None;
+        h.state.folder_plus_rects.clear();
+        h.state.pane_rects.clear();
+        h.state.browser_image_rects.clear();
+    }
+    let active = active.min(hosts.len().saturating_sub(1));
     ui.painter().rect_filled(full, 0.0, theme::MAIN_BG);
 
     let status_rect = Rect::from_min_max(
@@ -192,17 +309,26 @@ pub fn render(ui: &mut Ui, c: &mut ui::Ctx) {
     );
     let body = Rect::from_min_max(full.min, egui::pos2(full.max.x, status_rect.min.y));
 
-    let sb_w = if c.state.sidebar_hidden {
+    let (sidebar_hidden, sidebar_w) = match hosts.get(active) {
+        Some(h) => (h.state.sidebar_hidden, h.state.sidebar_w),
+        None => return,
+    };
+    let sb_w = if sidebar_hidden {
         0.0
     } else {
         let max = (body.width() * 0.5).max(theme::SIDEBAR_MIN_W);
-        c.state.sidebar_w.clamp(theme::SIDEBAR_MIN_W, theme::SIDEBAR_MAX_W).min(max)
+        sidebar_w.clamp(theme::SIDEBAR_MIN_W, theme::SIDEBAR_MAX_W).min(max)
     };
     let sidebar_rect = Rect::from_min_size(body.min, Vec2::new(sb_w, body.height()));
     let main_rect = Rect::from_min_max(egui::pos2(body.min.x + sb_w, body.min.y), body.max);
 
     if sb_w > 0.0 {
-        sidebar::show(ui, sidebar_rect, c);
+        sidebar::show_hosts(ui, sidebar_rect, hosts, active);
+    }
+    let (left, right) = hosts.split_at_mut(active);
+    let Some((c, right)) = right.split_first_mut() else { return };
+
+    if sb_w > 0.0 {
 
         let handle = Rect::from_min_size(
             egui::pos2(sidebar_rect.max.x - 3.0, body.min.y),
@@ -293,8 +419,14 @@ pub fn render(ui: &mut Ui, c: &mut ui::Ctx) {
 
     // Drag feedback runs last, over everything a drag can land on. The sidebar
     // rows and the panes have both been drawn, so one pass resolves against the
-    // geometry on screen and the ghost is free to cross between them.
+    // geometry on screen and the ghost is free to cross between them. A row
+    // dragged on another host's group belongs to that host's state.
     drag::show(ui, c);
+    for other in left.iter_mut().chain(right.iter_mut()) {
+        if other.state.tab_drag.is_some() {
+            drag::show(ui, other);
+        }
+    }
 }
 
 /// Global keybindings. Public so kittest interaction tests can drive it.

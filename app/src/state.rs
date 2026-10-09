@@ -113,6 +113,14 @@ pub struct AppState {
     /// A create aimed at a host that is not connected yet; it fires when that
     /// host's tree arrives.
     pub pending_create: Option<PendingCreate>,
+    /// Salts this host's egui ids, so two hosts that both have `workspace:1`
+    /// never share a widget id in the one sidebar. Empty for a single host.
+    pub host_salt: String,
+    /// Set when the user acted on this host (selected or created something),
+    /// so the app makes it the host on screen. Cleared by the app each frame.
+    pub activated: bool,
+    /// The sidebar shows this host's group folded to its header.
+    pub host_collapsed: bool,
     pub terms: HashMap<Ref, TermView>,
     pub browsers: HashMap<Ref, BrowserView>,
     /// PTYs owned by this process, one per local terminal surface. Present only
@@ -363,6 +371,9 @@ impl AppState {
             tree: Tree::default(),
             current_host: String::new(),
             host_folders: HashMap::new(),
+            host_salt: String::new(),
+            activated: false,
+            host_collapsed: false,
             pending_create: None,
             terms: HashMap::new(),
             browsers: HashMap::new(),
@@ -433,6 +444,7 @@ impl AppState {
     /// A new session (workspace) inside `folder`, or at top level with `None`.
     /// The session is a terminal in the sidebar, running on the connected host.
     pub fn new_session(&mut self, folder: Option<Ref>) {
+        self.activated = true;
         self.rpc(
             m::WORKSPACE_NEW,
             // No command: the daemon runs the shell tmux defaults to.
@@ -444,6 +456,7 @@ impl AppState {
     /// editor opens as soon as the daemon reports the new ref, so the folder
     /// gets a name in the same gesture that created it.
     pub fn new_folder(&mut self, parent: Option<Ref>) {
+        self.activated = true;
         let mut params = serde_json::json!({ "name": "New Folder" });
         if let Some(p) = parent {
             params["parent"] = serde_json::json!(p);
@@ -589,7 +602,7 @@ impl AppState {
     }
 
     /// Fire a create that was waiting for another host to connect.
-    fn fire_pending_create(&mut self) {
+    pub fn fire_pending_create(&mut self) {
         let Some(pending) = self.pending_create.clone() else {
             return;
         };
@@ -661,6 +674,7 @@ impl AppState {
     pub fn select_workspace(&mut self, id: &str) {
         let Some(w) = self.workspace(id) else { return };
         let id = w.id.clone();
+        self.activated = true;
         if self.selected.as_deref() == Some(id.as_str()) {
             return;
         }

@@ -193,6 +193,17 @@ pub fn load_hosts_with_local() -> Vec<HostConfig> {
     hosts
 }
 
+/// The hosts the app connects to at once: this machine first, then every
+/// configured remote. The bun mock is a development stand-in, so it is left
+/// out unless `LMUX_WS_URL` pins the app to a single host.
+pub fn app_hosts() -> Vec<HostConfig> {
+    let hosts = load_hosts_with_local();
+    if std::env::var("LMUX_WS_URL").is_ok() {
+        return hosts;
+    }
+    hosts.into_iter().filter(|h| !(h.kind == "direct" && h.name == "mock")).collect()
+}
+
 /// Load hosts, seeding the config file on first run. `LMUX_WS_URL` overrides
 /// everything and points at a single direct host (used for development).
 pub fn load_hosts() -> Vec<HostConfig> {
@@ -459,6 +470,15 @@ impl Net {
         if std::env::var("LMUX_WS_URL").is_err() {
             net.local_error = ensure_local_daemon().err();
         }
+        net
+    }
+
+    /// One connection to `hosts[index]`. The app holds one of these per host;
+    /// each keeps the full list so the create menu can name every host, with
+    /// the indices matching the app's own order.
+    pub fn for_host(hosts: Vec<HostConfig>, index: usize) -> Self {
+        let mut net = Self::with_hosts(hosts);
+        net.host_index = index.min(net.hosts.len().saturating_sub(1));
         net
     }
 

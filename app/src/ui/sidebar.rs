@@ -20,27 +20,38 @@ const LINE: f32 = 15.0;
 const INDENT: f32 = 13.0;
 const ROW_H: f32 = 26.0;
 
+/// The sidebar for a single host.
 pub fn show(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
+    show_hosts(ui, rect, std::slice::from_mut(c), 0);
+}
+
+/// The sidebar for every host at once: the top strip acts on the host on
+/// screen (`hosts[active]`), and the list shows each host as its own labelled
+/// group. With one host there is no group header, as before.
+pub fn show_hosts(ui: &mut Ui, rect: Rect, hosts: &mut [Ctx], active: usize) {
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 0.0, theme::SIDEBAR_BG);
 
+    let unread: u32 = hosts.iter().map(|h| h.state.unread_total()).sum();
     let strip = Rect::from_min_size(rect.min, Vec2::new(rect.width(), theme::TOP_STRIP_H));
-    top_icons(ui, strip, c);
+    if let Some(c) = hosts.get_mut(active) {
+        top_icons(ui, strip, c, unread);
+    }
 
     let list = Rect::from_min_max(egui::pos2(rect.min.x, strip.max.y), rect.max);
     // Rows are hit-tested against the area they were drawn in, so a drop while
     // the pointer is over the panes cannot land in the sidebar.
-    c.state.sidebar_list_rect = Some(list);
-    body(ui, list, c);
+    for h in hosts.iter_mut() {
+        h.state.sidebar_list_rect = Some(list);
+    }
+    body(ui, list, hosts, active);
 }
 
-fn top_icons(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
+fn top_icons(ui: &mut Ui, rect: Rect, c: &mut Ctx, unread: u32) {
     let p = ui.painter_at(rect);
     let y = rect.center().y;
     let start = rect.min.x + 12.0 + theme::titlebar_inset();
     let step = 23.0;
-
-    let unread = c.state.unread_total();
 
     let items: [(&str, f32); 5] = [
         ("sidebar", start),
@@ -100,7 +111,8 @@ fn top_icons(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
     }
 }
 
-fn body(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
+fn body(ui: &mut Ui, rect: Rect, hosts: &mut [Ctx], active: usize) {
+    let multi = hosts.len() > 1;
     let builder = UiBuilder::new()
         .max_rect(rect)
         .layout(egui::Layout::top_down(egui::Align::Min));
@@ -110,25 +122,22 @@ fn body(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
             .id_salt("sidebar")
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                let folders = c.state.tree.folders.clone();
-                let workspaces = c.state.tree.workspaces.clone();
-                let selected = c.state.selected.clone();
-
-                if workspaces.is_empty() && folders.is_empty() {
-                    ui.add_space(10.0);
-                    ui.label(
-                        egui::RichText::new("no workspaces")
-                            .font(theme::ui(theme::FS_SMALL))
-                            .color(theme::DIM_2),
-                    );
-                    return;
-                }
-
-                folder_level(ui, &folders, &workspaces, None, 0, selected.as_deref(), c);
-
-                // Workspaces without a folder.
-                for ws in workspaces.iter().filter(|w| w.folder.is_none()) {
-                    ws_card(ui, ws, selected.as_deref() == Some(ws.id.as_str()), c);
+                for (i, c) in hosts.iter_mut().enumerate() {
+                    let top = ui.cursor().min.y;
+                    if multi && host_header(ui, c, i == active) {
+                        continue;
+                    }
+                    host_list(ui, c, i == active, multi);
+                    if multi {
+                        // A row dragged within this host resolves against this
+                        // host's group only, so it can never land in another
+                        // host's folders.
+                        let section = Rect::from_min_max(
+                            egui::pos2(rect.min.x, top),
+                            egui::pos2(rect.max.x, ui.cursor().min.y),
+                        );
+                        c.state.sidebar_list_rect = Some(section.intersect(rect));
+                    }
                 }
                 ui.add_space(8.0);
 
@@ -139,6 +148,7 @@ fn body(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
                 // hit.
                 let rest = ui.available_rect_before_wrap().intersect(rect);
                 if rest.width() > 4.0 && rest.height() > 4.0 {
+                    let Some(c) = hosts.get_mut(active) else { return };
                     let resp = ui.interact(rest, Id::new("sidebar-empty"), Sense::click());
                     if resp.double_clicked() {
                         let folder = c.state.default_new_folder();
@@ -148,6 +158,118 @@ fn body(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
                 }
             });
     });
+}
+
+/// One host's folders and cards. Only the host on screen shows a selected card.
+fn host_list(ui: &mut Ui, c: &mut Ctx, is_active: bool, multi: bool) {
+    let folders = c.state.tree.folders.clone();
+    let workspaces = c.state.tree.workspaces.clone();
+    let selected = if is_active { c.state.selected.clone() } else { None };
+
+    if workspaces.is_empty() && folders.is_empty() {
+        let text = if multi && c.net.state != crate::net::ConnState::Connected {
+            ""
+        } else {
+            "no workspaces"
+        };
+        if !text.is_empty() {
+            ui.add_space(if multi { 2.0 } else { 10.0 });
+            ui.horizontal(|ui| {
+                ui.add_space(if multi { theme::SIDEBAR_PAD + 6.0 } else { 0.0 });
+                ui.label(
+                    egui::RichText::new(text).font(theme::ui(theme::FS_SMALL)).color(theme::DIM_2),
+                );
+            });
+            ui.add_space(if multi { 6.0 } else { 0.0 });
+        }
+        return;
+    }
+
+    folder_level(ui, &folders, &workspaces, None, 0, selected.as_deref(), c);
+
+    // Workspaces without a folder.
+    for ws in workspaces.iter().filter(|w| w.folder.is_none()) {
+        ws_card(ui, ws, selected.as_deref() == Some(ws.id.as_str()), c);
+    }
+}
+
+/// A host's group header: its name and connection state. A click folds the
+/// group; the menu creates on that host or reconnects it. Returns true when
+/// the group is folded, so its rows are skipped.
+fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
+    use crate::net::ConnState;
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, ROW_H), Sense::click());
+    let painter = ui.painter_at(rect);
+    let inner = rect.shrink2(Vec2::new(theme::SIDEBAR_PAD, 0.0));
+    let cy = rect.center().y;
+    let collapsed = c.state.host_collapsed;
+
+    icons::chevron(
+        &painter,
+        egui::pos2(inner.min.x + 5.0, cy),
+        3.4,
+        theme::DIM,
+        if collapsed { Arrow::Right } else { Arrow::Down },
+    );
+    let (dot, status) = match c.net.state {
+        ConnState::Connected => (theme::GREEN, ""),
+        ConnState::Connecting => (theme::AMBER, "connecting…"),
+        ConnState::Disconnected => (theme::RED, "offline"),
+    };
+    icons::dot(&painter, egui::pos2(inner.min.x + 18.0, cy), 3.0, dot);
+    let font = theme::ui_semibold(theme::FS_SMALL);
+    let name = c.net.host_name().to_uppercase();
+    let color = if is_active || resp.hovered() { theme::TEXT_SOFT } else { theme::DIM };
+    let name_w = crate::util::measure(ui.ctx(), &name, &font);
+    let text_x = inner.min.x + 27.0;
+    painter.text(
+        egui::pos2(text_x, cy),
+        Align2::LEFT_CENTER,
+        ellipsize(ui.ctx(), &name, &font, (inner.max.x - text_x - 4.0).max(10.0), false),
+        font,
+        color,
+    );
+    if !status.is_empty() {
+        painter.text(
+            egui::pos2(text_x + name_w + 8.0, cy),
+            Align2::LEFT_CENTER,
+            status,
+            theme::ui(theme::FS_TINY),
+            theme::DIM_2,
+        );
+    }
+
+    if resp.clicked() {
+        c.state.host_collapsed = !collapsed;
+    }
+    let mut new_session = false;
+    let mut new_folder = false;
+    let mut reconnect = false;
+    resp.context_menu(|ui| {
+        ui.set_min_width(170.0);
+        if ui.button("New Session").clicked() {
+            new_session = true;
+            ui.close();
+        }
+        if ui.button("New Folder").clicked() {
+            new_folder = true;
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Reconnect").clicked() {
+            reconnect = true;
+            ui.close();
+        }
+    });
+    if new_session {
+        c.state.new_session(None);
+    } else if new_folder {
+        c.state.new_folder(None);
+    } else if reconnect {
+        c.state.actions.push(crate::state::Action::Reconnect);
+    }
+    collapsed
 }
 
 /// One level of the folder tree, then the workspaces each folder holds.
@@ -253,7 +375,7 @@ fn folder_row(
     // hidden while a row is being dragged so it cannot read as a drop target.
     let plus = Rect::from_center_size(egui::pos2(inner.max.x - 12.0, cy), Vec2::splat(18.0));
     c.state.folder_plus_rects.insert(folder.id.clone(), plus);
-    let plus_resp = ui.interact(plus, Id::new(("folderplus", &folder.id)), Sense::click());
+    let plus_resp = ui.interact(plus, Id::new(("folderplus", &c.state.host_salt, &folder.id)), Sense::click());
     if c.state.tab_drag.is_none() && (resp.hovered() || plus_resp.hovered()) {
         let color = if plus_resp.hovered() { theme::TEXT } else { theme::DIM_2 };
         icons::plus(&painter, Rect::from_center_size(plus.center(), Vec2::splat(12.0)), color);
@@ -408,7 +530,7 @@ fn folder_rename_editor(
         egui::pos2(text_x - 2.0, row.min.y + 3.0),
         egui::pos2(text_x - 2.0 + width, row.max.y - 3.0),
     );
-    let edit_id = Id::new(("folder-rename", &folder.id));
+    let edit_id = Id::new(("folder-rename", &c.state.host_salt, &folder.id));
     ui.scope_builder(
         UiBuilder::new().max_rect(edit_rect).layout(egui::Layout::left_to_right(egui::Align::Center)),
         |ui| {
@@ -624,7 +746,7 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
     );
     let close_resp = ui.interact(
         Rect::from_center_size(close_center, Vec2::splat(18.0)),
-        Id::new(("cardx", &ws.id)),
+        Id::new(("cardx", &c.state.host_salt, &ws.id)),
         Sense::click(),
     );
     if c.state.tab_drag.is_none() && (resp.hovered() || close_resp.hovered()) {

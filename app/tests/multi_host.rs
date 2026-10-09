@@ -1,0 +1,210 @@
+//! Every host in one sidebar: two daemons whose refs collide (`workspace:1` on
+//! both) are drawn as two labelled groups, a click on the other host's card
+//! selects it there, and only the host on screen streams anything.
+//!
+//! Run `UPDATE_SNAPSHOTS=1 cargo test --test multi_host` to (re)create the
+//! reference image.
+
+use egui::Vec2;
+use egui_kittest::Harness;
+use lmux_app::net::{ConnState, HostConfig, Net};
+use lmux_app::state::AppState;
+use lmux_app::{app, fonts, wire};
+
+fn host(name: &str, url: &str) -> HostConfig {
+    HostConfig {
+        name: name.into(),
+        label: name.into(),
+        kind: "direct".into(),
+        url: Some(url.into()),
+        ssh_target: None,
+        remote_port: 7878,
+        browser_scale: None,
+    }
+}
+
+fn hosts() -> Vec<HostConfig> {
+    vec![host("this mac", "ws://127.0.0.1:7879"), host("my-server", "ws://127.0.0.1:7900")]
+}
+
+/// A tree with one folder and one session in it. Both hosts get the same refs.
+fn tree(host: &str, folder: &str, title: &str, cwd: &str) -> wire::Tree {
+    use wire::*;
+    Tree {
+        host: host.into(),
+        folders: vec![Folder {
+            id: "folder:1".into(),
+            name: folder.into(),
+            parent: None,
+            collapsed: false,
+        }],
+        workspaces: vec![Workspace {
+            id: "workspace:1".into(),
+            title: title.into(),
+            folder: Some("folder:1".into()),
+            cwd: cwd.into(),
+            git_branch: None,
+            agent: AgentState::None,
+            summary: None,
+            unread_notifications: 0,
+            status_pills: vec![],
+            progress: None,
+            layout: Layout::Pane { pane: "pane:1".into() },
+            panes: vec![Pane {
+                id: "pane:1".into(),
+                surfaces: vec![Surface {
+                    id: "surface:1".into(),
+                    title: "zsh".into(),
+                    kind: SurfaceKind::Terminal { tmux_pane: Some("%1".into()), cols: 80, rows: 24 },
+                }],
+                active_surface: Some("surface:1".into()),
+            }],
+            focused_pane: Some("pane:1".into()),
+        }],
+        selected_workspace: Some("workspace:1".into()),
+    }
+}
+
+struct Host {
+    state: AppState,
+    net: Net,
+}
+
+struct Fixture {
+    hosts: Vec<Host>,
+    active: usize,
+    ready: bool,
+}
+
+fn fixture() -> Fixture {
+    let make = |i: usize, t: wire::Tree| {
+        let mut net = Net::for_host(hosts(), i);
+        net.state = ConnState::Connected;
+        let mut state = AppState::new();
+        state.host_salt = net.host_name();
+        state.set_current_host(&net.host_name());
+        state.apply_tree(t);
+        // The tree's own selection is not a user action.
+        state.activated = false;
+        Host { state, net }
+    };
+    Fixture {
+        hosts: vec![
+            make(0, tree("this mac", "lmux", "local shell", "/Users/me/Documents/lmux")),
+            make(1, tree("my-server", "webapp", "claude · server", "/home/me/webapp")),
+        ],
+        active: 0,
+        ready: false,
+    }
+}
+
+fn harness<'a>(fx: Fixture, ppp: f32) -> Harness<'a, Fixture> {
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(620.0, 420.0))
+        .with_pixels_per_point(ppp)
+        .build_ui_state(
+            |ui, fx: &mut Fixture| {
+                if !fx.ready {
+                    fonts::install(ui.ctx());
+                    fx.ready = true;
+                    return;
+                }
+                let mut ctxs: Vec<lmux_app::ui::Ctx> = fx
+                    .hosts
+                    .iter_mut()
+                    .map(|h| lmux_app::ui::Ctx { state: &mut h.state, net: &mut h.net })
+                    .collect();
+                app::render_hosts(ui, &mut ctxs, fx.active);
+            },
+            fx,
+        );
+    h.run();
+    h
+}
+
+#[test]
+fn both_hosts_are_drawn_as_separate_groups() {
+    let h = harness(fixture(), 1.0);
+    let fx = h.state();
+    let local = fx.hosts[0].state.card_rects.get("workspace:1").copied().expect("local card");
+    let remote = fx.hosts[1].state.card_rects.get("workspace:1").copied().expect("remote card");
+    assert!(remote.min.y > local.max.y, "the remote group sits below the local one");
+    // Each host's drop area is its own group, so rows never cross hosts.
+    let a = fx.hosts[0].state.sidebar_list_rect.expect("local section");
+    let b = fx.hosts[1].state.sidebar_list_rect.expect("remote section");
+    assert!(a.max.y <= b.min.y + 0.5, "sections do not overlap: {a:?} {b:?}");
+}
+
+#[test]
+fn clicking_the_other_hosts_card_selects_it_there_only() {
+    let mut fx = fixture();
+    // Nothing selected on the remote yet, so the click is a real change.
+    fx.hosts[1].state.selected = None;
+    let mut h = harness(fx, 1.0);
+    let card = h.state().hosts[1].state.card_rects["workspace:1"];
+    h.input_mut().events.push(egui::Event::PointerMoved(card.center()));
+    h.run();
+    h.input_mut().events.push(egui::Event::PointerButton {
+        pos: card.center(),
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Default::default(),
+    });
+    h.input_mut().events.push(egui::Event::PointerButton {
+        pos: card.center(),
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Default::default(),
+    });
+    h.run();
+    let fx = h.state();
+    assert_eq!(fx.hosts[1].state.selected.as_deref(), Some("workspace:1"));
+    assert!(fx.hosts[1].state.activated, "the remote host asks to come on screen");
+    assert!(!fx.hosts[0].state.activated, "the local host was not touched");
+    let select = fx.hosts[1]
+        .state
+        .pending
+        .iter()
+        .any(|m| format!("{m:?}").contains("workspace.select"));
+    assert!(select, "the select RPC is queued on the remote host's connection");
+    assert!(
+        !fx.hosts[0].state.pending.iter().any(|m| format!("{m:?}").contains("workspace.select")),
+        "and not on the local one"
+    );
+}
+
+#[test]
+fn only_the_host_on_screen_subscribes() {
+    let mut h = harness(fixture(), 1.0);
+    h.run();
+    let fx = h.state_mut();
+    for host in &mut fx.hosts {
+        host.state.sync_subscriptions(true);
+    }
+    // The remote host's terminal is not on screen, so it never subscribes.
+    let remote_subs = fx.hosts[1]
+        .state
+        .pending
+        .iter()
+        .filter(|m| matches!(m, wire::ClientMsg::Subscribe { .. }))
+        .count();
+    assert_eq!(remote_subs, 0);
+    assert!(!fx.hosts[1].state.pane_rects.contains_key("pane:1"));
+    assert!(fx.hosts[0].state.pane_rects.contains_key("pane:1"));
+}
+
+#[test]
+fn folding_a_host_hides_its_rows() {
+    let mut fx = fixture();
+    fx.hosts[1].state.host_collapsed = true;
+    let h = harness(fx, 1.0);
+    let fx = h.state();
+    assert!(fx.hosts[0].state.card_rects.contains_key("workspace:1"));
+    assert!(fx.hosts[1].state.card_rects.is_empty());
+}
+
+#[test]
+fn snapshot_sidebar_multi_host() {
+    let mut h = harness(fixture(), 2.0);
+    h.snapshot("sidebar_multi_host");
+}
