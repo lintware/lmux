@@ -672,6 +672,8 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
 
     // Agent state line.
     if let Some(color) = agent_color(ws.agent) {
+        // Idle's accent blue is the selected card's own colour: go white there.
+        let color = if selected && color == theme::ACCENT { Color32::WHITE } else { color };
         icons::dot(&p, egui::pos2(x + 3.0, y + 6.0), 3.0, color);
         p.text(
             egui::pos2(x + 12.0, y),
