@@ -210,6 +210,8 @@ impl eframe::App for LmuxApp {
             render_hosts(ui, &mut hosts, active);
         }
 
+        self.poll_installs(&ctx);
+
         // OSC 52: a program copied text, here or on a remote host.
         let copied: Vec<String> = self.hosts.iter_mut().flat_map(|h| h.state.take_clipboard_requests()).collect();
         if let Some(text) = copied.into_iter().last() {
@@ -261,8 +263,16 @@ impl eframe::App for LmuxApp {
                 Action::SwitchHost(to) => self.create_on(from, to),
                 Action::Reconnect => self.hosts[from].net.begin_connect(&ctx),
                 Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                Action::AddHost(target) => self.add_host(&target, &ctx),
+                Action::AddHost(target) => {
+                    let install = self.hosts[from].state.add_host_install;
+                    self.add_host(&target, &ctx);
+                    if install {
+                        let at = self.active;
+                        self.install_host(at, &ctx);
+                    }
+                }
                 Action::RemoveHost => removals.push(from),
+                Action::InstallHost => self.install_host(from, &ctx),
             }
         }
         removals.sort_unstable();
@@ -332,6 +342,7 @@ impl LmuxApp {
             }
             // Output from the local PTYs, which never goes through the websocket.
             h.state.pump_local_ptys();
+            h.state.poll_image_pastes();
             h.state.poll_decoded();
             let connected = h.net.state == ConnState::Connected;
             if !connected && h.was_connected {
@@ -400,6 +411,43 @@ impl LmuxApp {
         self.hosts.push(HostSession { state, net, was_connected: false });
         self.reindex(&configs);
         self.activate(self.hosts.len() - 1);
+    }
+
+    /// Install or update lmux on a remote host in the background; the host's
+    /// header shows progress, and it reconnects when the install is done.
+    fn install_host(&mut self, index: usize, ctx: &egui::Context) {
+        let Some(h) = self.hosts.get_mut(index) else { return };
+        if h.net.is_local_host() {
+            return;
+        }
+        let running = h
+            .state
+            .install
+            .as_ref()
+            .is_some_and(|s| matches!(*s.lock().unwrap(), crate::net::InstallStatus::Running(_)));
+        if running {
+            return;
+        }
+        let Some(target) = h.net.current_host().map(|c| c.ssh_target.clone().unwrap_or_else(|| c.name.clone())) else {
+            return;
+        };
+        h.state.install = Some(crate::net::start_install(&target, Some(ctx.clone())));
+    }
+
+    /// A finished install reconnects its host once, so the new daemon is used.
+    fn poll_installs(&mut self, ctx: &egui::Context) {
+        for h in &mut self.hosts {
+            let done = h
+                .state
+                .install
+                .as_ref()
+                .is_some_and(|s| *s.lock().unwrap() == crate::net::InstallStatus::Done);
+            if done {
+                h.state.install = None;
+                h.state.banner = Some((format!("lmux is installed on {}", h.net.host_name()), false));
+                h.net.begin_connect(ctx);
+            }
+        }
     }
 
     /// Forget a remote host: close its connection and drop it from hosts.json.
@@ -865,9 +913,18 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
             let app_cursor = mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR);
             let mut bytes: Vec<u8> = Vec::new();
             let mut copy = false;
+            let mut maybe_image = false;
             ctx.input(|i| {
                 for ev in &i.events {
                     match ev {
+                        // Cmd+V with an image (no text) on the clipboard: egui
+                        // reports nothing on the press, only this release. Look
+                        // for an image to paste as a file path.
+                        egui::Event::Key { key: Key::V, pressed: false, modifiers, .. }
+                            if modifiers.command && !modifiers.shift =>
+                        {
+                            maybe_image = true;
+                        }
                         egui::Event::Text(t) => {
                             // Control characters arrive as text too; the key handler owns them.
                             if t.chars().all(|ch| ch >= ' ') {
@@ -878,6 +935,11 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
                         }
                         egui::Event::Key { key, pressed: true, modifiers, .. } => {
                             if modifiers.command {
+                                // Cmd+Backspace / Cmd+arrows edit the line;
+                                // every other Cmd chord is an app shortcut.
+                                if let Some(b) = keys::command_key(*key) {
+                                    bytes.extend_from_slice(&b);
+                                }
                                 continue;
                             }
                             if let Some(b) = keys::terminal_key_mode(*key, *modifiers, app_cursor) {
@@ -893,7 +955,13 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
                         _ => {}
                     }
                 }
+                if i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))) {
+                    maybe_image = false;
+                }
             });
+            if maybe_image {
+                c.state.request_image_paste(&sid);
+            }
             if copy {
                 copy_selection(ctx, c, &sid);
             }
@@ -977,7 +1045,7 @@ fn add_host_dialog(ctx: &egui::Context, c: &mut ui::Ctx) {
         .fixed_size(Vec2::new(320.0, 0.0))
         .show(ctx, |ui| {
             ui.label(
-                egui::RichText::new("SSH alias or user@host. The host needs lmux running (deploy/install-remote.sh).")
+                egui::RichText::new("SSH alias or user@host, reachable with your SSH keys.")
                     .font(theme::ui(theme::FS_SMALL))
                     .color(theme::DIM),
             );
@@ -994,6 +1062,8 @@ fn add_host_dialog(ctx: &egui::Context, c: &mut ui::Ctx) {
             if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                 add = true;
             }
+            ui.add_space(4.0);
+            ui.checkbox(&mut c.state.add_host_install, "Install or update lmux there (needs tmux and Rust)");
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button("Add").clicked() {

@@ -1229,6 +1229,37 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             inner.mark_dirty();
             ok(id, json!({"count": count}))
         }
+        methods::FILE_PUT => {
+            // A file from the app (a pasted image) saved where programs on
+            // this host can read it; the app then pastes the path.
+            use base64::Engine;
+            let name = s(params, "name").unwrap_or_else(|| "paste.png".into());
+            let safe: String = name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '-' })
+                .collect();
+            let Some(data) = params.get("data").and_then(|d| d.as_str()) else {
+                return err(id, RpcErrorCode::InvalidParams, "data required");
+            };
+            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
+                return err(id, RpcErrorCode::InvalidParams, "data is not base64");
+            };
+            let dir = inner.cfg.state_dir.join("pastes");
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let path = dir.join(format!("{stamp}-{safe}"));
+            let written = async {
+                tokio::fs::create_dir_all(&dir).await?;
+                tokio::fs::write(&path, &bytes).await
+            }
+            .await;
+            match written {
+                Ok(()) => ok(id, json!({"path": path.to_string_lossy()})),
+                Err(e) => err(id, RpcErrorCode::Internal, format!("saving {}: {e}", path.display())),
+            }
+        }
         methods::NOTIFY_MARK_READ => {
             let count = {
                 let mut state = inner.state.lock().await;

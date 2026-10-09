@@ -214,11 +214,26 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
         theme::DIM,
         if collapsed { Arrow::Right } else { Arrow::Down },
     );
-    let (dot, status) = match c.net.state {
-        ConnState::Connected => (theme::GREEN, ""),
-        ConnState::Connecting => (theme::AMBER, "connecting…"),
-        ConnState::Disconnected => (theme::RED, "offline"),
+    let (dot, mut status) = match c.net.state {
+        ConnState::Connected => (theme::GREEN, String::new()),
+        ConnState::Connecting => (theme::AMBER, "connecting…".to_owned()),
+        ConnState::Disconnected => (theme::RED, "offline".to_owned()),
     };
+    // An install in progress (or failed) says so instead.
+    let install = c.state.install.as_ref().map(|s| s.lock().unwrap().clone());
+    let mut status_color = theme::DIM_2;
+    match &install {
+        Some(crate::net::InstallStatus::Running(line)) => {
+            status = format!("installing · {line}");
+            status_color = theme::AMBER;
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        Some(crate::net::InstallStatus::Failed(_)) => {
+            status = "install failed".to_owned();
+            status_color = theme::RED;
+        }
+        _ => {}
+    }
     icons::dot(&painter, egui::pos2(inner.min.x + 18.0, cy), 3.0, dot);
     let font = theme::ui_semibold(theme::FS_SMALL);
     let name = c.net.host_name().to_uppercase();
@@ -233,13 +248,17 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
         color,
     );
     if !status.is_empty() {
+        let sx = text_x + name_w + 8.0;
         painter.text(
-            egui::pos2(text_x + name_w + 8.0, cy),
+            egui::pos2(sx, cy),
             Align2::LEFT_CENTER,
-            status,
+            ellipsize(ui.ctx(), &status, &theme::ui(theme::FS_TINY), (inner.max.x - sx).max(10.0), false),
             theme::ui(theme::FS_TINY),
-            theme::DIM_2,
+            status_color,
         );
+    }
+    if let Some(crate::net::InstallStatus::Failed(why)) = &install {
+        resp.clone().on_hover_text(format!("{why}\n(full log in ~/.local/state/lmux/install-*.log)"));
     }
 
     if resp.clicked() {
@@ -250,6 +269,7 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
     let mut reconnect = false;
     let mut add_host = false;
     let mut remove = false;
+    let mut install = false;
     resp.context_menu(|ui| {
         ui.set_min_width(170.0);
         if ui.button("New Session").clicked() {
@@ -269,6 +289,10 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
             add_host = true;
             ui.close();
         }
+        if !c.net.is_local_host() && ui.button("Install or Update lmux on Host").clicked() {
+            install = true;
+            ui.close();
+        }
         if !c.net.is_local_host() && ui.button("Remove Host").clicked() {
             remove = true;
             ui.close();
@@ -284,6 +308,8 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
         c.state.add_host_draft = Some(String::new());
     } else if remove {
         c.state.actions.push(crate::state::Action::RemoveHost);
+    } else if install {
+        c.state.actions.push(crate::state::Action::InstallHost);
     }
     collapsed
 }

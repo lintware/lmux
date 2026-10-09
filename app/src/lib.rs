@@ -1,6 +1,7 @@
 //! lmux native client (egui/eframe): sidebar, split layout, terminals, browsers.
 
 pub mod app;
+pub mod clip;
 pub mod decode;
 pub mod fonts;
 pub mod keys;

@@ -40,9 +40,19 @@ fn terminal_key_normal(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
             }
             return Some(vec![0x09]);
         }
+        // Option+Backspace deletes a word (ESC DEL), as macOS terminals
+        // send it; Ctrl+Backspace too, as ^W.
+        Key::Backspace if ctrl => return Some(vec![0x17]),
+        Key::Backspace if alt => return Some(vec![0x1b, 0x7f]),
         Key::Backspace => return Some(vec![0x7f]),
+        // Option+←/→ move by word: ESC b / ESC f, which shells and Claude
+        // Code bind (the CSI-modifier form is unbound in zsh by default).
+        Key::ArrowLeft if alt && !ctrl && !shift => return Some(b"\x1bb".to_vec()),
+        Key::ArrowRight if alt && !ctrl && !shift => return Some(b"\x1bf".to_vec()),
         Key::Escape => return Some(vec![0x1b]),
-        Key::Space => return Some(vec![0x20]),
+        // A plain space arrives as text too; sending it here as well typed
+        // every space twice. (Ctrl+Space is NUL, handled above.)
+        Key::Space => return None,
         Key::ArrowUp => b"\x1b[A",
         Key::ArrowDown => b"\x1b[B",
         Key::ArrowRight => b"\x1b[C",
@@ -83,6 +93,20 @@ fn terminal_key_normal(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
         out.insert(0, 0x1b);
     }
     Some(out)
+}
+
+/// Cmd+key editing in a terminal, as macOS terminals map it: Cmd+Backspace
+/// deletes to the start of the line (^U), Cmd+←/→ go to its start/end
+/// (^A/^E), Cmd+Delete deletes to its end (^K). Other Cmd chords are app
+/// shortcuts and send nothing.
+pub fn command_key(key: Key) -> Option<Vec<u8>> {
+    Some(vec![match key {
+        Key::Backspace => 0x15,
+        Key::ArrowLeft => 0x01,
+        Key::ArrowRight => 0x05,
+        Key::Delete => 0x0b,
+        _ => return None,
+    }])
 }
 
 fn is_cursor(key: Key) -> bool {
@@ -276,5 +300,22 @@ mod tests {
     fn dom_keys() {
         assert_eq!(dom_key(Key::A), Some(("a", "KeyA")));
         assert_eq!(dom_key(Key::Enter), Some(("Enter", "Enter")));
+    }
+
+    #[test]
+    fn mac_editing_keys() {
+        let none = Modifiers::NONE;
+        let alt = Modifiers { alt: true, ..Default::default() };
+        let ctrl = Modifiers::CTRL;
+        assert_eq!(terminal_key(Key::Space, none), None, "a space comes from the text event only");
+        assert_eq!(terminal_key(Key::Space, ctrl), Some(vec![0x00]));
+        assert_eq!(terminal_key(Key::Backspace, alt), Some(vec![0x1b, 0x7f]));
+        assert_eq!(terminal_key(Key::Backspace, ctrl), Some(vec![0x17]));
+        assert_eq!(terminal_key(Key::ArrowLeft, alt), Some(b"\x1bb".to_vec()));
+        assert_eq!(terminal_key(Key::ArrowRight, alt), Some(b"\x1bf".to_vec()));
+        assert_eq!(command_key(Key::Backspace), Some(vec![0x15]));
+        assert_eq!(command_key(Key::ArrowLeft), Some(vec![0x01]));
+        assert_eq!(command_key(Key::ArrowRight), Some(vec![0x05]));
+        assert_eq!(command_key(Key::T), None);
     }
 }

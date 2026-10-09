@@ -261,6 +261,104 @@ pub fn load_hosts_with_local() -> Vec<HostConfig> {
     hosts
 }
 
+/// Where an "install lmux on this host" job stands.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InstallStatus {
+    /// Running; the installer's latest progress line.
+    Running(String),
+    Done,
+    /// Failed; the last lines it printed.
+    Failed(String),
+}
+
+/// The installer script and, inside the app bundle, the source it ships:
+/// `Contents/Resources/{install-remote.sh,lmux-src.tar}`. From a checkout
+/// (development), the repo's own script, which ships the source from git.
+pub fn installer() -> Option<(PathBuf, Option<PathBuf>)> {
+    if let Some(res) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().and_then(|d| d.parent()).map(|c| c.join("Resources")))
+    {
+        let (script, tar) = (res.join("install-remote.sh"), res.join("lmux-src.tar"));
+        if script.is_file() && tar.is_file() {
+            return Some((script, Some(tar)));
+        }
+    }
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deploy/install-remote.sh");
+    dev.is_file().then_some((dev, None))
+}
+
+/// Install (or update) lmux on `target` over SSH in the background: build it
+/// there, run it as the lmuxd user service, add the Claude hooks. The log
+/// goes to ~/.local/state/lmux/install-<target>.log.
+pub fn start_install(target: &str, wake: Option<egui::Context>) -> std::sync::Arc<std::sync::Mutex<InstallStatus>> {
+    use std::io::BufRead;
+    let status = std::sync::Arc::new(std::sync::Mutex::new(InstallStatus::Running("starting…".into())));
+    let out = status.clone();
+    let target = target.to_owned();
+    std::thread::spawn(move || {
+        let set = |s: InstallStatus| {
+            if let Ok(mut g) = out.lock() {
+                *g = s;
+            }
+            if let Some(c) = &wake {
+                c.request_repaint();
+            }
+        };
+        let Some((script, tar)) = installer() else {
+            set(InstallStatus::Failed("this build has no installer".into()));
+            return;
+        };
+        let log_path = dirs::home_dir().map(|h| {
+            let safe: String = target.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+            h.join(format!(".local/state/lmux/install-{safe}.log"))
+        });
+        let mut log = log_path.as_ref().and_then(|p| std::fs::File::create(p).ok());
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script).arg(&target).env("PATH", daemon_path());
+        if let Some(t) = &tar {
+            cmd.env("LMUX_SRC_TAR", t);
+        }
+        let child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                set(InstallStatus::Failed(format!("could not run the installer: {e}")));
+                return;
+            }
+        };
+        // stderr is folded into the same stream of progress lines.
+        let err = child.stderr.take();
+        let err_lines = std::thread::spawn(move || {
+            err.map(|e| std::io::BufReader::new(e).lines().map_while(Result::ok).collect::<Vec<_>>()).unwrap_or_default()
+        });
+        let mut tail: Vec<String> = Vec::new();
+        if let Some(stdout) = child.stdout.take() {
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(f) = log.as_mut() {
+                    let _ = writeln!(f, "{line}");
+                }
+                set(InstallStatus::Running(line.trim_start_matches("==> ").to_owned()));
+                tail.push(line);
+            }
+        }
+        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        for line in err_lines.join().unwrap_or_default() {
+            if let Some(f) = log.as_mut() {
+                let _ = writeln!(f, "{line}");
+            }
+            tail.push(line);
+        }
+        if ok {
+            set(InstallStatus::Done);
+        } else {
+            let last: Vec<String> = tail.iter().rev().take(3).rev().cloned().collect();
+            set(InstallStatus::Failed(last.join(" · ")));
+        }
+    });
+    status
+}
+
 /// The hosts the app connects to at once: this machine first, then every
 /// configured remote. The bun mock is a development stand-in, so it is left
 /// out unless `LMUX_WS_URL` pins the app to a single host.

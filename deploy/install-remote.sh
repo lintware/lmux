@@ -17,7 +17,11 @@ set -euo pipefail
 
 target=${1:?usage: install-remote.sh <ssh-target> [git-ref]}
 ref=${2:-HEAD}
-repo=$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)
+# The app runs this from its bundle with LMUX_SRC_TAR pointing at the source
+# it ships; from a checkout, the source comes from git.
+if [ -z "${LMUX_SRC_TAR:-}" ]; then
+  repo=$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)
+fi
 
 echo "==> checking $target"
 ssh -o BatchMode=yes "$target" 'set -e
@@ -28,8 +32,14 @@ ssh -o BatchMode=yes "$target" 'set -e
     echo "warning: lingering is off, so lmuxd stops at logout (loginctl enable-linger $USER)"
   fi'
 
-echo "==> shipping $(git -C "$repo" rev-parse --short "$ref")"
-git -C "$repo" archive --format=tar "$ref" | ssh -o BatchMode=yes "$target" \
+if [ -n "${LMUX_SRC_TAR:-}" ]; then
+  echo "==> shipping $(basename "$LMUX_SRC_TAR")"
+  ship() { cat "$LMUX_SRC_TAR"; }
+else
+  echo "==> shipping $(git -C "$repo" rev-parse --short "$ref")"
+  ship() { git -C "$repo" archive --format=tar "$ref"; }
+fi
+ship | ssh -o BatchMode=yes "$target" \
   'rm -rf ~/lmux.new && mkdir -p ~/lmux.new && tar -x -C ~/lmux.new'
 
 echo "==> building (first build takes a minute or two)"

@@ -47,6 +47,11 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+echo "==> remote installer and source"
+# "Add Remote Host" installs lmux on the host from these.
+cp "$repo/deploy/install-remote.sh" "$app/Contents/Resources/install-remote.sh"
+git -C "$repo" archive --format=tar HEAD > "$app/Contents/Resources/lmux-src.tar"
+
 echo "==> icon"
 icon_src="$build/icon-1024.png"
 swift "$repo/deploy/macos/make-icon.swift" "$icon_src"

@@ -138,6 +138,10 @@ pub struct AppState {
     pub host_collapsed: bool,
     /// The "Add Remote Host" field, while it is open: the SSH target typed so far.
     pub add_host_draft: Option<String>,
+    /// Whether adding the host also installs lmux there (on by default).
+    pub add_host_install: bool,
+    /// An install of lmux on this host, while running or just finished.
+    pub install: Option<std::sync::Arc<std::sync::Mutex<crate::net::InstallStatus>>>,
     pub terms: HashMap<Ref, TermView>,
     pub browsers: HashMap<Ref, BrowserView>,
     /// PTYs owned by this process, one per local terminal surface. Present only
@@ -180,6 +184,11 @@ pub struct AppState {
     pending_closes: HashMap<u64, CloseTarget>,
     /// The "still running" question, while it is open.
     pub confirm_close: Option<ConfirmClose>,
+    /// Clipboard images being read for a paste: the surface, and the PNG's
+    /// local path once read (None: the clipboard held text or no image).
+    image_reads: Vec<(Ref, std::sync::mpsc::Receiver<Option<std::path::PathBuf>>)>,
+    /// Images uploaded to the host for a paste, by RPC id: the surface.
+    pending_uploads: HashMap<u64, Ref>,
     /// Animate (the running-agent spinner). The app turns it on; tests keep
     /// still frames.
     pub animate: bool,
@@ -253,6 +262,8 @@ pub enum Action {
     AddHost(String),
     /// Forget this host (the one whose state queued the action).
     RemoveHost,
+    /// Install or update lmux on this host over SSH, then reconnect.
+    InstallHost,
 }
 
 /// Something a close was asked for, kept until the daemon answers.
@@ -451,6 +462,8 @@ impl AppState {
             activated: false,
             host_collapsed: false,
             add_host_draft: None,
+            add_host_install: true,
+            install: None,
             pending_create: None,
             terms: HashMap::new(),
             browsers: HashMap::new(),
@@ -482,6 +495,8 @@ impl AppState {
             browser_replies: HashMap::new(),
             clipboard_out: None,
             confirm_close: None,
+            image_reads: Vec::new(),
+            pending_uploads: HashMap::new(),
             term_font: crate::theme::FS_TERM,
             folder_toggle: None,
             folder_rename_pending: None,
@@ -1305,6 +1320,13 @@ impl AppState {
                 if let Some(reply) = self.browser_replies.remove(&response.id) {
                     self.on_browser_reply(reply, response.result.as_ref());
                 }
+                // An uploaded image: paste the path it was saved at on the host.
+                if let Some(surface) = self.pending_uploads.remove(&response.id) {
+                    if let Some(path) = response.result.as_ref().and_then(|r| r.get("path")).and_then(|p| p.as_str()) {
+                        let path = path.to_owned();
+                        self.paste_text(&surface, &path);
+                    }
+                }
                 let close = self.pending_closes.remove(&response.id);
                 match (response.error, close) {
                     (Some(err), Some(target)) if err.code == lmux_proto::RpcErrorCode::Busy => {
@@ -1641,6 +1663,56 @@ impl AppState {
 
     /// Send input bytes to a terminal: a local pane's PTY when this process
     /// owns one, otherwise the daemon.
+    /// Cmd+V found no text: read an image off the clipboard in the
+    /// background. `poll_image_pastes` pastes it as a file path, after
+    /// uploading it to the host for a remote pane, since a terminal only
+    /// carries text and Claude Code attaches an image given its path.
+    pub fn request_image_paste(&mut self, surface: &str) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = self.wake.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::clip::clipboard_png());
+            if let Some(c) = wake {
+                c.request_repaint();
+            }
+        });
+        self.image_reads.push((surface.to_owned(), rx));
+    }
+
+    /// Finish image pastes whose clipboard read is done.
+    pub fn poll_image_pastes(&mut self) {
+        let mut done: Vec<(Ref, std::path::PathBuf)> = Vec::new();
+        self.image_reads.retain(|(surface, rx)| match rx.try_recv() {
+            Ok(Some(path)) => {
+                done.push((surface.clone(), path));
+                false
+            }
+            Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+        });
+        for (surface, path) in done {
+            if self.local_mode {
+                // This Mac: the file is already where the program can read it.
+                self.paste_text(&surface, &path.to_string_lossy());
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+            let id = self.rpc_with_id(m::FILE_PUT, serde_json::json!({ "name": "pasted-image.png", "data": data }));
+            self.pending_uploads.insert(id, surface);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Paste text into a terminal as the keyboard would (bracketed when the
+    /// program asked for it).
+    pub fn paste_text(&mut self, surface: &str, text: &str) {
+        let bracketed = self.term_mode(surface).contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+        let bytes = crate::termio::paste_bytes(text, bracketed);
+        self.send_term_input(surface, &bytes);
+    }
+
     /// Text terminals copied with OSC 52 since the last call: the app puts
     /// it on the system clipboard. Remote panes included, since the escape
     /// travels with their output.

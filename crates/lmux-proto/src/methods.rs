@@ -58,6 +58,7 @@ pub const TERM_READ_SCREEN: &str = "term.read_screen";
 pub const TERM_CLEAR_HISTORY: &str = "term.clear_history"; // {surface?}
 
 // --- agent awareness ---
+pub const FILE_PUT: &str = "file.put"; // {name, data: base64} -> {path} (a pasted image, saved on the host)
 pub const NOTIFY: &str = "notify.create"; // {title, subtitle?, body?, workspace?, surface?} -> {id}
 pub const NOTIFY_LIST: &str = "notify.list"; // {} -> {notifications: [..]}
 pub const NOTIFY_CLEAR: &str = "notify.clear"; // {id? | all_read?: bool | workspace?, surface?} (no selector: the caller's workspace, else all)
