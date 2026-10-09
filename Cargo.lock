@@ -485,6 +485,7 @@ dependencies = [
  "lmux-proto",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-tungstenite 0.21.0",
  "tracing",
