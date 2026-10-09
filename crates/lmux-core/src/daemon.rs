@@ -123,31 +123,27 @@ fn parse_branch_output(stdout: &str) -> Option<String> {
 /// Shelling out beats adding a `git2` dependency: one short-lived process per
 /// distinct cwd per TTL, no native build, and it uses the user's git config.
 pub async fn git_branch(cwd: &str) -> Option<String> {
-    let out = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    if let Some(b) = parse_branch_output(&String::from_utf8_lossy(&out.stdout)) {
+    let out = git_quick(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
+    if let Some(b) = parse_branch_output(&out) {
         return Some(b);
     }
     // Detached HEAD: abbrev-ref printed "HEAD"; show the short commit instead.
-    let out = tokio::process::Command::new("git")
+    parse_branch_output(&git_quick(cwd, &["rev-parse", "--short", "HEAD"]).await?)
+}
+
+/// Run git in `cwd`, giving up after a few seconds. On macOS a folder such as
+/// ~/Documents can hold git until the user answers a privacy prompt, and a
+/// workspace create waits for its branch, so git must never hang the daemon.
+async fn git_quick(cwd: &str, args: &[&str]) -> Option<String> {
+    let run = tokio::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_branch_output(&String::from_utf8_lossy(&out.stdout))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(3), run).await.ok()?.ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// A message to one websocket client.

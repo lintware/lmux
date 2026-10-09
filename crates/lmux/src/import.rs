@@ -227,7 +227,9 @@ async fn import_one(
         o.status = "copied";
         return o;
     }
-    if let Err(e) = cmux(&["close-workspace", "--workspace", &w.cmux_id]) {
+    // cmux asks before closing a workspace with a running process; the check
+    // above has already made sure no Claude in it is working.
+    if let Err(e) = cmux(&["close-workspace", "--workspace", &w.cmux_id, "--force"]) {
         o.status = "copied";
         o.reason = Some(format!("built in lmux, but cmux did not close it: {e:#}"));
         return o;
