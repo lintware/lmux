@@ -1129,33 +1129,32 @@ impl AppState {
                 self.local_retry.insert(id.clone(), now + LOCAL_PTY_RETRY);
             }
 
-            if self.local_ptys.contains_key(id) {
-                let size = self.desired_sizes.get(id).copied().unwrap_or((80, 24));
-                if let Some(p) = self.local_ptys.get_mut(id) {
-                    p.resize(size.0, size.1);
+            if !self.local_ptys.contains_key(id)
+                && self.local_wanted.contains(id)
+                && self.local_retry.get(id).is_none_or(|t| *t <= now)
+            {
+                let (cols, rows) = self.desired_sizes.get(id).copied().unwrap_or((80, 24));
+                match LocalPty::spawn(id, &pane, cols, rows, self.wake.clone()) {
+                    Ok(pty) => {
+                        self.local_retry.remove(id);
+                        self.local_ptys.insert(id.clone(), pty);
+                    }
+                    Err(e) => {
+                        eprintln!("[localpty] {id}: {e}");
+                        self.local_retry.insert(id.clone(), now + LOCAL_PTY_RETRY);
+                    }
                 }
-                if let Some(t) = self.terms.get_mut(id) {
-                    t.resize(size.0, size.1);
-                }
-                continue;
             }
 
-            if !self.local_wanted.contains(id) {
-                continue;
+            // The painter's size drives both: the PTY tells tmux (with
+            // `window-size latest` on the window) and the local grid is resized
+            // to match, so the pane is never a frame out of step with its PTY.
+            let size = self.desired_sizes.get(id).copied().unwrap_or((80, 24));
+            if let Some(pty) = self.local_ptys.get_mut(id) {
+                pty.resize(size.0, size.1);
             }
-            if self.local_retry.get(id).is_some_and(|t| *t > now) {
-                continue;
-            }
-            let (cols, rows) = self.desired_sizes.get(id).copied().unwrap_or((80, 24));
-            match LocalPty::spawn(id, &pane, cols, rows, self.wake.clone()) {
-                Ok(pty) => {
-                    self.local_retry.remove(id);
-                    self.local_ptys.insert(id.clone(), pty);
-                }
-                Err(e) => {
-                    eprintln!("[localpty] {id}: {e}");
-                    self.local_retry.insert(id.clone(), now + LOCAL_PTY_RETRY);
-                }
+            if let Some(t) = self.terms.get_mut(id) {
+                t.resize(size.0, size.1);
             }
         }
     }
