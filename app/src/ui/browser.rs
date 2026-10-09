@@ -124,6 +124,32 @@ pub fn show(ui: &mut Ui, rect: Rect, surface: &str, _focused: bool, c: &mut Ctx)
         (view.frame_size.0, view.frame_size.1, view.have_frame, view.texture.clone())
     };
 
+    // Report the canvas size (CSS px) after it settles, before any frame has
+    // come: the size is what starts the stream. The stream is 1× by default
+    // (review #9): a Retina pixels_per_point would quadruple the bytes.
+    let want = (
+        area.width().round().max(1.0) as u32,
+        area.height().round().max(1.0) as u32,
+        c.net.browser_scale(),
+    );
+    let now = Instant::now();
+    let (send, schedule) = match c.state.browsers.get_mut(surface) {
+        Some(view) => view.resize_decision(want, now, RESIZE_DEBOUNCE),
+        None => (false, None),
+    };
+    if send {
+        c.state.pending.push(lmux_proto::ClientMsg::BrowserResize {
+            surface: surface.to_owned(),
+            width: want.0,
+            height: want.1,
+            device_scale_factor: want.2,
+        });
+    }
+    if let Some(d) = schedule {
+        // Keep the timer alive even when the window is otherwise idle.
+        ui.ctx().request_repaint_after(d);
+    }
+
     if !has_frame {
         let msg = "waiting for the first frame…";
         painter.text(
@@ -149,31 +175,6 @@ pub fn show(ui: &mut Ui, rect: Rect, surface: &str, _focused: bool, c: &mut Ctx)
             Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             Color32::WHITE,
         );
-    }
-
-    // Report the canvas size (CSS px) after it settles. The stream is 1× by
-    // default (review #9): a Retina pixels_per_point would quadruple the bytes.
-    let want = (
-        area.width().round().max(1.0) as u32,
-        area.height().round().max(1.0) as u32,
-        c.net.browser_scale(),
-    );
-    let now = Instant::now();
-    let (send, schedule) = match c.state.browsers.get_mut(surface) {
-        Some(view) => view.resize_decision(want, now, RESIZE_DEBOUNCE),
-        None => (false, None),
-    };
-    if send {
-        c.state.pending.push(lmux_proto::ClientMsg::BrowserResize {
-            surface: surface.to_owned(),
-            width: want.0,
-            height: want.1,
-            device_scale_factor: want.2,
-        });
-    }
-    if let Some(d) = schedule {
-        // Keep the timer alive even when the window is otherwise idle.
-        ui.ctx().request_repaint_after(d);
     }
 
     // Input mapping.

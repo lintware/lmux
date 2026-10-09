@@ -266,6 +266,9 @@ pub struct Inner {
     pub browser: Option<Arc<dyn BrowserBackend>>,
     /// Surfaces whose screencast is currently running.
     browser_streaming: Mutex<HashSet<Ref>>,
+    /// The size each browser was last shown at, so a stream restarted for a
+    /// viewer that reconnects (and does not resend its size) matches its canvas.
+    browser_sizes: std::sync::Mutex<HashMap<Ref, (u32, u32, f32)>>,
     clients: Mutex<Clients>,
     /// Wakes the persist task.
     dirty: Notify,
@@ -343,11 +346,25 @@ impl Inner {
         id
     }
 
+    /// Forget a client. A browser it was the last viewer of stops streaming,
+    /// as on `Unsubscribe`: its last frame was never acked, so a stream left
+    /// running would stay stalled for the next viewer.
     async fn unregister(&self, id: u64) {
-        let mut c = self.clients.lock().await;
-        c.conns.remove(&id);
-        for set in c.subs.values_mut() {
-            set.remove(&id);
+        let orphaned: Vec<Ref> = {
+            let mut c = self.clients.lock().await;
+            c.conns.remove(&id);
+            c.subs
+                .iter_mut()
+                .filter_map(|(surface, set)| (set.remove(&id) && set.is_empty()).then(|| surface.clone()))
+                .collect()
+        };
+        for surface in orphaned {
+            if self.is_streaming(&surface).await {
+                self.clear_streaming(&surface).await;
+                if let Some(b) = &self.browser {
+                    let _ = b.stop_screencast(&surface).await;
+                }
+            }
         }
     }
 
@@ -1170,6 +1187,7 @@ pub async fn run(cfg: Config, browser: Option<Arc<dyn BrowserBackend>>) -> anyho
         tmux,
         browser,
         browser_streaming: Mutex::new(HashSet::new()),
+            browser_sizes: Default::default(),
         clients: Mutex::new(Clients::default()),
         dirty: Notify::new(),
         tree_dirty: Notify::new(),
@@ -1663,6 +1681,8 @@ impl Inner {
                     }
                     Some(SurfaceKind::Browser { .. }) => {
                         if count == 1 {
+                            // A sole viewer means nobody is drawing frames.
+                            self.clear_streaming(&surface).await;
                             self.maybe_start_fallback_screencast(surface.clone());
                         }
                     }
@@ -1712,6 +1732,10 @@ impl Inner {
             } => {
                 // The client's own size drives the screencast; we never invent a
                 // 2x scale. Starting here also means a hidden pane stays dark.
+                self.browser_sizes
+                    .lock()
+                    .unwrap()
+                    .insert(surface.clone(), (width, height, device_scale_factor));
                 if let Some(b) = &self.browser {
                     let _ = b
                         .start_screencast(&surface, width, height, device_scale_factor)
@@ -1735,7 +1759,8 @@ impl Inner {
     }
 
     /// If a client subscribes to a browser surface but never sends a resize, start
-    /// a sane non-Retina stream after a short grace period.
+    /// a stream after a short grace period: at the size it was last shown at,
+    /// else a sane non-Retina one.
     fn maybe_start_fallback_screencast(self: &Arc<Self>, surface: Ref) {
         let Some(b) = self.browser.clone() else {
             return;
@@ -1746,8 +1771,15 @@ impl Inner {
             if me.subscriber_count(&surface).await == 0 || me.is_streaming(&surface).await {
                 return;
             }
+            let (w, h, dsf) = me
+                .browser_sizes
+                .lock()
+                .unwrap()
+                .get(&surface)
+                .copied()
+                .unwrap_or((1280, 800, 1.0));
             if b
-                .start_screencast(&surface, 1280, 800, 1.0)
+                .start_screencast(&surface, w, h, dsf)
                 .await
                 .is_ok()
             {
@@ -1945,6 +1977,95 @@ mod tests {
         false
     }
 
+    /// A viewer that drops mid-stream (its last frame never acked) must not
+    /// leave the browser marked as streaming: the next viewer, which subscribes
+    /// without a resize, gets a stream at the size the pane was shown at.
+    #[tokio::test]
+    async fn browser_stream_restarts_for_a_viewer_after_a_disconnect() {
+        let socket = format!("lmux-test-bs-{}", std::process::id());
+        let state_dir = tempfile::tempdir().unwrap();
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let tmux = match Tmux::spawn(TmuxConfig { socket: socket.clone(), session: "lmux".into() }, ev_tx).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping: could not start tmux ({e})");
+                return;
+            }
+        };
+        let mut state = SessionState::new("t");
+        let ws = state.next_workspace();
+        let pane = state.next_pane();
+        let surf = state.next_surface();
+        state.add_workspace(Workspace {
+            id: ws,
+            title: "w".into(),
+            folder: None,
+            cwd: "/tmp".into(),
+            git_branch: None,
+            agent: AgentState::None,
+            summary: None,
+            unread_notifications: 0,
+            status_pills: vec![],
+            progress: None,
+            layout: Layout::Pane { pane: pane.clone() },
+            panes: vec![Pane {
+                id: pane.clone(),
+                surfaces: vec![Surface {
+                    id: surf.clone(),
+                    title: "b".into(),
+                    kind: SurfaceKind::Browser {
+                        url: "about:blank".into(),
+                        loading: false,
+                        can_go_back: false,
+                        can_go_forward: false,
+                    },
+                }],
+                active_surface: Some(surf.clone()),
+            }],
+            focused_pane: Some(pane),
+            ports: vec![],
+            pr: None,
+        });
+        let fake = Arc::new(crate::browser::FakeBrowser::new());
+        let inner = Arc::new(Inner {
+            cfg: Config {
+                state_dir: state_dir.path().to_path_buf(),
+                socket: None,
+                tmux_socket: socket.clone(),
+                ws_addr: "127.0.0.1:1".into(),
+                host: "t".into(),
+            },
+            state: Mutex::new(state),
+            tmux,
+            browser: Some(fake.clone()),
+            browser_streaming: Mutex::new(HashSet::new()),
+            browser_sizes: Default::default(),
+            clients: Mutex::new(Clients::default()),
+            dirty: Notify::new(),
+            tree_dirty: Notify::new(),
+            respawn: std::sync::Mutex::new(RespawnState::default()),
+            scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
+            prs: std::sync::Mutex::new(HashMap::new()),
+        });
+
+        let a_sink = ClientSink::new(64);
+        let a = inner.register(a_sink.clone()).await;
+        inner.handle_client_msg(a, ClientMsg::Subscribe { surface: surf.clone() }, &a_sink).await;
+        let resize = ClientMsg::BrowserResize { surface: surf.clone(), width: 900, height: 600, device_scale_factor: 1.0 };
+        inner.handle_client_msg(a, resize, &a_sink).await;
+        inner.unregister(a).await;
+        assert!(!inner.is_streaming(&surf).await);
+        assert!(fake.calls.lock().unwrap().contains(&format!("stop {surf}")));
+
+        let b_sink = ClientSink::new(64);
+        let b = inner.register(b_sink.clone()).await;
+        inner.handle_client_msg(b, ClientMsg::Subscribe { surface: surf.clone() }, &b_sink).await;
+        let started = wait_for(5, || async { inner.is_streaming(&surf).await }).await;
+        tmux_cmd(&socket, &["kill-server"]).await;
+        assert!(started, "no stream for the second viewer: {:?}", fake.calls.lock().unwrap());
+        assert_eq!(fake.calls.lock().unwrap().last().unwrap(), &format!("start {surf} 900x600"));
+    }
+
     /// End to end: output in a terminal is saved to its scrollback file; after
     /// the tmux server is killed, reconcile respawns the terminal in its old
     /// directory and the new pane shows the saved output above a fresh shell.
@@ -2020,6 +2141,7 @@ mod tests {
             tmux,
             browser: None,
             browser_streaming: Mutex::new(HashSet::new()),
+            browser_sizes: Default::default(),
             clients: Mutex::new(Clients::default()),
             dirty: Notify::new(),
             tree_dirty: Notify::new(),
