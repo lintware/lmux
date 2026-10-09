@@ -311,24 +311,51 @@ impl Tmux {
             .await
     }
 
-    /// Human-facing plain screen capture.
+    /// Human-facing plain screen capture. Blank rows below the last line of
+    /// output are dropped. `lines` keeps only the last `n` lines; with
+    /// `scrollback` those may reach back into history.
     pub async fn read_screen(
         &self,
         pane: &str,
         scrollback: bool,
         lines: Option<u32>,
     ) -> anyhow::Result<String> {
-        if scrollback {
-            let start = lines.map(|n| -(n as i32)).unwrap_or(-2000);
-            self.capture(pane, false, Some(start)).await
-        } else if let Some(n) = lines {
-            let full = self.capture(pane, false, None).await?;
-            let all: Vec<&str> = split_lines(&full);
-            let from = all.len().saturating_sub(n as usize);
-            Ok(all[from..].join("\n"))
+        let full = if scrollback {
+            let start = lines.map(|n| -(n.min(i32::MAX as u32) as i32)).unwrap_or(-2000);
+            self.capture(pane, false, Some(start)).await?
         } else {
-            self.capture(pane, false, None).await
+            self.capture(pane, false, None).await?
+        };
+        Ok(last_lines(&full, lines))
+    }
+
+    /// `capture-pane -p` over a line range, as tmux takes it: `start`/`end` are
+    /// line numbers (0 is the top of the visible screen, negative reaches into
+    /// history) or `-` for the start of history / end of the screen.
+    pub async fn capture_range(
+        &self,
+        pane: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        escape: bool,
+        join: bool,
+    ) -> anyhow::Result<String> {
+        let mut line = format!("capture-pane -p -t {pane}");
+        if escape {
+            line.push_str(" -e");
         }
+        if join {
+            line.push_str(" -J");
+        }
+        for (flag, v) in [("-S", start), ("-E", end)] {
+            if let Some(v) = v {
+                if !valid_capture_line(v) {
+                    anyhow::bail!("{flag} takes a line number or '-', not {v:?}");
+                }
+                line.push_str(&format!(" {flag} {v}"));
+            }
+        }
+        self.command(line).await
     }
 
     pub async fn display(&self, pane: &str, format: &str) -> anyhow::Result<String> {
@@ -470,6 +497,21 @@ impl Tmux {
 
 /// Split tmux capture output into screen lines, dropping only a single trailing
 /// newline (interior blank lines are kept).
+/// A `capture-pane -S/-E` value: `-` or a (possibly negative) integer.
+pub fn valid_capture_line(v: &str) -> bool {
+    v == "-" || v.parse::<i64>().is_ok()
+}
+
+/// Drop blank lines at the end, then keep the last `n` lines if asked.
+fn last_lines(s: &str, n: Option<u32>) -> String {
+    let mut all = split_lines(s);
+    while all.last().is_some_and(|l| l.trim().is_empty()) {
+        all.pop();
+    }
+    let from = n.map(|n| all.len().saturating_sub(n as usize)).unwrap_or(0);
+    all[from..].join("\n")
+}
+
 fn split_lines(s: &str) -> Vec<&str> {
     let trimmed = s.strip_suffix('\n').unwrap_or(s);
     if trimmed.is_empty() {
@@ -837,6 +879,25 @@ mod tests {
             .await
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn last_lines_trims_blank_rows_then_takes_the_tail() {
+        let screen = "a\nb\nc\n\n   \n\n";
+        assert_eq!(last_lines(screen, None), "a\nb\nc");
+        assert_eq!(last_lines(screen, Some(2)), "b\nc");
+        assert_eq!(last_lines(screen, Some(10)), "a\nb\nc");
+        assert_eq!(last_lines("\n\n", Some(3)), "");
+    }
+
+    #[test]
+    fn capture_line_values_are_validated() {
+        for ok in ["-", "0", "-100", "42"] {
+            assert!(valid_capture_line(ok), "{ok}");
+        }
+        for bad in ["", "--", "1;kill-server", "abc", "-1 -e"] {
+            assert!(!valid_capture_line(bad), "{bad}");
+        }
     }
 
     /// Regression for review #1: a chunk of non-UTF-8 output must not kill the

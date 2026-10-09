@@ -23,44 +23,64 @@ pub const WORKSPACE_LIST: &str = "workspace.list"; // {} -> {workspaces: [..]}
 pub const WORKSPACE_SELECT: &str = "workspace.select"; // {workspace}
 pub const WORKSPACE_RENAME: &str = "workspace.rename"; // {workspace?, title}
 pub const WORKSPACE_CLOSE: &str = "workspace.close"; // {workspace, if_idle?} -> Busy error as for surface.close
-pub const WORKSPACE_MOVE: &str = "workspace.move"; // {workspace, folder?: Ref|null, index?}
+pub const WORKSPACE_MOVE: &str = "workspace.move"; // {workspace, folder?: Ref|null, index?, before?, after?} (before/after: next to that workspace, in its folder)
+pub const WORKSPACE_CURRENT: &str = "workspace.current"; // {} -> {workspace} (the caller's, else the selected one)
 
 // --- panes & surfaces ---
-pub const SPLIT_NEW: &str = "pane.split"; // {side: SplitSide, surface?, type?: "terminal"|"browser", url?, command?, cwd?} -> {pane, surface}
+pub const SPLIT_NEW: &str = "pane.split"; // {side: SplitSide, surface?, workspace?, type?: "terminal"|"browser", url?, command?, cwd?, focus?: bool} -> {pane, surface} (focus: false keeps the focused pane)
 pub const PANE_LIST: &str = "pane.list"; // {workspace?} -> {panes: [..]}
+pub const PANE_SURFACES: &str = "pane.surfaces"; // {pane?, workspace?} -> {workspace, pane, surfaces: [{id, title, type, selected, url?}]}
 pub const PANE_FOCUS: &str = "pane.focus"; // {pane}
 pub const PANE_RESIZE: &str = "pane.resize"; // {pane, ratio}
-pub const SURFACE_NEW: &str = "surface.new"; // {pane?, type?, url?, command?, cwd?} -> {surface} (new tab in pane)
+pub const SURFACE_NEW: &str = "surface.new"; // {pane?, workspace?, type?, url?, command?, cwd?, focus?: bool} -> {surface} (new tab in pane)
 pub const SURFACE_CLOSE: &str = "surface.close"; // {surface?, if_idle?} -> Busy error naming the program when if_idle and one runs
 pub const SURFACE_RENAME: &str = "surface.rename"; // {surface?, title}
 // Drag-and-drop rearranging in the client. Together these cover dragging a tab
 // within its strip, onto another pane, and onto a pane's edge to make a split.
-pub const SURFACE_MOVE: &str = "surface.move"; // {surface, pane, index?} -> {pane} (move a tab to another pane, or reorder it within its own; a pane left empty is removed and its split collapses; `index` defaults to the end)
+// `surface.move`: {surface, pane?, workspace?, index?, before?, after?} -> {pane, workspace}.
+// Move a tab to another pane, in any workspace, or reorder it within its own.
+// `pane` defaults to `workspace`'s focused pane, else the tab's own pane;
+// `before`/`after` name a tab to sit next to. A pane left empty is removed and
+// its split collapses; a workspace left empty closes. `index` defaults to the end.
+pub const SURFACE_MOVE: &str = "surface.move";
+pub const SURFACE_MOVE_TO_NEW_WORKSPACE: &str = "surface.move_to_new_workspace"; // {surface?, title?, focus?: bool} -> {workspace, pane, surface} (the tab keeps running; the new workspace sits after its old one)
 pub const SURFACE_SPLIT: &str = "surface.split"; // {surface, side: SplitSide, pane?} -> {pane} (move an existing tab into a new pane split off `pane`, or off the tab's own pane when `pane` is absent, on `side`; a source pane left empty collapses)
 pub const PANE_SWAP: &str = "pane.swap"; // {pane, other} -> {} (exchange two panes' positions in the workspace layout)
 
 // --- terminal control ---
 pub const TERM_SEND: &str = "term.send"; // {surface?, text} (text is sent literally; "\n" is Enter)
 pub const TERM_SEND_KEY: &str = "term.send_key"; // {surface?, key} e.g. "enter", "ctrl+c", "escape", "up"
-pub const TERM_READ_SCREEN: &str = "term.read_screen"; // {surface?, scrollback?: bool, lines?: u32} -> {text}
+// `term.read_screen`: {surface?, scrollback?: bool, lines?: u32, start?, end?, escape?: bool, join?: bool} -> {text}.
+// `lines` keeps the last n lines (with `scrollback`, reaching into history).
+// `start`/`end` are tmux capture-pane -S/-E values (a line number or "-") and
+// take over from scrollback/lines.
+pub const TERM_READ_SCREEN: &str = "term.read_screen";
 pub const TERM_CLEAR_HISTORY: &str = "term.clear_history"; // {surface?}
 
 // --- agent awareness ---
 pub const NOTIFY: &str = "notify.create"; // {title, subtitle?, body?, workspace?, surface?} -> {id}
 pub const NOTIFY_LIST: &str = "notify.list"; // {} -> {notifications: [..]}
-pub const NOTIFY_CLEAR: &str = "notify.clear"; // {id? | workspace?}
-pub const NOTIFY_MARK_READ: &str = "notify.mark_read"; // {id? | workspace?}
+pub const NOTIFY_CLEAR: &str = "notify.clear"; // {id? | all_read?: bool | workspace?, surface?} (no selector: the caller's workspace, else all)
+pub const NOTIFY_MARK_READ: &str = "notify.mark_read"; // {id? | all?: bool | workspace?, surface?}
+pub const NOTIFY_JUMP_TO_UNREAD: &str = "notify.jump_to_unread"; // {id?} -> {id?, workspace?, surface?} (select the newest unread notification's workspace and tab, or the one named by `id`; empty when there is none)
 pub const STATUS_SET: &str = "status.set"; // {key, value, icon?, color?, workspace?}
 pub const STATUS_CLEAR: &str = "status.clear"; // {key, workspace?}
+pub const STATUS_LIST: &str = "status.list"; // {workspace?} -> {workspace, status: [StatusPill], progress?}
 pub const PROGRESS_SET: &str = "progress.set"; // {value, label?, workspace?}
 pub const PROGRESS_CLEAR: &str = "progress.clear"; // {workspace?}
 pub const LOG: &str = "log.append"; // {message, level?, source?, workspace?}
 pub const LOG_LIST: &str = "log.list"; // {workspace?, limit?} -> {entries: [..]}
+pub const LOG_CLEAR: &str = "log.clear"; // {} (entries carry no workspace, so this clears them all)
 pub const AGENT_STATE: &str = "agent.state"; // {state: AgentState, summary?, workspace?} (called by Claude Code hooks)
 pub const AGENT_SESSION: &str = "agent.session"; // {surface, agent, id, cwd?, source?} (SessionStart hook; resumed after a tmux restart)
 
 // --- browser (implemented by lmux-browser, routed by the daemon) ---
-pub const BROWSER_OPEN: &str = "browser.open"; // {url?, side?: SplitSide, surface?} -> {surface}
+// `browser.open`: {url?, side?: SplitSide, surface?, workspace?, focus?: bool} -> {surface, pane, workspace}.
+// Splits off `surface`'s pane, else the caller's, else the workspace's focused
+// pane; with no workspace at all the browser opens in a new one.
+// Every other `browser.*` method without an explicit `surface` acts on a
+// browser in the caller's workspace (its focused one, else the newest).
+pub const BROWSER_OPEN: &str = "browser.open";
 pub const BROWSER_GOTO: &str = "browser.goto"; // {surface?, url}
 pub const BROWSER_BACK: &str = "browser.back"; // {surface?}
 pub const BROWSER_FORWARD: &str = "browser.forward"; // {surface?}

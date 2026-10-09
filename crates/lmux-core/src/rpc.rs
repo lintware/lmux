@@ -78,7 +78,64 @@ fn move_err(e: crate::tree::MoveError) -> RpcError {
             code: RpcErrorCode::InvalidParams,
             message: "surface and pane are in different workspaces".into(),
         },
+        OnlySurface => RpcError {
+            code: RpcErrorCode::InvalidParams,
+            message: "the surface is the only one in its workspace".into(),
+        },
     }
+}
+
+fn not_found(msg: impl Into<String>) -> RpcError {
+    RpcError {
+        code: RpcErrorCode::NotFound,
+        message: msg.into(),
+    }
+}
+
+/// Where `surface.move` puts a surface: `(pane, index)`. `before`/`after` name
+/// a tab to sit next to; else `pane`; else `workspace`'s focused pane; else the
+/// surface's own pane (a reorder).
+fn move_target(
+    state: &crate::tree::SessionState,
+    surface: &str,
+    params: &Value,
+) -> Result<(Ref, Option<usize>), RpcError> {
+    let anchor = s(params, "before")
+        .map(|a| (a, 0))
+        .or_else(|| s(params, "after").map(|a| (a, 1)));
+    if let Some((a, after)) = anchor {
+        let pane = state
+            .pane_of_surface(&a)
+            .ok_or_else(|| not_found(format!("surface {a} not found")))?;
+        let (wi, pi) = state.locate_pane(&pane).ok_or_else(|| not_found("pane not found"))?;
+        // Positions as they will be once the moving tab has left.
+        let pos = state.workspaces[wi].panes[pi]
+            .surfaces
+            .iter()
+            .filter(|x| x.id != surface)
+            .position(|x| x.id == a)
+            .ok_or_else(|| not_found(format!("surface {a} not found")))?;
+        return Ok((pane, Some(pos + after)));
+    }
+    let index = u(params, "index").map(|n| n as usize);
+    if let Some(p) = s(params, "pane") {
+        return Ok((p, index));
+    }
+    if let Some(ws) = s(params, "workspace") {
+        let w = state
+            .workspace(&ws)
+            .ok_or_else(|| not_found(format!("workspace {ws} not found")))?;
+        let pane = w
+            .focused_pane
+            .clone()
+            .or_else(|| w.panes.first().map(|p| p.id.clone()))
+            .ok_or_else(|| not_found("workspace has no pane"))?;
+        return Ok((pane, index));
+    }
+    let own = state
+        .pane_of_surface(surface)
+        .ok_or_else(|| not_found("surface not found"))?;
+    Ok((own, index))
 }
 
 fn resolve_workspace(state: &crate::tree::SessionState, params: &Value) -> Option<Ref> {
@@ -91,13 +148,15 @@ fn resolve_workspace(state: &crate::tree::SessionState, params: &Value) -> Optio
             None
         };
     }
-    if let Some(w) = s(params, "caller_workspace") {
-        if state.workspace(&w).is_some() {
+    // The caller's surface wins over its workspace env var: a tab moved to
+    // another workspace keeps the `LMUX_WORKSPACE_ID` it was started with.
+    if let Some(surf) = s(params, "caller_surface") {
+        if let Some(w) = state.workspace_of_surface(&surf) {
             return Some(w);
         }
     }
-    if let Some(surf) = s(params, "caller_surface") {
-        if let Some(w) = state.workspace_of_surface(&surf) {
+    if let Some(w) = s(params, "caller_workspace") {
+        if state.workspace(&w).is_some() {
             return Some(w);
         }
     }
@@ -117,13 +176,179 @@ fn resolve_surface(state: &crate::tree::SessionState, params: &Value) -> Option<
             None
         };
     }
-    if let Some(surf) = s(params, "caller_surface") {
-        if state.surface(&surf).is_some() {
-            return Some(surf);
+    // An explicit workspace means its focused surface, not the caller's.
+    if s(params, "workspace").is_none() {
+        if let Some(surf) = s(params, "caller_surface") {
+            if state.surface(&surf).is_some() {
+                return Some(surf);
+            }
         }
     }
     let ws = resolve_workspace(state, params)?;
     state.focused_surface(&ws)
+}
+
+/// The surface a `browser.*` call acts on. An explicit `surface` is used as
+/// is. Otherwise the caller is usually an agent in a terminal, so a resolved
+/// terminal gives way to a browser in the same workspace: the focused pane's
+/// active browser, else the active browser of any pane, else the newest one.
+fn resolve_browser_surface(state: &crate::tree::SessionState, params: &Value) -> Option<Ref> {
+    let surf = resolve_surface(state, params);
+    if s(params, "surface").is_some() {
+        return surf;
+    }
+    if let Some(surf) = &surf {
+        if surface_is_browser(state, surf) {
+            return Some(surf.clone());
+        }
+    }
+    let ws = surf
+        .as_ref()
+        .and_then(|x| state.workspace_of_surface(x))
+        .or_else(|| resolve_workspace(state, params));
+    let Some(w) = ws.as_ref().and_then(|ws| state.workspace(ws)) else {
+        return surf;
+    };
+    let is_browser = |id: &str| surface_is_browser(state, id);
+    let focused = w
+        .focused_pane
+        .as_ref()
+        .and_then(|p| w.panes.iter().find(|x| &x.id == p))
+        .and_then(|p| p.active_surface.clone())
+        .filter(|x| is_browser(x));
+    let active = || {
+        w.panes
+            .iter()
+            .filter_map(|p| p.active_surface.clone())
+            .filter(|x| is_browser(x))
+            .last()
+    };
+    let newest = || {
+        w.panes
+            .iter()
+            .flat_map(|p| p.surfaces.iter())
+            .filter(|x| matches!(x.kind, SurfaceKind::Browser { .. }))
+            .max_by_key(|x| ref_number(&x.id))
+            .map(|x| x.id.clone())
+    };
+    focused.or_else(active).or_else(newest).or(surf)
+}
+
+/// Which notifications a clear / mark-read acts on.
+#[derive(Debug, PartialEq)]
+enum NotifySelector {
+    Id(String),
+    All,
+    /// Only those already read (`dismiss-notification --all-read`).
+    Read,
+    Workspace { workspace: Ref, surface: Option<Ref> },
+}
+
+impl NotifySelector {
+    /// `id`, then the `all_key` flag (`all` or `all_read`), then a workspace:
+    /// the explicit one, else the caller's. With none of those, all of them.
+    fn from_params(state: &crate::tree::SessionState, params: &Value, all_key: &str) -> Self {
+        if let Some(nid) = s(params, "id") {
+            return NotifySelector::Id(nid);
+        }
+        if b(params, all_key).unwrap_or(false) {
+            return if all_key == "all_read" { NotifySelector::Read } else { NotifySelector::All };
+        }
+        let ws = s(params, "workspace")
+            .or_else(|| s(params, "caller_surface").and_then(|x| state.workspace_of_surface(&x)))
+            .or_else(|| s(params, "caller_workspace"));
+        match ws {
+            Some(workspace) => NotifySelector::Workspace {
+                workspace,
+                surface: s(params, "surface"),
+            },
+            None => NotifySelector::All,
+        }
+    }
+
+    fn matches(&self, n: &Notification) -> bool {
+        match self {
+            NotifySelector::Id(id) => &n.id == id,
+            NotifySelector::All => true,
+            NotifySelector::Read => n.read,
+            NotifySelector::Workspace { workspace, surface } => {
+                n.workspace.as_deref() == Some(workspace.as_str())
+                    && surface.as_ref().is_none_or(|x| n.surface.as_deref() == Some(x.as_str()))
+            }
+        }
+    }
+}
+
+/// Recompute every workspace's unread badge from the notification list.
+fn recount_unread(state: &mut crate::tree::SessionState) {
+    let mut counts: std::collections::HashMap<Ref, u32> = std::collections::HashMap::new();
+    for n in state.notifications.iter().filter(|n| !n.read) {
+        if let Some(w) = &n.workspace {
+            *counts.entry(w.clone()).or_default() += 1;
+        }
+    }
+    for w in &mut state.workspaces {
+        w.unread_notifications = counts.get(&w.id).copied().unwrap_or(0);
+    }
+}
+
+/// A fresh browser surface (its page is created by the backend).
+fn browser_surface(id: Ref, url: Option<&str>) -> Surface {
+    Surface {
+        id,
+        title: url.unwrap_or("browser").to_string(),
+        kind: SurfaceKind::Browser {
+            url: url.unwrap_or("about:blank").to_string(),
+            loading: false,
+            can_go_back: false,
+            can_go_forward: false,
+        },
+    }
+}
+
+/// A workspace's focus: its focused pane and every pane's active tab.
+type FocusSnapshot = (Ref, Option<Ref>, Vec<(Ref, Option<Ref>)>);
+
+fn focus_snapshot(state: &crate::tree::SessionState, ws: &str) -> Option<FocusSnapshot> {
+    let w = state.workspace(ws)?;
+    Some((
+        ws.to_string(),
+        w.focused_pane.clone(),
+        w.panes.iter().map(|p| (p.id.clone(), p.active_surface.clone())).collect(),
+    ))
+}
+
+/// Put back a [`focus_snapshot`], for creates asked to leave focus alone.
+fn restore_focus(state: &mut crate::tree::SessionState, snap: FocusSnapshot) {
+    let (ws, focused, actives) = snap;
+    let Some(w) = state.workspace_mut(&ws) else { return };
+    if focused.as_ref().is_some_and(|p| w.panes.iter().any(|x| &x.id == p)) {
+        w.focused_pane = focused;
+    }
+    for (pane, active) in actives {
+        if let Some(p) = w.panes.iter_mut().find(|p| p.id == pane) {
+            if active.as_ref().is_some_and(|a| p.surfaces.iter().any(|x| &x.id == a)) {
+                p.active_surface = active;
+            }
+        }
+    }
+}
+
+/// Re-tag a terminal's tmux window with its workspace after a move, so a
+/// daemon that lost its state file adopts it into the right one.
+async fn retag_workspace(inner: &Arc<Inner>, surface: &str) {
+    let (term, ws) = {
+        let state = inner.state.lock().await;
+        (state.term_cloned(surface), state.workspace_of_surface(surface))
+    };
+    if let (Some(term), Some(ws)) = (term, ws) {
+        let _ = inner.tmux.set_window_option(&term.window, "@lmux_workspace", &ws).await;
+    }
+}
+
+/// The number in a ref like `surface:12`, for "newest" ordering.
+fn ref_number(r: &str) -> u64 {
+    r.rsplit(':').next().and_then(|n| n.parse().ok()).unwrap_or(0)
 }
 
 fn resolve_pane(state: &crate::tree::SessionState, params: &Value) -> Option<Ref> {
@@ -238,6 +463,27 @@ pub(crate) async fn spawn_terminal_env(
 }
 
 pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
+    // Creates move focus to what they make, unless asked not to (`focus: false`,
+    // cmux's `--focus false`): then the workspace's focus is put back after.
+    let creates = [methods::SPLIT_NEW, methods::SURFACE_NEW, methods::BROWSER_OPEN];
+    let snap = if b(&req.params, "focus") == Some(false) && creates.contains(&req.method.as_str()) {
+        let state = inner.state.lock().await;
+        resolve_pane(&state, &req.params)
+            .and_then(|p| state.locate_pane(&p).map(|(wi, _)| state.workspaces[wi].id.clone()))
+            .or_else(|| resolve_workspace(&state, &req.params))
+            .and_then(|ws| focus_snapshot(&state, &ws))
+    } else {
+        None
+    };
+    let resp = dispatch_inner(inner, req).await;
+    if let (Some(snap), None) = (snap, &resp.error) {
+        restore_focus(&mut *inner.state.lock().await, snap);
+        inner.tree_changed();
+    }
+    resp
+}
+
+async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
     let id = req.id;
     let params = &req.params;
     match req.method.as_str() {
@@ -514,32 +760,55 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
                 _ => None,
             };
             let index = u(params, "index").map(|n| n as usize);
-            inner
-                .state
-                .lock()
-                .await
-                .move_workspace(&ws, folder, index);
+            let anchor = s(params, "before")
+                .map(|a| (a, 0))
+                .or_else(|| s(params, "after").map(|a| (a, 1)));
+            {
+                let mut state = inner.state.lock().await;
+                match anchor {
+                    // Next to another workspace, joining its folder.
+                    Some((a, after)) => {
+                        let (Some(cur), Some(at)) = (state.workspace_index(&ws), state.workspace_index(&a)) else {
+                            return err(id, RpcErrorCode::NotFound, format!("workspace {a} not found"));
+                        };
+                        if a != ws {
+                            let folder = state.workspaces[at].folder.clone();
+                            let at = if cur < at { at - 1 } else { at } + after;
+                            state.move_workspace(&ws, folder, Some(at));
+                        }
+                    }
+                    None => {
+                        state.move_workspace(&ws, folder, index);
+                    }
+                }
+            }
             inner.tree_changed();
             inner.mark_dirty();
             ok(id, json!({"workspace": ws}))
+        }
+        methods::WORKSPACE_CURRENT => {
+            let state = inner.state.lock().await;
+            match resolve_workspace(&state, params) {
+                Some(ws) => ok(id, json!({"workspace": ws})),
+                None => err(id, RpcErrorCode::NotFound, "no workspace"),
+            }
         }
 
         // --- panes / surfaces ---------------------------------------------
         methods::SPLIT_NEW => {
             let side = parse_side(params);
             let kind = s(params, "type").unwrap_or_else(|| "terminal".to_string());
-            let ws = {
+            // The new pane joins the workspace of the pane it splits off, which
+            // an explicit surface or pane decides.
+            let (ws, target_pane) = {
                 let state = inner.state.lock().await;
-                resolve_workspace(&state, params)
+                let pane = resolve_pane(&state, params);
+                let ws = pane
+                    .as_ref()
+                    .and_then(|p| state.locate_pane(p).map(|(wi, _)| state.workspaces[wi].id.clone()));
+                (ws, pane)
             };
-            let Some(ws) = ws else {
-                return err(id, RpcErrorCode::NotFound, "no workspace");
-            };
-            let target_pane = {
-                let state = inner.state.lock().await;
-                resolve_pane(&state, params)
-            };
-            let Some(target_pane) = target_pane else {
+            let (Some(ws), Some(target_pane)) = (ws, target_pane) else {
                 return err(id, RpcErrorCode::NotFound, "no target pane");
             };
             split_impl(inner, id, &ws, &target_pane, side, &kind, params).await
@@ -551,7 +820,37 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
                 return ok(id, json!({"panes": []}));
             };
             let panes = state.workspace(&ws).map(|w| w.panes.clone()).unwrap_or_default();
-            ok(id, json!({"panes": panes}))
+            let focused = state.workspace(&ws).and_then(|w| w.focused_pane.clone());
+            ok(id, json!({"workspace": ws, "focused_pane": focused, "panes": panes}))
+        }
+        methods::PANE_SURFACES => {
+            let state = inner.state.lock().await;
+            let Some(pane) = resolve_pane(&state, params) else {
+                return err(id, RpcErrorCode::NotFound, "pane not found");
+            };
+            let Some((wi, pi)) = state.locate_pane(&pane) else {
+                return err(id, RpcErrorCode::NotFound, "pane not found");
+            };
+            let p = &state.workspaces[wi].panes[pi];
+            let surfaces: Vec<Value> = p
+                .surfaces
+                .iter()
+                .map(|x| {
+                    let selected = p.active_surface.as_deref() == Some(x.id.as_str());
+                    match &x.kind {
+                        SurfaceKind::Terminal { .. } => json!({
+                            "id": x.id, "title": x.title, "type": "terminal", "selected": selected,
+                        }),
+                        SurfaceKind::Browser { url, .. } => json!({
+                            "id": x.id, "title": x.title, "type": "browser", "selected": selected, "url": url,
+                        }),
+                    }
+                })
+                .collect();
+            ok(
+                id,
+                json!({"workspace": state.workspaces[wi].id, "pane": pane, "surfaces": surfaces}),
+            )
         }
         methods::PANE_FOCUS => {
             let Some(pane) = s(params, "pane") else {
@@ -654,25 +953,66 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
         // --- drag-and-drop rearranging ------------------------------------
         methods::SURFACE_MOVE => {
             let surface = {
+                // `workspace` names the destination here, not where the tab is.
+                let mut own = params.clone();
+                if let Some(o) = own.as_object_mut() {
+                    o.remove("workspace");
+                }
                 let state = inner.state.lock().await;
-                resolve_surface(&state, params)
+                resolve_surface(&state, &own)
             };
             let Some(surface) = surface else {
                 return err(id, RpcErrorCode::NotFound, "surface not found");
             };
-            let Some(target_pane) = s(params, "pane") else {
-                return err(id, RpcErrorCode::InvalidParams, "pane required");
-            };
-            let index = u(params, "index").map(|n| n as usize);
             let res = {
                 let mut state = inner.state.lock().await;
-                state.move_surface(&surface, &target_pane, index)
+                let target = match move_target(&state, &surface, params) {
+                    Ok(t) => t,
+                    Err(e) => return RpcResponse { id, result: None, error: Some(e) },
+                };
+                let from = state.workspace_of_surface(&surface);
+                state
+                    .transfer_surface(&surface, &target.0, target.1)
+                    .map(|(pane, _)| (pane, from, state.workspace_of_surface(&surface)))
             };
             match res {
-                Ok(pane) => {
+                Ok((pane, from, to)) => {
+                    if from != to {
+                        retag_workspace(inner, &surface).await;
+                    }
                     inner.tree_changed();
                     inner.mark_dirty();
-                    ok(id, json!({"pane": pane, "surface": surface}))
+                    ok(id, json!({"pane": pane, "surface": surface, "workspace": to}))
+                }
+                Err(e) => RpcResponse {
+                    id,
+                    result: None,
+                    error: Some(move_err(e)),
+                },
+            }
+        }
+        methods::SURFACE_MOVE_TO_NEW_WORKSPACE => {
+            let res = {
+                let mut state = inner.state.lock().await;
+                let Some(surface) = resolve_surface(&state, params) else {
+                    return err(id, RpcErrorCode::NotFound, "surface not found");
+                };
+                state
+                    .surface_to_new_workspace(&surface, v_str(params, "title"))
+                    .map(|(ws, pane)| {
+                        if b(params, "focus").unwrap_or(false) {
+                            state.selected_workspace = Some(ws.clone());
+                        }
+                        (ws, pane, surface)
+                    })
+            };
+            match res {
+                Ok((ws, pane, surface)) => {
+                    retag_workspace(inner, &surface).await;
+                    inner.refresh_branches().await;
+                    inner.tree_changed();
+                    inner.mark_dirty();
+                    ok(id, json!({"workspace": ws, "pane": pane, "surface": surface}))
                 }
                 Err(e) => RpcResponse {
                     id,
@@ -799,9 +1139,31 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
                 return err(id, RpcErrorCode::InvalidParams, "not a terminal surface");
             };
             let scrollback = b(params, "scrollback").unwrap_or(false);
-            let lines = u(params, "lines").map(|n| n as u32);
-            match inner.tmux.read_screen(&term.pane, scrollback, lines).await {
-                Ok(text) => ok(id, json!({"text": text})),
+            let lines = u(params, "lines").map(|n| n.min(u32::MAX as u64) as u32);
+            // tmux capture-pane's -S/-E take a line number or "-".
+            let line_arg = |key: &str| match params.get(key) {
+                Some(Value::String(v)) => Some(v.clone()),
+                Some(Value::Number(n)) => Some(n.to_string()),
+                _ => None,
+            };
+            let (start, end) = (line_arg("start"), line_arg("end"));
+            let escape = b(params, "escape").unwrap_or(false);
+            let join = b(params, "join").unwrap_or(false);
+            let res = if start.is_some() || end.is_some() || escape || join {
+                for v in [&start, &end].into_iter().flatten() {
+                    if !crate::tmux::valid_capture_line(v) {
+                        return err(id, RpcErrorCode::InvalidParams, format!("bad line {v:?}: use a number or '-'"));
+                    }
+                }
+                inner
+                    .tmux
+                    .capture_range(&term.pane, start.as_deref(), end.as_deref(), escape, join)
+                    .await
+            } else {
+                inner.tmux.read_screen(&term.pane, scrollback, lines).await
+            };
+            match res {
+                Ok(text) => ok(id, json!({"text": text, "surface": surface})),
                 Err(e) => err(id, RpcErrorCode::Internal, format!("tmux: {e}")),
             }
         }
@@ -853,85 +1215,82 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             ok(id, json!({"notifications": state.notifications}))
         }
         methods::NOTIFY_CLEAR => {
-            let one = s(params, "id");
-            let ws = s(params, "workspace").or_else(|| s(params, "caller_workspace"));
-            {
+            // Idempotent: `count` says how many went, so a caller that named
+            // one can tell a stale id from a dismissed one.
+            let count = {
                 let mut state = inner.state.lock().await;
-                if let Some(nid) = one {
-                    // Dismiss one notification; an unread one leaves its count.
-                    if let Some(pos) = state.notifications.iter().position(|n| n.id == nid) {
-                        let n = state.notifications.remove(pos);
-                        if let (false, Some(ws)) = (n.read, n.workspace) {
-                            if let Some(w) = state.workspace_mut(&ws) {
-                                w.unread_notifications = w.unread_notifications.saturating_sub(1);
-                            }
-                        }
-                    }
-                } else {
-                match ws {
-                    Some(ws) => {
-                        state
-                            .notifications
-                            .retain(|n| n.workspace.as_deref() != Some(&ws));
-                        if let Some(w) = state.workspace_mut(&ws) {
-                            w.unread_notifications = 0;
-                        }
-                    }
-                    None => {
-                        state.notifications.clear();
-                        for w in &mut state.workspaces {
-                            w.unread_notifications = 0;
-                        }
-                    }
-                }
-                }
-            }
+                let sel = NotifySelector::from_params(&state, params, "all_read");
+                let before = state.notifications.len();
+                state.notifications.retain(|n| !sel.matches(n));
+                recount_unread(&mut state);
+                before - state.notifications.len()
+            };
             inner.tree_changed();
             inner.mark_dirty();
-            ok(id, json!({}))
+            ok(id, json!({"count": count}))
         }
         methods::NOTIFY_MARK_READ => {
-            let id_param = s(params, "id");
-            let ws = s(params, "workspace").or_else(|| s(params, "caller_workspace"));
+            let count = {
+                let mut state = inner.state.lock().await;
+                let sel = NotifySelector::from_params(&state, params, "all");
+                let mut count = 0;
+                for n in state.notifications.iter_mut().filter(|n| sel.matches(n)) {
+                    n.read = true;
+                    count += 1;
+                }
+                recount_unread(&mut state);
+                count
+            };
+            inner.tree_changed();
+            inner.mark_dirty();
+            ok(id, json!({"count": count}))
+        }
+        methods::NOTIFY_JUMP_TO_UNREAD => {
+            let picked = {
+                let state = inner.state.lock().await;
+                match s(params, "id") {
+                    Some(nid) => match state.notifications.iter().find(|n| n.id == nid) {
+                        Some(n) => Some(n.clone()),
+                        None => {
+                            return err(id, RpcErrorCode::NotFound, format!("notification {nid} not found"))
+                        }
+                    },
+                    // The newest unread one whose workspace still exists.
+                    None => state
+                        .notifications
+                        .iter()
+                        .filter(|n| !n.read)
+                        .filter(|n| n.workspace.as_deref().is_some_and(|w| state.workspace(w).is_some()))
+                        .max_by_key(|n| n.created_at)
+                        .cloned(),
+                }
+            };
+            let Some(n) = picked else {
+                return ok(id, json!({}));
+            };
             {
                 let mut state = inner.state.lock().await;
-                match id_param {
-                    Some(nid) => {
-                        if let Some(n) = state.notifications.iter_mut().find(|n| n.id == nid) {
-                            n.read = true;
-                            let ws = n.workspace.clone();
-                            if let Some(ws) = ws {
-                                if let Some(w) = state.workspace_mut(&ws) {
-                                    w.unread_notifications = w.unread_notifications.saturating_sub(1);
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        for n in &mut state.notifications {
-                            let matches = ws
-                                .as_deref()
-                                .map(|w| n.workspace.as_deref() == Some(w))
-                                .unwrap_or(true);
-                            if matches {
-                                n.read = true;
-                            }
-                        }
-                        if let Some(ws) = ws {
-                            if let Some(w) = state.workspace_mut(&ws) {
-                                w.unread_notifications = 0;
-                            }
-                        } else {
-                            for w in &mut state.workspaces {
-                                w.unread_notifications = 0;
-                            }
+                if let Some(ws) = n.workspace.as_deref().filter(|w| state.workspace(w).is_some()) {
+                    // Looking at a workspace reads its notifications, as select does.
+                    let ws = ws.to_string();
+                    state.selected_workspace = Some(ws.clone());
+                    for x in state.notifications.iter_mut() {
+                        if x.workspace.as_deref() == Some(ws.as_str()) {
+                            x.read = true;
                         }
                     }
                 }
+                if let Some(x) = state.notifications.iter_mut().find(|x| x.id == n.id) {
+                    x.read = true;
+                }
+                if let Some(surf) = &n.surface {
+                    state.set_active_surface(surf);
+                }
+                recount_unread(&mut state);
             }
             inner.tree_changed();
             inner.mark_dirty();
-            ok(id, json!({}))
+            ok(id, json!({"id": n.id, "workspace": n.workspace, "surface": n.surface}))
         }
         methods::STATUS_SET => {
             let Some(key) = v_str(params, "key") else {
@@ -1065,6 +1424,21 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             let from = all.len().saturating_sub(limit);
             ok(id, json!({"entries": &all[from..]}))
         }
+        methods::LOG_CLEAR => {
+            inner.state.lock().await.logs.clear();
+            inner.mark_dirty();
+            ok(id, json!({}))
+        }
+        methods::STATUS_LIST => {
+            let state = inner.state.lock().await;
+            let Some(w) = resolve_workspace(&state, params).and_then(|ws| state.workspace(&ws)) else {
+                return err(id, RpcErrorCode::NotFound, "workspace not found");
+            };
+            ok(
+                id,
+                json!({"workspace": w.id, "status": w.status_pills, "progress": w.progress}),
+            )
+        }
         methods::AGENT_SESSION => {
             let Some(surface) = s(params, "surface") else {
                 return err(id, RpcErrorCode::InvalidParams, "surface required");
@@ -1138,16 +1512,22 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
                 return err(id, RpcErrorCode::Unsupported, unsupported(&req.method).message);
             }
             let side = parse_side(params);
-            let ws = {
+            let (ws, target_pane, none_at_all) = {
                 let state = inner.state.lock().await;
-                resolve_workspace(&state, params)
+                // The pane to split off belongs to the workspace it is in, which
+                // an explicit surface decides.
+                let pane = resolve_pane(&state, params);
+                let ws = pane
+                    .as_ref()
+                    .and_then(|p| state.locate_pane(p).map(|(wi, _)| state.workspaces[wi].id.clone()))
+                    .or_else(|| resolve_workspace(&state, params));
+                (ws, pane, state.workspaces.is_empty())
             };
+            if none_at_all && s(params, "workspace").is_none() && s(params, "surface").is_none() {
+                return browser_workspace(inner, id, params).await;
+            }
             let Some(ws) = ws else {
-                return err(id, RpcErrorCode::NotFound, "no workspace");
-            };
-            let target_pane = {
-                let state = inner.state.lock().await;
-                resolve_pane(&state, params)
+                return err(id, RpcErrorCode::NotFound, "workspace not found");
             };
             let Some(target_pane) = target_pane else {
                 return err(id, RpcErrorCode::NotFound, "no target pane");
@@ -1160,7 +1540,7 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             };
             let surface = {
                 let state = inner.state.lock().await;
-                resolve_surface(&state, params)
+                resolve_browser_surface(&state, params)
             };
             let Some(surface) = surface else {
                 return err(id, RpcErrorCode::NotFound, "surface not found");
@@ -1183,7 +1563,54 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
     }
 }
 
-// A browser tab helper that retains the pane (see browser.open).
+/// `browser.open` with no workspace to put it in: a new workspace holding just
+/// the browser.
+async fn browser_workspace(inner: &Arc<Inner>, id: u64, params: &Value) -> RpcResponse {
+    let Some(backend) = inner.browser.clone() else {
+        return err(id, RpcErrorCode::Unsupported, "browser backend not available");
+    };
+    let url = s(params, "url");
+    let (ws_ref, pane_ref, surface_ref) = {
+        let mut state = inner.state.lock().await;
+        let ws_ref = state.next_workspace();
+        let pane_ref = state.next_pane();
+        let surface_ref = state.next_surface();
+        let cwd = default_cwd(params, &state, None);
+        state.add_workspace(Workspace {
+            id: ws_ref.clone(),
+            title: "browser".into(),
+            folder: None,
+            cwd,
+            git_branch: None,
+            agent: AgentState::None,
+            summary: None,
+            unread_notifications: 0,
+            status_pills: vec![],
+            progress: None,
+            layout: Layout::Pane {
+                pane: pane_ref.clone(),
+            },
+            panes: vec![Pane {
+                id: pane_ref.clone(),
+                surfaces: vec![browser_surface(surface_ref.clone(), url.as_deref())],
+                active_surface: Some(surface_ref.clone()),
+            }],
+            focused_pane: Some(pane_ref.clone()),
+        });
+        if state.selected_workspace.is_none() {
+            state.selected_workspace = Some(ws_ref.clone());
+        }
+        (ws_ref, pane_ref, surface_ref)
+    };
+    if let Err(e) = backend.create_surface(&surface_ref, url.as_deref()).await {
+        // Removing its only surface closes the workspace too.
+        inner.state.lock().await.remove_surface(&surface_ref);
+        return err(id, RpcErrorCode::Internal, format!("browser: {e}"));
+    }
+    inner.tree_changed();
+    inner.mark_dirty();
+    ok(id, json!({"workspace": ws_ref, "pane": pane_ref, "surface": surface_ref}))
+}
 
 async fn split_impl(
     inner: &Arc<Inner>,
@@ -1213,20 +1640,11 @@ async fn split_impl(
             return err(id, RpcErrorCode::Unsupported, "browser backend not available");
         }
         let url = s(params, "url");
-        let surface_ref = {
+        let (surface_ref, pane_ref) = {
             let mut state = inner.state.lock().await;
             let surface_ref = state.next_surface();
             let pane_ref = state.next_pane();
-            let surface = Surface {
-                id: surface_ref.clone(),
-                title: url.clone().unwrap_or_else(|| "browser".to_string()),
-                kind: SurfaceKind::Browser {
-                    url: url.clone().unwrap_or_else(|| "about:blank".to_string()),
-                    loading: false,
-                    can_go_back: false,
-                    can_go_forward: false,
-                },
-            };
+            let surface = browser_surface(surface_ref.clone(), url.as_deref());
             let pane = Pane {
                 id: pane_ref.clone(),
                 surfaces: vec![surface],
@@ -1237,7 +1655,7 @@ async fn split_impl(
             }
             state.split_pane(ws, target_pane, side, &pane_ref);
             state.workspace_mut(ws).unwrap().focused_pane = Some(pane_ref.clone());
-            surface_ref
+            (surface_ref, pane_ref)
         };
         let backend = inner.browser.as_ref().unwrap();
         if let Err(e) = backend.create_surface(&surface_ref, url.as_deref()).await {
@@ -1246,7 +1664,7 @@ async fn split_impl(
         }
         inner.tree_changed();
         inner.mark_dirty();
-        return ok(id, json!({"surface": surface_ref}));
+        return ok(id, json!({"surface": surface_ref, "pane": pane_ref, "workspace": ws}));
     }
 
     let (surface_ref, pane_ref, title, command) = {
@@ -1307,16 +1725,7 @@ async fn add_surface_impl(
         let surface_ref = {
             let mut state = inner.state.lock().await;
             let surface_ref = state.next_surface();
-            let surface = Surface {
-                id: surface_ref.clone(),
-                title: url.clone().unwrap_or_else(|| "browser".to_string()),
-                kind: SurfaceKind::Browser {
-                    url: url.clone().unwrap_or_else(|| "about:blank".to_string()),
-                    loading: false,
-                    can_go_back: false,
-                    can_go_forward: false,
-                },
-            };
+            let surface = browser_surface(surface_ref.clone(), url.as_deref());
             state.add_surface(pane, surface);
             surface_ref
         };
@@ -1513,5 +1922,132 @@ mod tests {
             resolve_surface(&s, &json!({"caller_surface": "surface:1"})).as_deref(),
             Some("surface:1")
         );
+    }
+
+    /// `state()` plus a second workspace whose pane holds a terminal and a
+    /// browser; returns (state, ws2, pane2, terminal, browser).
+    fn two_workspaces() -> (SessionState, Ref, Ref, Ref, Ref) {
+        let mut s = state();
+        let ws = s.next_workspace();
+        let pane = s.next_pane();
+        let term = s.next_surface();
+        let web = s.next_surface();
+        s.add_workspace(Workspace {
+            id: ws.clone(),
+            title: "w2".into(),
+            folder: None,
+            cwd: "/tmp".into(),
+            git_branch: None,
+            agent: AgentState::None,
+            summary: None,
+            unread_notifications: 0,
+            status_pills: vec![],
+            progress: None,
+            layout: Layout::Pane { pane: pane.clone() },
+            panes: vec![Pane {
+                id: pane.clone(),
+                surfaces: vec![
+                    terminal_surface(term.clone(), "t", 80, 24),
+                    browser_surface(web.clone(), Some("https://example.com")),
+                ],
+                active_surface: Some(term.clone()),
+            }],
+            focused_pane: Some(pane.clone()),
+        });
+        (s, ws, pane, term, web)
+    }
+
+    #[test]
+    fn caller_surface_beats_a_stale_workspace_env() {
+        let (s, ws2, _, term, _) = two_workspaces();
+        // A tab moved to workspace 2 still carries LMUX_WORKSPACE_ID=workspace:1.
+        let p = json!({"caller_workspace": "workspace:1", "caller_surface": term});
+        assert_eq!(resolve_workspace(&s, &p).as_deref(), Some(ws2.as_str()));
+    }
+
+    #[test]
+    fn explicit_workspace_beats_the_caller_surface() {
+        let (s, ws2, _, term, _) = two_workspaces();
+        let p = json!({"workspace": "workspace:1", "caller_surface": term});
+        assert_eq!(resolve_surface(&s, &p).as_deref(), Some("surface:1"));
+        let p = json!({"workspace": ws2, "caller_surface": "surface:1"});
+        assert_eq!(resolve_surface(&s, &p).as_deref(), Some(term.as_str()));
+    }
+
+    #[test]
+    fn browser_calls_from_a_terminal_find_the_workspace_browser() {
+        let (s, _, _, term, web) = two_workspaces();
+        let p = json!({"caller_surface": term});
+        assert_eq!(resolve_browser_surface(&s, &p).as_deref(), Some(web.as_str()));
+        // An explicit surface is never second-guessed.
+        let p = json!({"caller_surface": term, "surface": term});
+        assert_eq!(resolve_browser_surface(&s, &p).as_deref(), Some(term.as_str()));
+        // No browser in the workspace: the terminal stands, and the backend
+        // answers for it.
+        let p = json!({"caller_surface": "surface:1"});
+        assert_eq!(resolve_browser_surface(&s, &p).as_deref(), Some("surface:1"));
+    }
+
+    #[test]
+    fn move_target_places_next_to_an_anchor() {
+        let (s, ws2, pane2, term, web) = two_workspaces();
+        // Before the browser, as seen once the moving tab has left the pane.
+        let t = move_target(&s, "surface:1", &json!({"before": web})).unwrap();
+        assert_eq!(t, (pane2.clone(), Some(1)));
+        let t = move_target(&s, "surface:1", &json!({"after": web})).unwrap();
+        assert_eq!(t, (pane2.clone(), Some(2)));
+        let t = move_target(&s, &term, &json!({"after": web})).unwrap();
+        assert_eq!(t, (pane2.clone(), Some(1)));
+        // A workspace means its focused pane; nothing means the tab's own pane.
+        let t = move_target(&s, "surface:1", &json!({"workspace": ws2, "index": 0})).unwrap();
+        assert_eq!(t, (pane2, Some(0)));
+        let t = move_target(&s, "surface:1", &json!({})).unwrap();
+        assert_eq!(t, ("pane:1".to_string(), None));
+        assert!(move_target(&s, "surface:1", &json!({"before": "surface:99"})).is_err());
+    }
+
+    #[test]
+    fn notify_selectors() {
+        let (mut s, ws2, _, term, _) = two_workspaces();
+        let n = |id: &str, ws: &str, surface: Option<&str>, read: bool| Notification {
+            id: id.into(),
+            title: "t".into(),
+            subtitle: None,
+            body: None,
+            workspace: Some(ws.into()),
+            surface: surface.map(Into::into),
+            created_at: 0,
+            read,
+        };
+        let a = n("a", "workspace:1", None, false);
+        let b2 = n("b", &ws2, Some(&term), true);
+        let c = n("c", &ws2, None, false);
+        let sel = NotifySelector::from_params(&s, &json!({"id": "a"}), "all");
+        assert!(sel.matches(&a) && !sel.matches(&b2));
+        let sel = NotifySelector::from_params(&s, &json!({"all_read": true}), "all_read");
+        assert!(!sel.matches(&a) && sel.matches(&b2));
+        // The caller's workspace comes from its surface.
+        let sel = NotifySelector::from_params(&s, &json!({"caller_surface": term}), "all");
+        assert!(!sel.matches(&a) && sel.matches(&b2) && sel.matches(&c));
+        let sel = NotifySelector::from_params(&s, &json!({"workspace": ws2, "surface": term}), "all");
+        assert!(sel.matches(&b2) && !sel.matches(&c));
+        assert_eq!(NotifySelector::from_params(&s, &json!({}), "all"), NotifySelector::All);
+
+        s.notifications = vec![a, b2, c];
+        recount_unread(&mut s);
+        assert_eq!(s.workspace("workspace:1").unwrap().unread_notifications, 1);
+        assert_eq!(s.workspace(&ws2).unwrap().unread_notifications, 1);
+    }
+
+    #[test]
+    fn focus_is_restored_after_a_create() {
+        let (mut s, ws2, pane2, term, web) = two_workspaces();
+        let snap = focus_snapshot(&s, &ws2).unwrap();
+        s.workspace_mut(&ws2).unwrap().focused_pane = Some("pane:missing".into());
+        s.set_active_surface(&web);
+        restore_focus(&mut s, snap);
+        let w = s.workspace(&ws2).unwrap();
+        assert_eq!(w.focused_pane.as_deref(), Some(pane2.as_str()));
+        assert_eq!(w.panes[0].active_surface.as_deref(), Some(term.as_str()));
     }
 }
