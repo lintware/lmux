@@ -28,6 +28,8 @@ use crate::tree::{terminal_surface, AgentSession, SessionState, TermMeta};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub state_dir: PathBuf,
+    /// The unix socket to listen on; `<state_dir>/lmux.sock` when unset.
+    pub socket: Option<PathBuf>,
     pub tmux_socket: String,
     pub ws_addr: String,
     pub host: String,
@@ -37,6 +39,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             state_dir: crate::default_state_dir(),
+            socket: None,
             tmux_socket: "lmux".to_string(),
             ws_addr: crate::default_ws_addr(),
             host: hostname(),
@@ -46,7 +49,7 @@ impl Default for Config {
 
 impl Config {
     pub fn socket_path(&self) -> PathBuf {
-        self.state_dir.join("lmux.sock")
+        self.socket.clone().unwrap_or_else(|| self.state_dir.join("lmux.sock"))
     }
     pub fn state_path(&self) -> PathBuf {
         self.state_dir.join("state.json")
@@ -1738,13 +1741,17 @@ mod tests {
 
     #[test]
     fn config_paths() {
-        let cfg = Config {
+        let mut cfg = Config {
             state_dir: PathBuf::from("/tmp/lmux-test"),
+            socket: None,
             tmux_socket: "s".into(),
             ws_addr: "127.0.0.1:1".into(),
             host: "h".into(),
         };
         assert_eq!(cfg.socket_path(), PathBuf::from("/tmp/lmux-test/lmux.sock"));
+        // An explicit socket wins over the state directory.
+        cfg.socket = Some(PathBuf::from("/tmp/s.sock"));
+        assert_eq!(cfg.socket_path(), PathBuf::from("/tmp/s.sock"));
         assert_eq!(cfg.state_path(), PathBuf::from("/tmp/lmux-test/state.json"));
     }
 
@@ -1886,6 +1893,7 @@ mod tests {
         let inner = Arc::new(Inner {
             cfg: Config {
                 state_dir: state_dir.path().to_path_buf(),
+                socket: None,
                 tmux_socket: socket.clone(),
                 ws_addr: "127.0.0.1:1".into(),
                 host: "t".into(),

@@ -688,6 +688,11 @@ impl AppState {
         let Some(w) = self.workspace(id) else { return };
         let id = w.id.clone();
         self.activated = true;
+        // Looking at a workspace reads its notifications (the daemon does the
+        // same on workspace.select), so the bell and panel agree at once.
+        for n in self.notifications.iter_mut().filter(|n| n.workspace.as_deref() == Some(id.as_str())) {
+            n.read = true;
+        }
         if self.selected.as_deref() == Some(id.as_str()) {
             return;
         }

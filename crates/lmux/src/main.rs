@@ -507,6 +507,8 @@ async fn run() -> anyhow::Result<()> {
                 .init();
             let cfg = lmux_core::Config {
                 state_dir: args.state_dir.unwrap_or_else(lmux_core::default_state_dir),
+                // `lmux --socket PATH server` listens where clients will look.
+                socket: cli.socket.clone().map(PathBuf::from),
                 tmux_socket: args.tmux_socket,
                 ws_addr: args.ws_addr,
                 host: lmux_core::daemon::hostname(),

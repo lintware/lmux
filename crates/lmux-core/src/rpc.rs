@@ -421,7 +421,19 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             let Some(ws) = ws else {
                 return err(id, RpcErrorCode::NotFound, "workspace not found");
             };
-            inner.state.lock().await.selected_workspace = Some(ws.clone());
+            {
+                // Looking at a workspace reads its notifications, as in cmux.
+                let mut state = inner.state.lock().await;
+                state.selected_workspace = Some(ws.clone());
+                for n in state.notifications.iter_mut() {
+                    if n.workspace.as_deref() == Some(ws.as_str()) {
+                        n.read = true;
+                    }
+                }
+                if let Some(w) = state.workspace_mut(&ws) {
+                    w.unread_notifications = 0;
+                }
+            }
             inner.tree_changed();
             inner.mark_dirty();
             ok(id, json!({"workspace": ws}))
