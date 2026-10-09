@@ -35,8 +35,13 @@ How the findings were checked:
 
 These freeze the daemon, corrupt terminals, or let someone run commands.
 
-- **N1. Closing a surface deadlocks the whole daemon.** `rpc.rs:1221-1227` holds the state lock, then calls `inner.surface_term()`, which takes the same lock again. Tokio locks are not re-entrant, so any tab close hangs every later request.
-  - **Fix:** read the term from the guard that is already held.
+- **N1. Closing a surface deadlocks the whole daemon.** ✅ **Fixed 2026-10-09.**
+  `rpc.rs` `close_surface` held the state lock and then called `inner.surface_term()`,
+  which takes the same lock again; tokio locks are not re-entrant, so any tab close hung
+  every later request. It now reads the term from the guard it already holds
+  (`state.term_cloned(surface)`) and drops the guard before awaiting. Verified against a
+  live daemon: `surface.close` and `workspace.close` both answer and the daemon keeps
+  serving.
 - **N2. tmux replies go to the wrong caller.** tmux sends one reply block for each command in a `;`-chained line. `new_terminal` (`tmux.rs:187-208`) chains 6 commands but registers one waiter, so 5 extra replies go to whichever commands are queued next, and every later reply shifts along.
   - **Fix:** register one waiter per command.
 - **N3. Partial tmux lines are dropped.** The select loop clears `line` at the start of every pass (`tmux.rs:641`). If a command arrives while `read_until` has read half a line, that half is lost. Output gets corrupted, or a split `%end` line shifts every later reply.
@@ -191,7 +196,8 @@ H-1 and H-4 are the cheap, clearly wasteful ones to fix first.
 
 ## Suggested order
 
-1. N1, N2, N3, S1 and N8: the deadlock, the corrupted replies, and the command-execution paths.
+1. N2, N3, S1 and N8: the corrupted replies and the command-execution paths (N1, the
+   deadlock, is fixed).
 2. H1, H2, A1, A4, B1 and P1: browser hangs, freezes and orphaned processes.
 3. N5, N6, A2, A3 and C1.
 4. Everything else.

@@ -249,11 +249,12 @@ fn folder_row(
     }
 
     // The row's own `+`: a session in this folder, without leaving the row.
-    // Registered after the row, so it takes the click inside its own rect.
+    // Registered after the row, so it takes the click inside its own rect, and
+    // hidden while a row is being dragged so it cannot read as a drop target.
     let plus = Rect::from_center_size(egui::pos2(inner.max.x - 12.0, cy), Vec2::splat(18.0));
     c.state.folder_plus_rects.insert(folder.id.clone(), plus);
     let plus_resp = ui.interact(plus, Id::new(("folderplus", &folder.id)), Sense::click());
-    if resp.hovered() || plus_resp.hovered() {
+    if c.state.tab_drag.is_none() && (resp.hovered() || plus_resp.hovered()) {
         let color = if plus_resp.hovered() { theme::TEXT } else { theme::DIM_2 };
         icons::plus(&painter, Rect::from_center_size(plus.center(), Vec2::splat(12.0)), color);
     }
@@ -613,6 +614,31 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
         );
     }
 
+    // Close button, beside the badge: hidden until the card is pointed at, like
+    // the row controls in the reference. It is registered even while hidden,
+    // because egui hands the pointer to the topmost widget and the card would
+    // otherwise keep the hover that is supposed to reveal it.
+    let close_center = egui::pos2(
+        rect.max.x - if ws.unread_notifications > 0 { 30.0 } else { 12.0 },
+        rect.min.y + 11.0,
+    );
+    let close_resp = ui.interact(
+        Rect::from_center_size(close_center, Vec2::splat(18.0)),
+        Id::new(("cardx", &ws.id)),
+        Sense::click(),
+    );
+    if c.state.tab_drag.is_none() && (resp.hovered() || close_resp.hovered()) {
+        let color = if close_resp.hovered() { theme::RED } else { theme::DIM_2 };
+        icons::close(&p, Rect::from_center_size(close_center, Vec2::splat(9.0)), color);
+    }
+    if close_resp.clicked() {
+        c.state.rpc(
+            lmux_proto::methods::WORKSPACE_CLOSE,
+            serde_json::json!({ "workspace": ws.id }),
+        );
+        return;
+    }
+
     if resp.double_clicked() {
         // Double clicking a card selects it and starts a new session next to it,
         // in the same folder — the sidebar's double click always means "new
@@ -643,7 +669,13 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
 /// folder by its trail, plus the top level, because dragging a card out of a
 /// deep folder to the sidebar's empty tail is a long haul.
 fn card_menu(resp: &egui::Response, ws: &Workspace, c: &mut Ctx) {
-    let targets: Vec<(Option<Ref>, String)> = std::iter::once((None, "Top Level".to_owned()))
+    // "Top Level" only appears when the session is somewhere else, so no entry
+    // ever says what the session already is.
+    let targets: Vec<(Option<Ref>, String)> = ws
+        .folder
+        .is_some()
+        .then(|| (None, "Top Level".to_owned()))
+        .into_iter()
         .chain(
             c.state
                 .tree

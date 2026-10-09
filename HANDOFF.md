@@ -1,10 +1,43 @@
-# HANDOFF — local host, host picker, nested folders
+# HANDOFF — sidebar drag-and-drop, folder moves, card controls
 
-Written 2026-10-09 at the end of a session that added the local host and the
-create menus. Everything below is what the next session needs; the code is in the
-tree, the tests are green, and one **open blocker** is documented in detail.
+Written 2026-10-09 across two sessions: the earlier one added the local host and
+the create menus (kept below), the later one added dragging sidebar rows between
+folders and sessions, `folder.move`, the folder `+`, the card's close button and
+menu, and fixed the close deadlock. The tests are green.
 
-## What this session built
+## What the sidebar session built
+
+1. **Sidebar rows drag and drop.** A workspace card or a folder row is now a drag
+   source (`app/src/ui/sidebar.rs`: `Sense::click_and_drag` →
+   `AppState::begin_tab_drag`). `app/src/ui/drag.rs` resolves the drop against
+   `AppState::sidebar_rows`, the rows drawing recorded this frame, and paints one
+   of two indicators: an accent **line** at the gap, or the **filled folder row**
+   when the row goes inside a folder.
+2. **What each drop means.** Over a card: in front of it or behind it, in that
+   card's folder (top half / bottom half). Over a folder row: a session goes
+   inside it; a folder joins it, unless the pointer is in the row's top third,
+   where the folder takes that row's own slot beside it. Below every row: the
+   top level, appended. Dropping a row beside itself resolves to nothing, so no
+   RPC goes out and no line is drawn. A folder cannot be dropped into its own
+   subtree — refused in the resolver, in the daemon and in the mock.
+3. **`folder.move {folder, parent?, index?}`.** New RPC (`crates/lmux-proto`,
+   `SessionState::move_folder` in `crates/lmux-core/src/tree.rs`, handler in
+   `rpc.rs`, `lmux move-folder`, mirrored in `app/mock/server.ts`). `parent: null`
+   is the top level, `index` counts that parent's child folders *without* the
+   moved folder, so a same-parent reorder is not off by one. `workspace.move`
+   already existed and the mock now honours its `index` too.
+4. **`index` from a slot.** `workspace_move_index` / `folder_move_index` in
+   `app/src/state.rs` turn "the k-th row of that folder" into the list index the
+   daemon wants; `insertion_slot` is the pure rule that makes a drop beside
+   itself a no-op.
+5. **Card controls.** A folder row shows a `+` on hover (a session in that
+   folder) and a card shows a `×` on hover (close that session) beside its unread
+   badge — the previously open item, now done. A card's right-click menu has
+   `New Session Here`, `Move to Folder ▸ <trail>` (plus `Top Level`) and
+   `Close Session`. The row controls hide while a drag is in flight.
+6. **The close deadlock is fixed** (see below).
+
+## Earlier session: local host, host picker, nested folders
 
 1. **Nested folders, end to end.** `Folder.parent` in `crates/lmux-proto`, mirrored in
    `app/mock/proto.ts`. `folder.new {name, parent?}` nests; `folder.close` lifts the
@@ -48,64 +81,34 @@ tree, the tests are green, and one **open blocker** is documented in detail.
   `sidebar_folder_menu` snapshots and by interaction tests that drive real pointer
   events; a live right click was not exercised (no right-click tool in this session).
 
-## OPEN BLOCKER — closing a surface deadlocks the daemon
+## FIXED — closing a surface used to deadlock the daemon
 
-Symptom the user hit: the app reconnects every ~5.5 s, the UI is laggy, and the CLI
-hangs. The daemon log shows `ws client connected` every 5.5 s and almost no disconnects.
-5.5 s = the app's 2 s ping interval + 3 s ping timeout (`app/src/net.rs`).
+The user hit this: the app reconnected every ~5.5 s, the UI was laggy, the CLI hung.
 
-Root cause: `crates/lmux-core/src/rpc.rs`, `close_surface` (~line 1233):
+Root cause (now fixed in `crates/lmux-core/src/rpc.rs`, `close_surface`): the state
+guard was held across `inner.surface_term(surface).await`, which takes the same lock.
+Tokio's Mutex is not reentrant, so the task blocked forever **holding the lock**, and
+`handle_ws_conn` awaits `inner.tree().await` before spawning its writer task, so clients
+received nothing at all. `close_surface` now reads the term from the guard it already
+holds (`state.term_cloned(surface)`) and drops the guard before awaiting.
 
-```rust
-let (term, is_browser) = {
-    let state = inner.state.lock().await;      // lock held
-    (
-        inner.surface_term(surface).await,     // takes the same lock → deadlock
-        surface_is_browser(&state, surface),
-    )
-};
-```
+Verified 2026-10-09: a scratch daemon on `127.0.0.1:7933` created a workspace, answered
+`close-surface --surface surface:1` immediately, kept serving `tree`, and `close-workspace`
+then reported the (now empty) workspace as not found. This was `REVIEW.md` **N1**; the
+entry there is marked fixed.
 
-`Inner::surface_term` (`daemon.rs:459`) does `self.state.lock().await`. Tokio's Mutex is
-not reentrant, so the task blocks forever **holding the lock**. Everything else then
-queues: `handle_ws_conn` awaits `inner.tree().await` (`daemon.rs:1002`) *before* it spawns
-the connection's writer task, so a client receives nothing at all — not even `welcome` or
-the initial `tree` — and the app's ping never gets a reply. This is item **N1** in
-`REVIEW.md` ("Fix first"), and it is still unfixed.
-
-Note the deadlock is reached from `workspace.close` too (`rpc.rs:526`), so closing a
-sidebar card wedges the daemon the same way.
-
-Fix: read the term from the guard already held, e.g.
-
-```rust
-let (term, is_browser) = {
-    let state = inner.state.lock().await;
-    (state.term_cloned(surface), surface_is_browser(&state, surface))
-};
-```
-
-Then audit every other `inner.state.lock()` block that calls an `Inner` method which
-locks again.
-
-Repro / how to confirm health after a fix:
+Health check, if a wedged daemon is suspected (a healthy one answers at once):
 
 ```bash
-# wedged daemon: this replies with nothing
 bun -e 'const w=new WebSocket("ws://127.0.0.1:7879");const g=[];w.addEventListener("message",e=>g.push(e.data));await new Promise(r=>w.addEventListener("open",r));await new Promise(r=>setTimeout(r,3000));console.log(g.length?g.map(s=>String(s).slice(0,40)):"(nothing)");w.close();process.exit(0)'
 ```
 
-Healthy: `welcome` and `tree` arrive immediately. Wedged: nothing at all.
-Workaround until it is fixed: **do not close surfaces or workspaces from the app**;
-restart the daemon (`kill <lmux server pid>`; the app starts a fresh one on its next
-launch, or start it by hand — see below).
+## DONE — a close button on the sidebar's workspace cards
 
-## OPEN ITEM — a close button on the sidebar's workspace cards
-
-The user asked for one ("the left side tabs don't have a close button"). Not implemented.
-Add a hover × at the card's top right in `ws_card` (`app/src/ui/sidebar.rs`), mirroring
-the chip's ×, issuing `workspace.close`. Do the deadlock fix first, or that button will
-wedge the daemon on its first click.
+Implemented as a hover `×` at the card's top right (`ws_card` in
+`app/src/ui/sidebar.rs`), beside the unread badge, issuing `workspace.close`; the same
+card's menu also has `Close Session`. Safe now that the deadlock above is fixed, and
+covered by `the_cards_close_button_closes_that_session`.
 
 ## How to build, run and check
 
@@ -118,9 +121,18 @@ PATH="$HOME/.local/bin:$PATH" ./target/debug/lmux server --ws-addr 127.0.0.1:787
 ./target/debug/lmux --socket ~/.local/state/lmux/lmux.sock list-workspaces
 
 bun app/mock/server.ts                     # the mock, ws://127.0.0.1:7900
-cd app && cargo test                       # 62 lib + 28 interaction + 16 snapshots …
+cd app && cargo test                       # 77 lib + 31 interaction + 18 snapshots …
 cargo test --workspace
 ```
+
+Checked 2026-10-09 after the sidebar session: `cd app && cargo test` (77 lib, 16
+drag_drop, 31 interaction, 18 snapshots, plus the small suites) and `cargo test
+--workspace` are green. The sidebar drags are driven by real pointer events in
+`app/tests/drag_drop.rs` (`dragging_a_session_onto_a_folder_row_moves_it_into_that_folder`
+and friends); `sidebar_drag_between.png` and `sidebar_drag_into_folder.png` show the two
+indicator styles. The mock was driven over the websocket for `folder.move`
+(nest/reorder/cycle) and `workspace.move` with an `index`; a scratch daemon on
+`127.0.0.1:7933` verified the same two RPCs plus the close paths through `lmux` itself.
 
 - The app logs to `/tmp/lmux-app.log` when started with `nohup … > /tmp/lmux-app.log`.
 - The host list is `~/Library/Application Support/lmux/hosts.json`; the local host is

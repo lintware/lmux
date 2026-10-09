@@ -281,6 +281,13 @@ pub enum SidebarRowKind {
     Workspace,
 }
 
+impl DragItem {
+    /// Whether this drag carries a sidebar folder row rather than a session.
+    pub fn item_is_folder(&self) -> bool {
+        matches!(self, DragItem::Folder(_))
+    }
+}
+
 /// An in-flight drag of a chip or a pane header. Distinct from [`Drag`], which
 /// is the divider resize. The geometry the UI actually drew is looked up via
 /// [`AppState::chip_rects`] / [`AppState::pane_rects`] so hit-testing matches
@@ -1346,6 +1353,91 @@ mod tests {
         let _ = SplitDirection::Horizontal;
         let _ = Progress { value: 0.0, label: None };
     }
+
+    /// Folders `a` and `b` at the top level, `c` inside `b`; sessions `w1` in
+    /// `a`, `w4` in `b`, and `w2`/`w3` at the top level, in that list order.
+    fn sidebar_tree() -> Tree {
+        use lmux_proto::Folder;
+        let ws = |id: &str, folder: Option<&str>| Workspace {
+            id: id.into(),
+            title: id.into(),
+            folder: folder.map(str::to_owned),
+            cwd: "/tmp".into(),
+            git_branch: None,
+            agent: AgentState::None,
+            summary: None,
+            unread_notifications: 0,
+            status_pills: vec![],
+            progress: None,
+            layout: Layout::Pane { pane: "pane:1".into() },
+            panes: vec![],
+            focused_pane: None,
+        };
+        Tree {
+            host: "h".into(),
+            folders: vec![
+                Folder { id: "folder:a".into(), name: "a".into(), parent: None, collapsed: false },
+                Folder { id: "folder:b".into(), name: "b".into(), parent: None, collapsed: false },
+                Folder {
+                    id: "folder:c".into(),
+                    name: "c".into(),
+                    parent: Some("folder:b".into()),
+                    collapsed: false,
+                },
+            ],
+            workspaces: vec![
+                ws("w1", Some("folder:a")),
+                ws("w2", None),
+                ws("w3", None),
+                ws("w4", Some("folder:b")),
+            ],
+            selected_workspace: None,
+        }
+    }
+
+    #[test]
+    fn a_workspace_slot_maps_into_the_list_the_daemon_inserts_into() {
+        let t = sidebar_tree();
+        // Into folder:a, in front of its only session.
+        assert_eq!(workspace_move_index(&t, "w3", Some("folder:a"), Some(0)), Some(0));
+        // Into folder:a behind that session: nothing of the folder follows, so
+        // the index is left out and the daemon appends the session.
+        assert_eq!(workspace_move_index(&t, "w1", Some("folder:a"), Some(1)), None);
+        // To the top level, in front of w2 (the first top-level session).
+        assert_eq!(workspace_move_index(&t, "w4", None, Some(0)), Some(1));
+        // To the top level, at the end.
+        assert_eq!(workspace_move_index(&t, "w1", None, None), None);
+    }
+
+    #[test]
+    fn a_folder_slot_maps_into_the_list_the_daemon_inserts_into() {
+        let t = sidebar_tree();
+        // folder:c climbs out of folder:b, in front of folder:a.
+        assert_eq!(folder_move_index(&t, "folder:c", None, Some(0)), Some(0));
+        // The same move, landing between folder:a and folder:b.
+        assert_eq!(folder_move_index(&t, "folder:c", None, Some(1)), Some(1));
+        // Into folder:b, which holds no other folder: the index is left out.
+        assert_eq!(folder_move_index(&t, "folder:c", Some("folder:b"), Some(0)), None);
+    }
+
+    #[test]
+    fn a_drop_beside_itself_is_not_a_move() {
+        assert_eq!(insertion_slot(2, None), Some(2), "another container always inserts");
+        assert_eq!(insertion_slot(2, Some(2)), None, "dropping on itself is no move");
+        assert_eq!(insertion_slot(3, Some(2)), None, "nor is dropping just behind itself");
+        assert_eq!(insertion_slot(4, Some(2)), Some(3), "past itself the slot shifts down");
+        assert_eq!(insertion_slot(0, Some(2)), Some(0), "moving up is unaffected");
+    }
+
+    #[test]
+    fn a_folder_holds_itself_and_its_subtree() {
+        let t = sidebar_tree();
+        assert!(folder_holds(&t, "folder:b", Some("folder:c")));
+        assert!(folder_holds(&t, "folder:b", Some("folder:b")));
+        assert!(!folder_holds(&t, "folder:c", Some("folder:b")));
+        assert!(!folder_holds(&t, "folder:c", None), "the top level is nobody's subtree");
+        assert!(!folder_holds(&t, "folder:a", Some("folder:b")));
+    }
 }
 
 /// The `index` that drops a dragged workspace into `folder` at `slot`, where the
@@ -1392,6 +1484,61 @@ fn slot_to_index<T>(rest: &[&T], is_member: impl Fn(&T) -> bool, slot: usize) ->
         Some(at) => Some(*at),
         None => members.last().map(|last| last + 1),
     }
+}
+
+/// Where a workspace sits among the workspaces of `folder`, in tree order.
+pub fn workspace_position(tree: &Tree, id: &str, folder: Option<&str>) -> Option<usize> {
+    tree.workspaces
+        .iter()
+        .filter(|w| w.folder.as_deref() == folder)
+        .position(|w| w.id == id)
+}
+
+/// Where a folder sits among the child folders of `parent`.
+pub fn folder_position(tree: &Tree, id: &str, parent: Option<&str>) -> Option<usize> {
+    tree.folders
+        .iter()
+        .filter(|f| f.parent.as_deref() == parent)
+        .position(|f| f.id == id)
+}
+
+/// Whether `ancestor` is `candidate` itself or holds it somewhere below, so a
+/// folder cannot be dropped into its own subtree. `folder.move` refuses that
+/// move too; catching it here keeps the indicator from promising it.
+pub fn folder_holds(tree: &Tree, ancestor: &str, candidate: Option<&str>) -> bool {
+    let mut cursor = candidate.map(str::to_owned);
+    // The folder list is finite, so a malformed cycle cannot loop forever.
+    for _ in 0..=tree.folders.len() {
+        let Some(current) = cursor else { return false };
+        if current == ancestor {
+            return true;
+        }
+        cursor = tree
+            .folders
+            .iter()
+            .find(|f| f.id == current)
+            .and_then(|f| f.parent.clone());
+    }
+    false
+}
+
+/// The slot a row dropped between two rows of one container takes, given that
+/// container's rows in list order. `target` is the slot *before* which the row
+/// lands (the row above it plus one when the drop is below that row), and `own`
+/// is the dragged row's own position in the same list. `None` means the row
+/// would land exactly where it already is, so there is nothing to send and the
+/// indicator stays off. The daemon removes the row before inserting, so a slot
+/// after the row's own position shifts down by one.
+pub fn insertion_slot(target: usize, own: Option<usize>) -> Option<usize> {
+    if let Some(own) = own {
+        if target == own || target == own + 1 {
+            return None;
+        }
+        if target > own {
+            return Some(target - 1);
+        }
+    }
+    Some(target)
 }
 
 /// A folder's trail inside any folder list, `webapp / api`. The trail ends

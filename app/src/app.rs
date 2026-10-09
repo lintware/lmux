@@ -8,7 +8,7 @@ use lmux_proto::{BrowserInputEvent, ClientMsg, KeyAction, SurfaceKind};
 use crate::net::{ConnState, Net};
 use crate::state::{Action, AppState};
 use crate::theme;
-use crate::ui::{self, icons, notifications, pane, sidebar, statusbar, tabstrip};
+use crate::ui::{self, drag, icons, notifications, pane, sidebar, statusbar, tabstrip};
 use crate::util::ellipsize;
 use crate::{fonts, keys, wire};
 
@@ -174,6 +174,9 @@ pub fn render(ui: &mut Ui, c: &mut ui::Ctx) {
     c.state.chip_rects.clear();
     c.state.card_rects.clear();
     c.state.folder_rects.clear();
+    c.state.sidebar_rows.clear();
+    c.state.sidebar_list_rect = None;
+    c.state.folder_plus_rects.clear();
     c.state.pane_rects.clear();
     c.state.browser_image_rects.clear();
     ui.painter().rect_filled(full, 0.0, theme::MAIN_BG);
@@ -282,6 +285,11 @@ pub fn render(ui: &mut Ui, c: &mut ui::Ctx) {
     }
 
     statusbar::show(ui, status_rect, c);
+
+    // Drag feedback runs last, over everything a drag can land on. The sidebar
+    // rows and the panes have both been drawn, so one pass resolves against the
+    // geometry on screen and the ghost is free to cross between them.
+    drag::show(ui, c);
 }
 
 /// Global keybindings. Public so kittest interaction tests can drive it.

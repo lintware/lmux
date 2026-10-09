@@ -9,7 +9,7 @@ use crate::layout::{self, Solved};
 use crate::state::Drag;
 use crate::theme;
 
-use super::{browser, drag, tabstrip, terminal};
+use super::{browser, tabstrip, terminal};
 
 pub fn show(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
     let Some(ws) = c.state.selected_workspace().cloned() else {
@@ -40,9 +40,6 @@ pub fn show(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
     for div in &solved.dividers {
         draw_divider(ui, div.rect, div.region, &div.path, div.direction, &ws, c);
     }
-
-    // Drag feedback and drops run last, after every pane rect and chip is known.
-    drag::show(ui, c);
 }
 
 fn draw_pane(ui: &mut Ui, rect: Rect, pane_id: &str, ws: &Workspace, multi: bool, c: &mut Ctx) {

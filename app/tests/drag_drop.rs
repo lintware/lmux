@@ -176,6 +176,179 @@ fn no_move_rpcs(h: &Harness<Fx>) -> bool {
     })
 }
 
+/// A sidebar with two folders and two top-level sessions, each session a single
+/// terminal. The daemon's list order is `w1`(in `f1`), `w2`(in `f2`), `w3`,
+/// `w4`, and the sidebar draws the folders first, so the cards come out as
+/// `w1`, `w2`, `w3`, `w4`.
+fn sidebar_tree() -> wire::Tree {
+    use wire::*;
+    let ws = |id: &str, title: &str, folder: Option<&str>, surf: &str| Workspace {
+        id: id.into(),
+        title: title.into(),
+        folder: folder.map(str::to_owned),
+        cwd: "/tmp".into(),
+        git_branch: None,
+        agent: AgentState::None,
+        summary: None,
+        unread_notifications: 0,
+        status_pills: vec![],
+        progress: None,
+        layout: Layout::Pane { pane: format!("pane:{id}") },
+        panes: vec![pane(&format!("pane:{id}"), vec![term(surf, title)], surf)],
+        focused_pane: Some(format!("pane:{id}")),
+    };
+    Tree {
+        host: "h".into(),
+        folders: vec![
+            Folder { id: "folder:1".into(), name: "webapp".into(), parent: None, collapsed: false },
+            Folder { id: "folder:2".into(), name: "lintlabs".into(), parent: None, collapsed: false },
+        ],
+        workspaces: vec![
+            ws("workspace:1", "one", Some("folder:1"), "surface:1"),
+            ws("workspace:2", "two", Some("folder:2"), "surface:2"),
+            ws("workspace:3", "three", None, "surface:3"),
+            ws("workspace:4", "four", None, "surface:4"),
+        ],
+        selected_workspace: Some("workspace:3".into()),
+    }
+}
+
+fn sidebar_fixture() -> Fx {
+    let mut state = AppState::new();
+    state.apply_tree(sidebar_tree());
+    state.selected = Some("workspace:3".into());
+    let net = Net::with_hosts(vec![HostConfig {
+        name: "mock".into(),
+        label: "mock".into(),
+        kind: "direct".into(),
+        url: Some("ws://127.0.0.1:7900".into()),
+        ssh_target: None,
+        remote_port: 7878,
+        browser_scale: None,
+    }]);
+    Fx { state, net, ready: false }
+}
+
+fn card_rect(h: &Harness<Fx>, workspace: &str) -> egui::Rect {
+    *h.state()
+        .state
+        .card_rects
+        .get(workspace)
+        .unwrap_or_else(|| panic!("no card rect for {workspace}"))
+}
+
+fn folder_row(h: &Harness<Fx>, folder: &str) -> egui::Rect {
+    *h.state()
+        .state
+        .folder_rects
+        .get(folder)
+        .unwrap_or_else(|| panic!("no folder row for {folder}"))
+}
+
+/// A point on a card's title, away from the edges.
+fn card_grab(r: egui::Rect) -> Pos2 {
+    Pos2::new(r.min.x + 30.0, r.min.y + 10.0)
+}
+
+/// A point in the sidebar's empty tail: below every row, above the status bar.
+fn below_the_rows(h: &Harness<Fx>) -> Pos2 {
+    let bottom = h
+        .state()
+        .state
+        .sidebar_rows
+        .iter()
+        .map(|r| r.rect.max.y)
+        .fold(0.0, f32::max);
+    Pos2::new(100.0, (bottom + 12.0).min(520.0))
+}
+
+// --- sidebar rows -----------------------------------------------------------
+
+#[test]
+fn dragging_a_session_onto_a_folder_row_moves_it_into_that_folder() {
+    let mut h = harness(sidebar_fixture());
+    let card = card_rect(&h, "workspace:3");
+    let row = folder_row(&h, "folder:1");
+    drag(&mut h, card_grab(card), row.center());
+
+    let call = find(&h, "workspace.move").expect("workspace.move must be sent");
+    assert_eq!(call["workspace"], "workspace:3");
+    assert_eq!(call["folder"], "folder:1");
+    assert_eq!(call["index"], 0, "it lands in front of the folder's own session");
+    assert!(h.state().state.tab_drag.is_none(), "the drag must clear on release");
+}
+
+#[test]
+fn dragging_a_session_out_to_the_empty_tail_returns_it_to_the_top_level() {
+    let mut h = harness(sidebar_fixture());
+    let card = card_rect(&h, "workspace:1");
+    let to = below_the_rows(&h);
+    drag(&mut h, card_grab(card), to);
+
+    let call = find(&h, "workspace.move").expect("workspace.move must be sent");
+    assert_eq!(call["workspace"], "workspace:1");
+    assert!(call["folder"].is_null(), "the empty tail is the top level");
+    assert!(call.get("index").is_none(), "appending leaves the index out");
+}
+
+#[test]
+fn dragging_a_session_onto_another_session_reorders_it() {
+    let mut h = harness(sidebar_fixture());
+    let four = card_rect(&h, "workspace:4");
+    let three = card_rect(&h, "workspace:3");
+    // The upper half of `three` puts `four` in front of it.
+    let to = Pos2::new(three.center().x, three.min.y + 4.0);
+    drag(&mut h, card_grab(four), to);
+
+    let call = find(&h, "workspace.move").expect("workspace.move must be sent");
+    assert_eq!(call["workspace"], "workspace:4");
+    assert!(call["folder"].is_null());
+    // Without `four` the list is [one, two, three], so `three` is at index 2.
+    assert_eq!(call["index"], 2);
+}
+
+#[test]
+fn dragging_a_session_onto_the_row_it_already_holds_sends_nothing() {
+    let mut h = harness(sidebar_fixture());
+    let three = card_rect(&h, "workspace:3");
+    let four = card_rect(&h, "workspace:4");
+    // `three` sits directly above `four`, so dropping it on `four`'s top half
+    // is where it already is.
+    let to = Pos2::new(four.center().x, four.min.y + 4.0);
+    drag(&mut h, card_grab(three), to);
+
+    assert!(
+        find(&h, "workspace.move").is_none(),
+        "a drop into its own slot must not issue an RPC"
+    );
+    assert!(h.state().state.tab_drag.is_none());
+}
+
+#[test]
+fn dragging_a_folder_onto_another_folder_row_nests_it() {
+    let mut h = harness(sidebar_fixture());
+    let from = folder_row(&h, "folder:2");
+    let onto = folder_row(&h, "folder:1");
+    drag(&mut h, Pos2::new(from.center().x, from.center().y), onto.center());
+
+    let call = find(&h, "folder.move").expect("folder.move must be sent");
+    assert_eq!(call["folder"], "folder:2");
+    assert_eq!(call["parent"], "folder:1");
+    assert!(call.get("index").is_none(), "the only child lands at the end");
+}
+
+#[test]
+fn dragging_a_folder_to_the_empty_tail_lifts_it_to_the_top_level() {
+    let mut h = harness(sidebar_fixture());
+    let from = folder_row(&h, "folder:2");
+    let to = below_the_rows(&h);
+    drag(&mut h, Pos2::new(from.center().x, from.center().y), to);
+
+    let call = find(&h, "folder.move").expect("folder.move must be sent");
+    assert_eq!(call["folder"], "folder:2");
+    assert!(call["parent"].is_null(), "the empty tail is the top level");
+}
+
 // --- positive gestures ------------------------------------------------------
 
 #[test]
@@ -424,3 +597,4 @@ fn clicking_a_chip_still_selects_rather_than_dragging() {
     );
     let _ = ConnState::Connected;
 }
+

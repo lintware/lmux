@@ -506,6 +506,76 @@ fn right_clicking_a_folder_row_creates_a_folder_inside_it() {
 }
 
 #[test]
+fn clicking_a_folder_rows_plus_creates_a_session_in_it() {
+    let mut h = harness(fixture());
+    let plus = *h
+        .state()
+        .state
+        .folder_plus_rects
+        .get("folder:1")
+        .expect("the folder row records where its `+` is drawn");
+    click_at(&mut h, plus.center(), egui::PointerButton::Primary);
+    h.run();
+
+    let rpcs = rpc_methods(h.state());
+    let call = rpcs.iter().find(|(m, _)| m == "workspace.new").expect("workspace.new sent");
+    assert_eq!(call.1["folder"], "folder:1", "the session belongs to the row's folder");
+    assert!(
+        !h.state().state.collapsed.contains("folder:1"),
+        "the `+` must not also flip the row's collapse"
+    );
+    assert!(
+        h.state().state.card_rects.contains_key("workspace:1"),
+        "and the folder's session stays on screen"
+    );
+}
+
+#[test]
+fn a_cards_menu_moves_the_session_to_another_folder() {
+    use egui_kittest::kittest::Queryable;
+
+    let mut h = harness(fixture());
+    // workspace:2 sits in the nested folder, so `Top Level` and the other
+    // folder are both offered.
+    let card = *h
+        .state()
+        .state
+        .card_rects
+        .get("workspace:2")
+        .expect("card rect for workspace:2");
+    click_at(&mut h, card.center(), egui::PointerButton::Secondary);
+    h.run();
+    h.get_by_label_contains("Move to Folder").click();
+    h.run();
+    h.get_by_label("one").click();
+    h.run();
+
+    let rpcs = rpc_methods(h.state());
+    let call = rpcs.iter().find(|(m, _)| m == "workspace.move").expect("workspace.move sent");
+    assert_eq!(call.1["workspace"], "workspace:2");
+    assert_eq!(call.1["folder"], "folder:1");
+}
+
+#[test]
+fn the_cards_close_button_closes_that_session() {
+    let mut h = harness(fixture());
+    // workspace:3 has no unread badge, so its close button sits at the corner.
+    let card = *h
+        .state()
+        .state
+        .card_rects
+        .get("workspace:3")
+        .expect("card rect for workspace:3");
+    let close = egui::pos2(card.max.x - 12.0, card.min.y + 11.0);
+    click_at(&mut h, close, egui::PointerButton::Primary);
+    h.run();
+
+    let rpcs = rpc_methods(h.state());
+    let call = rpcs.iter().find(|(m, _)| m == "workspace.close").expect("workspace.close sent");
+    assert_eq!(call.1["workspace"], "workspace:3");
+}
+
+#[test]
 fn a_new_folder_is_named_in_line_in_the_sidebar() {
     let mut h = harness(fixture());
     h.state_mut().state.new_folder(Some("folder:1".into()));

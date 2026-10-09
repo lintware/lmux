@@ -1266,10 +1266,14 @@ async fn add_surface_impl(
 }
 
 async fn close_surface(inner: &Arc<Inner>, surface: &str) {
+    // Read the term from the guard that is already held, and let it drop before
+    // awaiting anything: `surface_term` takes the same lock, and a tokio lock is
+    // not re-entrant, so awaiting it here would hang the daemon and every client
+    // with it (REVIEW.md N1).
     let (term, is_browser) = {
         let state = inner.state.lock().await;
         (
-            inner.surface_term(surface).await,
+            state.term_cloned(surface),
             surface_is_browser(&state, surface),
         )
     };

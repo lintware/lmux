@@ -317,6 +317,7 @@ export const M = {
   FOLDER_NEW: "folder.new",
   FOLDER_RENAME: "folder.rename",
   FOLDER_CLOSE: "folder.close",
+  FOLDER_MOVE: "folder.move",
 
   WORKSPACE_NEW: "workspace.new",
   WORKSPACE_LIST: "workspace.list",

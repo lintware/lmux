@@ -416,6 +416,62 @@ fn snapshot_tabs_focused_and_unfocused() {
 
 // --- in-drag visuals --------------------------------------------------------
 
+/// A session dragged onto the sidebar, aimed between two cards: the accent line
+/// sits at the gap the daemon will insert into, and the dragged card is dimmed.
+#[test]
+fn snapshot_sidebar_drag_between_cards() {
+    let mut h = harness(fixture("workspace:1", true), Vec2::new(900.0, 560.0));
+    let from = card_rect(&h, "workspace:2");
+    let onto = card_rect(&h, "workspace:3");
+    let grab = Pos2::new(from.min.x + 30.0, from.min.y + 12.0);
+    let to = Pos2::new(onto.center().x, onto.min.y + 4.0);
+    press_drag(&mut h, grab, to);
+    h.snapshot("sidebar_drag_between");
+}
+
+/// A folder dragged onto another folder row: the row is filled, because the
+/// folder is about to go inside it rather than between two rows.
+#[test]
+fn snapshot_sidebar_drag_into_folder() {
+    let mut h = harness(fixture("workspace:1", true), Vec2::new(900.0, 560.0));
+    let from = *h
+        .state()
+        .state
+        .folder_rects
+        .get("folder:2")
+        .expect("folder:2 row");
+    let onto = *h
+        .state()
+        .state
+        .folder_rects
+        .get("folder:1")
+        .expect("folder:1 row");
+    press_drag(&mut h, from.center(), onto.center());
+    h.snapshot("sidebar_drag_into_folder");
+}
+
+fn card_rect(h: &Harness<Fixture>, workspace: &str) -> egui::Rect {
+    *h.state()
+        .state
+        .card_rects
+        .get(workspace)
+        .unwrap_or_else(|| panic!("no card rect for {workspace}"))
+}
+
+/// The controls a card reveals on hover: the `×` that closes that session, set
+/// beside the unread badge rather than under it.
+#[test]
+fn snapshot_sidebar_card_close_button() {
+    let mut h = harness(fixture("workspace:1", true), Vec2::new(900.0, 560.0));
+    // workspace:2 carries two unread notifications, so the `×` has to make room.
+    let card = card_rect(&h, "workspace:2");
+    let hover = Pos2::new(card.min.x + 40.0, card.min.y + 11.0);
+    h.input_mut().events.push(egui::Event::PointerMoved(hover));
+    h.step();
+    h.step();
+    h.snapshot("sidebar_card_close");
+}
+
 fn chip_rect(h: &Harness<Fixture>, surface: &str) -> egui::Rect {
     *h.state()
         .state
