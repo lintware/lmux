@@ -32,6 +32,9 @@ pub enum MoveError {
     SurfaceNotFound,
     PaneNotFound,
     DifferentWorkspace,
+    /// The surface is the only one in its workspace, so moving it out into a
+    /// new workspace would change nothing.
+    OnlySurface,
 }
 
 /// Why a folder cannot be reparented. A cycle would tear the subtree loose from
@@ -764,6 +767,97 @@ impl SessionState {
         }
         swap_layout_panes(&mut self.workspaces[wi].layout, a, b);
         true
+    }
+
+    /// Move a surface into a pane of any workspace. Within one workspace this is
+    /// [`Self::move_surface`]. Across workspaces the surface keeps its backing
+    /// (tmux window / browser target), its old pane collapses when left empty,
+    /// and its old workspace is closed when left empty; the closed workspace is
+    /// returned beside the target pane.
+    pub fn transfer_surface(
+        &mut self,
+        surface: &str,
+        target_pane: &str,
+        index: Option<usize>,
+    ) -> Result<(Ref, Option<Ref>), MoveError> {
+        let (s_wi, _) = self
+            .locate_surface(surface)
+            .ok_or(MoveError::SurfaceNotFound)?;
+        let (t_wi, _) = self.locate_pane(target_pane).ok_or(MoveError::PaneNotFound)?;
+        if s_wi == t_wi {
+            return self.move_surface(surface, target_pane, index).map(|p| (p, None));
+        }
+        let item = self
+            .surface_cloned(surface)
+            .ok_or(MoveError::SurfaceNotFound)?;
+        let removed = self.remove_surface(surface);
+        // Indices shift when the source workspace closes, so look again.
+        let (t_wi, t_pi) = self.locate_pane(target_pane).ok_or(MoveError::PaneNotFound)?;
+        let ws = &mut self.workspaces[t_wi];
+        let tp = &mut ws.panes[t_pi];
+        let len = tp.surfaces.len();
+        let at = index.map(|i| i.min(len)).unwrap_or(len);
+        tp.surfaces.insert(at, item);
+        tp.active_surface = Some(surface.to_string());
+        ws.focused_pane = Some(target_pane.to_string());
+        Ok((target_pane.to_string(), removed.workspace_closed))
+    }
+
+    /// Move a surface out into a new workspace of its own, placed right after
+    /// its old one and in the same folder, with the old workspace's cwd. The
+    /// surface keeps its backing. Returns `(workspace, pane)`.
+    pub fn surface_to_new_workspace(
+        &mut self,
+        surface: &str,
+        title: Option<String>,
+    ) -> Result<(Ref, Ref), MoveError> {
+        let (s_wi, _) = self
+            .locate_surface(surface)
+            .ok_or(MoveError::SurfaceNotFound)?;
+        let count: usize = self.workspaces[s_wi].panes.iter().map(|p| p.surfaces.len()).sum();
+        if count <= 1 {
+            return Err(MoveError::OnlySurface);
+        }
+        let (src_id, folder, cwd) = {
+            let w = &self.workspaces[s_wi];
+            (w.id.clone(), w.folder.clone(), w.cwd.clone())
+        };
+        let item = self
+            .surface_cloned(surface)
+            .ok_or(MoveError::SurfaceNotFound)?;
+        self.remove_surface(surface);
+        let ws_ref = self.next_workspace();
+        let pane_ref = self.next_pane();
+        let title = title
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| item.title.clone());
+        self.add_workspace(Workspace {
+            id: ws_ref.clone(),
+            title,
+            folder,
+            cwd,
+            git_branch: None,
+            agent: AgentState::None,
+            summary: None,
+            unread_notifications: 0,
+            status_pills: vec![],
+            progress: None,
+            layout: Layout::Pane {
+                pane: pane_ref.clone(),
+            },
+            panes: vec![Pane {
+                id: pane_ref.clone(),
+                surfaces: vec![item],
+                active_surface: Some(surface.to_string()),
+            }],
+            focused_pane: Some(pane_ref.clone()),
+        });
+        // Sit right after the workspace it came from.
+        if let (Some(from), Some(at)) = (self.workspace_index(&src_id), self.workspace_index(&ws_ref)) {
+            let w = self.workspaces.remove(at);
+            self.workspaces.insert((from + 1).min(self.workspaces.len()), w);
+        }
+        Ok((ws_ref, pane_ref))
     }
 
     // --- notifications / logs --------------------------------------------
@@ -1593,5 +1687,85 @@ mod tests {
             }
             other => panic!("expected split, got {other:?}"),
         }
+    }
+
+    /// Add a one-pane, one-surface workspace; returns (workspace, pane, surface).
+    fn add_single(s: &mut SessionState) -> (Ref, Ref, Ref) {
+        let ws = s.next_workspace();
+        let p = s.next_pane();
+        let surf = s.next_surface();
+        s.add_workspace(Workspace {
+            id: ws.clone(),
+            title: "other".into(),
+            folder: None,
+            cwd: "/var".into(),
+            git_branch: None,
+            agent: AgentState::None,
+            summary: None,
+            unread_notifications: 0,
+            status_pills: vec![],
+            progress: None,
+            layout: Layout::Pane { pane: p.clone() },
+            panes: vec![Pane {
+                id: p.clone(),
+                surfaces: vec![terminal_surface(surf.clone(), "o", 80, 24)],
+                active_surface: Some(surf.clone()),
+            }],
+            focused_pane: Some(p.clone()),
+        });
+        (ws, p, surf)
+    }
+
+    #[test]
+    fn transfer_surface_across_workspaces() {
+        let (mut s, ws, refs) = make(2);
+        let (ws2, p2, _) = add_single(&mut s);
+        let (_, moving) = refs[1].clone();
+        let (pane, closed) = s.transfer_surface(&moving, &p2, Some(0)).unwrap();
+        assert_eq!(pane, p2);
+        assert!(closed.is_none());
+        assert_eq!(s.workspace_of_surface(&moving).as_deref(), Some(ws2.as_str()));
+        let w2 = s.workspace(&ws2).unwrap();
+        assert_eq!(w2.panes[0].surfaces[0].id, moving, "inserted at index 0");
+        assert_eq!(w2.panes[0].active_surface.as_deref(), Some(moving.as_str()));
+        // The source pane emptied and collapsed out of the layout.
+        let w = s.workspace(&ws).unwrap();
+        assert_eq!(w.panes.len(), 1);
+        assert!(!layout_contains(&w.layout, &refs[1].0));
+
+        // Moving the last surface of a workspace away closes it.
+        let (_, last) = refs[0].clone();
+        let (_, closed) = s.transfer_surface(&last, &p2, None).unwrap();
+        assert_eq!(closed.as_deref(), Some(ws.as_str()));
+        assert!(s.workspace(&ws).is_none());
+        assert_eq!(s.workspace(&ws2).unwrap().panes[0].surfaces.len(), 3);
+    }
+
+    #[test]
+    fn surface_to_new_workspace_moves_and_places_after_source() {
+        let (mut s, ws, refs) = make(2);
+        let (ws_other, _, _) = add_single(&mut s);
+        let (_, moving) = refs[1].clone();
+        let (new_ws, new_pane) = s
+            .surface_to_new_workspace(&moving, Some("logs".into()))
+            .unwrap();
+        let order: Vec<&str> = s.workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(order, vec![ws.as_str(), new_ws.as_str(), ws_other.as_str()]);
+        let w = s.workspace(&new_ws).unwrap();
+        assert_eq!(w.title, "logs");
+        assert_eq!(w.cwd, "/tmp", "inherits the source workspace's cwd");
+        assert_eq!(w.layout, Layout::Pane { pane: new_pane.clone() });
+        assert_eq!(s.pane_of_surface(&moving).as_deref(), Some(new_pane.as_str()));
+        assert_eq!(s.workspace(&ws).unwrap().panes.len(), 1);
+
+        // The only surface of a workspace has nowhere to go.
+        assert_eq!(
+            s.surface_to_new_workspace(&moving, None),
+            Err(MoveError::OnlySurface)
+        );
+        assert_eq!(
+            s.surface_to_new_workspace("surface:99", None),
+            Err(MoveError::SurfaceNotFound)
+        );
     }
 }
