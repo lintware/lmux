@@ -11,7 +11,16 @@
 
 use std::time::{Duration, Instant};
 
-use lmux_app::pty::tmux_bin;
+use lmux_app::pty::{kill_scratch_server, tmux_bin};
+
+/// Kills the scratch server however the test ends.
+struct Scratch<'a>(&'a str, &'a str);
+
+impl Drop for Scratch<'_> {
+    fn drop(&mut self) {
+        kill_scratch_server(self.0, self.1);
+    }
+}
 use lmux_app::state::AppState;
 use lmux_app::wire::{AgentState, Layout, Pane, Surface, SurfaceKind, Tree, Workspace};
 
@@ -104,6 +113,7 @@ fn a_local_pane_attaches_resizes_and_detaches_with_its_surface() {
     // The app's attach reads this; the real lmux socket is never used.
     std::env::set_var("LMUX_TMUX_SOCKET", &socket);
     let _ = run(&tmux, &["-L", &socket, "kill-server"]);
+    let _scratch = Scratch(&tmux, &socket);
     // A pane that is in raw mode, so the only echo is the process's.
     run(
         &tmux,
@@ -193,6 +203,4 @@ fn a_local_pane_attaches_resizes_and_detaches_with_its_surface() {
         assert!(Instant::now() < deadline, "the view session outlived the pane: {sessions:?}");
         std::thread::sleep(Duration::from_millis(50));
     }
-
-    let _ = run(&tmux, &["-L", &socket, "kill-server"]);
 }

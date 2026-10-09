@@ -68,6 +68,8 @@ pub struct WinInfo {
     /// `@lmux_agent_session`, `<agent>:<id>`; mirrors the daemon's resume map so
     /// a lost `state.json` does not lose it.
     pub agent_session: Option<String>,
+    /// `window_activity`: when the pane last printed anything (unix seconds).
+    pub activity: u64,
 }
 
 struct TmuxCmd {
@@ -453,7 +455,7 @@ impl Tmux {
     }
 
     pub async fn list_windows(&self) -> anyhow::Result<Vec<WinInfo>> {
-        let fmt = "#{window_id}\t#{pane_id}\t#{@lmux_surface}\t#{@lmux_workspace}\t#{@lmux_title}\t#{window_width}\t#{window_height}\t#{pane_current_path}\t#{pane_current_command}\t#{@lmux_agent_session}";
+        let fmt = "#{window_id}\t#{pane_id}\t#{@lmux_surface}\t#{@lmux_workspace}\t#{@lmux_title}\t#{window_width}\t#{window_height}\t#{pane_current_path}\t#{pane_current_command}\t#{@lmux_agent_session}\t#{window_activity}";
         let out = self
             .command(format!(
                 "list-windows -t {} -F {}",
@@ -489,9 +491,23 @@ impl Tmux {
                 cwd: f.get(7).and_then(|v| opt(v)),
                 command: f.get(8).and_then(|v| opt(v)),
                 agent_session: f.get(9).and_then(|v| opt(v)),
+                activity: f.get(10).and_then(|v| v.trim().parse().ok()).unwrap_or(0),
             });
         }
         Ok(wins)
+    }
+
+    /// Pause or continue `%output` for one pane on the control client. tmux
+    /// keeps reading and drawing a paused pane; it only stops sending every
+    /// byte to a daemon that has nobody to forward it to. (`off` would be
+    /// wrong: with no other client attached, tmux stops reading the pane and
+    /// the program in it blocks once its output buffer fills.) `continue`
+    /// skips what was printed meanwhile, so the viewer needs a snapshot.
+    pub async fn set_pane_output(&self, pane: &str, on: bool) -> anyhow::Result<()> {
+        let state = if on { "continue" } else { "pause" };
+        self.command(format!("refresh-client -A {}", shell_quote(&format!("{pane}:{state}"))))
+            .await
+            .map(|_| ())
     }
 
     pub async fn pane_exists(&self, pane: &str) -> bool {
@@ -905,6 +921,10 @@ fn handle_line(
         });
         return;
     }
+    if line.starts_with(b"%pause ") || line.starts_with(b"%continue ") {
+        // Answers to `set_pane_output`; never part of a reply.
+        return;
+    }
     if line.starts_with(b"%exit") {
         // Control client detached; the read loop will end when stdout closes.
         return;
@@ -912,6 +932,32 @@ fn handle_line(
     if let Some(b) = block.as_mut() {
         // Part of the current command reply (could be an empty line).
         b.push(line.to_vec());
+    }
+}
+
+/// A scratch tmux server for tests: killed, and its socket file removed (tmux
+/// leaves it behind), however the test ends.
+#[cfg(test)]
+pub(crate) struct ScratchServer(pub String);
+
+#[cfg(test)]
+impl Drop for ScratchServer {
+    fn drop(&mut self) {
+        let tmux = |args: &[&str]| {
+            std::process::Command::new("tmux")
+                .args(["-L", &self.0])
+                .args(args)
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+        };
+        let path = tmux(&["display-message", "-p", "#{socket_path}"])
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .filter(|p| !p.is_empty());
+        let _ = tmux(&["kill-server"]);
+        if let Some(path) = path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -959,6 +1005,7 @@ mod tests {
             return;
         }
         let socket = format!("lmux-test-{}", std::process::id());
+        let _scratch = ScratchServer(socket.clone());
         let cfg = TmuxConfig {
             socket: socket.clone(),
             session: "lmux".into(),
@@ -1009,16 +1056,82 @@ mod tests {
         // The client must still accept commands after the binary chunk.
         let alive = tmux.list_windows().await.is_ok();
 
-        let _ = Command::new("tmux")
-            .args(["-L", &socket, "kill-server"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
 
         assert!(saw_high_byte, "expected raw high bytes to pass through");
         assert!(saw_after, "expected output to continue after invalid UTF-8");
         assert!(alive, "control client should still accept commands");
+    }
+
+    /// A paused pane sends no `%output` but keeps running (tmux still reads
+    /// it, so `window_activity` moves); continued, it streams again.
+    #[tokio::test]
+    async fn pane_output_can_be_switched_off_and_on() {
+        if !tmux_available().await {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        let socket = format!("lmux-test-pause-{}", std::process::id());
+        let _scratch = ScratchServer(socket.clone());
+        let cfg = TmuxConfig { socket: socket.clone(), session: "lmux".into() };
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        let tmux = match Tmux::spawn(cfg, ev_tx).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping: could not start tmux ({e})");
+                return;
+            }
+        };
+        let result = async {
+            let (_win, pane) = tmux
+                .new_terminal(
+                    "/tmp",
+                    Some("while :; do echo TICK; sleep 0.1; done"),
+                    &[],
+                    80,
+                    24,
+                    "t",
+                    "surface:1",
+                    "workspace:1",
+                )
+                .await
+                .map_err(|e| format!("new_terminal: {e}"))?;
+            // Counts output events for `pane` over `ms`.
+            async fn count(rx: &mut mpsc::UnboundedReceiver<TmuxEvent>, pane: &str, ms: u64) -> usize {
+                let deadline = Instant::now() + Duration::from_millis(ms);
+                let mut n = 0;
+                while let Ok(Some(ev)) = tokio::time::timeout_at(deadline.into(), rx.recv()).await {
+                    if matches!(&ev, TmuxEvent::Output { pane: p, .. } if p == pane) {
+                        n += 1;
+                    }
+                }
+                n
+            }
+            if count(&mut ev_rx, &pane, 800).await == 0 {
+                return Err("no output before pausing".to_string());
+            }
+            tmux.set_pane_output(&pane, false).await.map_err(|e| format!("off: {e}"))?;
+            count(&mut ev_rx, &pane, 200).await; // in flight
+            let activity = || async {
+                let wins = tmux.list_windows().await.map_err(|e| e.to_string())?;
+                wins.iter().find(|w| w.pane == pane).map(|w| w.activity).ok_or("window gone".to_string())
+            };
+            let before = activity().await?;
+            let off = count(&mut ev_rx, &pane, 1500).await;
+            if off != 0 {
+                return Err(format!("{off} output events while off"));
+            }
+            let after = activity().await?;
+            if after <= before {
+                return Err(format!("activity did not move while off ({before} -> {after})"));
+            }
+            tmux.set_pane_output(&pane, true).await.map_err(|e| format!("on: {e}"))?;
+            if count(&mut ev_rx, &pane, 800).await == 0 {
+                return Err("no output after resuming".to_string());
+            }
+            Ok(())
+        }
+        .await;
+        result.unwrap();
     }
 
     /// A window titled like the session (a workspace named `lmux`) must not
@@ -1031,6 +1144,7 @@ mod tests {
             return;
         }
         let socket = format!("lmux-test-name-{}", std::process::id());
+        let _scratch = ScratchServer(socket.clone());
         let cfg = TmuxConfig { socket: socket.clone(), session: "lmux".into() };
         let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
         let tmux = match Tmux::spawn(cfg, ev_tx).await {
@@ -1048,12 +1162,6 @@ mod tests {
             .await;
         let wins = tmux.list_windows().await;
 
-        let _ = Command::new("tmux")
-            .args(["-L", &socket, "kill-server"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
 
         let (w1, _) = first.expect("first terminal");
         let (w2, _) = second.expect("second terminal, beside a window named like the session");
@@ -1074,6 +1182,7 @@ mod tests {
             return;
         }
         let socket = format!("lmux-test-exists-{}", std::process::id());
+        let _scratch = ScratchServer(socket.clone());
         let cfg = TmuxConfig { socket: socket.clone(), session: "lmux".into() };
         let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
         let tmux = match Tmux::spawn(cfg, ev_tx).await {
@@ -1090,12 +1199,6 @@ mod tests {
         let alive = tmux.window_exists(&win).await;
         let _ = tmux.command(format!("kill-window -t {win}")).await;
         let after = tmux.window_exists(&win).await;
-        let _ = Command::new("tmux")
-            .args(["-L", &socket, "kill-server"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
         assert!(alive, "a live window exists");
         assert!(!after, "a killed window does not");
     }
@@ -1109,6 +1212,7 @@ mod tests {
             return;
         }
         let socket = format!("lmux-test-paste-{}", std::process::id());
+        let _scratch = ScratchServer(socket.clone());
         let cfg = TmuxConfig { socket: socket.clone(), session: "lmux".into() };
         let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
         let tmux = match Tmux::spawn(cfg, ev_tx).await {
@@ -1134,12 +1238,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let got = std::fs::read(&out).unwrap_or_default();
-        let _ = Command::new("tmux")
-            .args(["-L", &socket, "kill-server"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
         let _ = std::fs::remove_dir_all(&dir);
         assert!(sent.is_ok(), "send_bytes failed: {sent:?}");
         assert_eq!(got.len(), payload.len(), "every byte arrives");
@@ -1154,6 +1252,7 @@ mod tests {
             return;
         }
         let socket = format!("lmux-test-hist-{}", std::process::id());
+        let _scratch = ScratchServer(socket.clone());
         let cfg = TmuxConfig { socket: socket.clone(), session: "lmux".into() };
         let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
         let tmux = match Tmux::spawn(cfg, ev_tx).await {
@@ -1170,12 +1269,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let plain = tmux.snapshot(&pane).await.map(|(_, _, d)| d);
         let full = tmux.snapshot_with_history(&pane, 1000).await.map(|(_, _, d)| d);
-        let _ = Command::new("tmux")
-            .args(["-L", &socket, "kill-server"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
         let (plain, full) = (plain.expect("snapshot"), full.expect("snapshot with history"));
         assert!(full.contains("\r\n1\r\n2\r\n3\r\n") || full.contains("H1\r\n2\r\n3\r\n"), "history from the first line: {full:?}");
         assert!(!plain.contains("\r\n2\r\n3\r\n"), "the plain snapshot is the screen alone");

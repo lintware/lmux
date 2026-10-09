@@ -55,6 +55,25 @@ pub fn tmux_bin() -> String {
         .unwrap_or_else(|| "tmux".to_owned())
 }
 
+/// Stop a scratch tmux server (tests and benches use their own `-L` socket)
+/// and remove its socket file, which tmux leaves behind.
+pub fn kill_scratch_server(tmux: &str, socket: &str) {
+    let path = std::process::Command::new(tmux)
+        .args(["-L", socket, "display-message", "-p", "#{socket_path}"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|p| !p.is_empty());
+    let _ = std::process::Command::new(tmux)
+        .args(["-L", socket, "kill-server"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if let Some(path) = path {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// The tmux session a surface is viewed through. tmux rejects `:`, `.` and
 /// whitespace in session names, so everything but alphanumerics becomes `-`.
 pub fn view_name(surface: &str) -> String {

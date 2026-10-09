@@ -281,6 +281,13 @@ pub struct Inner {
     respawn: std::sync::Mutex<RespawnState>,
     /// Terminals with output since their scrollback was last saved.
     scrollback_dirty: std::sync::Mutex<HashSet<Ref>>,
+    /// `window_activity` per terminal at the last scrollback pass: panes
+    /// whose output tmux no longer sends still show they changed.
+    pane_activity: std::sync::Mutex<HashMap<Ref, u64>>,
+    /// Panes whose output the control client has switched off because nobody
+    /// watches them. Held while the switch is sent, so an `off` and an `on`
+    /// for the same pane can never reach tmux out of order.
+    paused_output: Mutex<HashSet<String>>,
     /// Pull request lookups by `cwd\0branch`, with when they were made.
     prs: std::sync::Mutex<HashMap<String, (Option<lmux_proto::PullRequest>, Instant)>>,
     /// Steps sent to an app for its in-app browsers, awaiting answers.
@@ -1134,6 +1141,32 @@ impl Inner {
         }
     }
 
+    /// Stop tmux sending `pane`'s output while `surface` has no viewer. The
+    /// check is repeated under the lock so a viewer that subscribed meanwhile
+    /// keeps its stream (`resume_output` runs after the subscription is added).
+    async fn pause_output(&self, surface: &str, pane: &str) {
+        let mut paused = self.paused_output.lock().await;
+        if paused.contains(pane) || self.has_subscribers(surface).await {
+            return;
+        }
+        match self.tmux.set_pane_output(pane, false).await {
+            Ok(()) => {
+                paused.insert(pane.to_owned());
+            }
+            Err(e) => tracing::debug!(%pane, "pausing output: {e}"),
+        }
+    }
+
+    /// Have tmux send `pane`'s output again (a viewer subscribed).
+    async fn resume_output(&self, pane: &str) {
+        let mut paused = self.paused_output.lock().await;
+        if paused.remove(pane) {
+            if let Err(e) = self.tmux.set_pane_output(pane, true).await {
+                tracing::warn!(%pane, "resuming output: {e}");
+            }
+        }
+    }
+
     /// Mark every terminal as changed (startup: the files may be stale).
     async fn mark_all_scrollback_dirty(&self) {
         let terms: Vec<Ref> = {
@@ -1158,6 +1191,20 @@ impl Inner {
         let Ok(wins) = self.tmux.list_windows().await else {
             return 0;
         };
+        // Paused panes send no output: tmux's activity time shows they changed.
+        {
+            let mut seen = self.pane_activity.lock().unwrap();
+            let mut d = self.scrollback_dirty.lock().unwrap();
+            for w in &wins {
+                let Some(surface) = &w.surface else { continue };
+                if let Some(prev) = seen.insert(surface.clone(), w.activity) {
+                    if prev != w.activity {
+                        d.insert(surface.clone());
+                    }
+                }
+            }
+            seen.retain(|s, _| wins.iter().any(|w| w.surface.as_ref() == Some(s)));
+        }
         let dirty: HashSet<Ref> = std::mem::take(&mut *self.scrollback_dirty.lock().unwrap());
         let in_flight = self.respawn.lock().unwrap().in_flight.clone();
         let (targets, terminals) = {
@@ -1285,6 +1332,8 @@ pub async fn run(cfg: Config, browser: Option<Arc<dyn BrowserBackend>>) -> anyho
         tree_dirty: Notify::new(),
         respawn: std::sync::Mutex::new(RespawnState::default()),
         scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
+        pane_activity: Default::default(),
+        paused_output: Default::default(),
         prs: std::sync::Mutex::new(HashMap::new()),
         app_calls: Default::default(),
     });
@@ -1481,9 +1530,11 @@ async fn tmux_event_loop(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Tmux
                     continue;
                 };
                 inner.note_output(&surface);
-                // Skip the encode entirely when nobody is watching this surface.
+                // Skip the encode entirely when nobody is watching this
+                // surface, and ask tmux to stop sending it until somebody does.
                 if !inner.has_subscribers(&surface).await {
                     tracing::trace!(%pane, %surface, "output but no subscribers");
+                    inner.pause_output(&surface, &pane).await;
                     continue;
                 }
                 if let Ok(bytes) = (Frame::TermOutput {
@@ -1503,6 +1554,8 @@ async fn tmux_event_loop(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Tmux
                 // The supervisor respawns the client; re-reconcile in case the
                 // tmux server restarted under us.
                 tracing::warn!("tmux control client exited; supervisor will respawn");
+                // The next client starts with every pane's output on.
+                inner.paused_output.lock().await.clear();
                 inner.reconcile().await;
                 inner.tree_changed();
             }
@@ -1771,6 +1824,7 @@ impl Inner {
                 match kind {
                     Some(SurfaceKind::Terminal { .. }) => {
                         if let Some(term) = self.surface_term(&surface).await {
+                            self.resume_output(&term.pane).await;
                             match self.tmux.snapshot_with_history(&term.pane, history.unwrap_or(0)).await {
                                 Ok((cols, rows, data)) => {
                                     outbox.push(Out::Msg(ServerMsg::TermSnapshot {
@@ -2091,6 +2145,7 @@ mod tests {
     #[tokio::test]
     async fn app_browser_panes_are_drawn_by_the_app() {
         let socket = format!("lmux-test-ab-{}", std::process::id());
+        let _scratch = crate::tmux::ScratchServer(socket.clone());
         let state_dir = tempfile::tempdir().unwrap();
         let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
         let tmux = match Tmux::spawn(TmuxConfig { socket: socket.clone(), session: "lmux".into() }, ev_tx).await {
@@ -2139,6 +2194,8 @@ mod tests {
             tree_dirty: Notify::new(),
             respawn: std::sync::Mutex::new(RespawnState::default()),
             scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
+            pane_activity: Default::default(),
+            paused_output: Default::default(),
             prs: std::sync::Mutex::new(HashMap::new()),
             app_calls: Default::default(),
         });
@@ -2176,7 +2233,6 @@ mod tests {
 
         let r = crate::rpc::dispatch(&inner, &call(methods::BROWSER_SNAPSHOT, json!({"surface": surf}))).await;
         assert_eq!(r.error.map(|e| e.code), Some(RpcErrorCode::Unsupported));
-        tmux_cmd(&socket, &["kill-server"]).await;
     }
 
     /// A viewer that drops mid-stream (its last frame never acked) must not
@@ -2185,6 +2241,7 @@ mod tests {
     #[tokio::test]
     async fn browser_reopens_and_streams_after_restart_and_disconnect() {
         let socket = format!("lmux-test-bs-{}", std::process::id());
+        let _scratch = crate::tmux::ScratchServer(socket.clone());
         let state_dir = tempfile::tempdir().unwrap();
         let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
         let tmux = match Tmux::spawn(TmuxConfig { socket: socket.clone(), session: "lmux".into() }, ev_tx).await {
@@ -2249,6 +2306,8 @@ mod tests {
             tree_dirty: Notify::new(),
             respawn: std::sync::Mutex::new(RespawnState::default()),
             scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
+            pane_activity: Default::default(),
+            paused_output: Default::default(),
             prs: std::sync::Mutex::new(HashMap::new()),
             app_calls: Default::default(),
         });
@@ -2270,7 +2329,6 @@ mod tests {
         let b = inner.register(b_sink.clone()).await;
         inner.handle_client_msg(b, ClientMsg::Subscribe { surface: surf.clone(), history: None }, &b_sink).await;
         let started = wait_for(5, || async { inner.is_streaming(&surf).await }).await;
-        tmux_cmd(&socket, &["kill-server"]).await;
         assert!(started, "no stream for the second viewer: {:?}", fake.calls.lock().unwrap());
         assert_eq!(fake.calls.lock().unwrap().last().unwrap(), &format!("start {surf} 900x600"));
     }
@@ -2285,6 +2343,7 @@ mod tests {
             return;
         }
         let socket = format!("lmux-test-sb-{}", std::process::id());
+        let _scratch = crate::tmux::ScratchServer(socket.clone());
         let state_dir = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
         let cwd = std::fs::canonicalize(work.path())
@@ -2357,6 +2416,8 @@ mod tests {
             tree_dirty: Notify::new(),
             respawn: std::sync::Mutex::new(RespawnState::default()),
             scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
+            pane_activity: Default::default(),
+            paused_output: Default::default(),
             prs: std::sync::Mutex::new(HashMap::new()),
             app_calls: Default::default(),
         });
@@ -2460,7 +2521,6 @@ mod tests {
         }
         .await;
 
-        tmux_cmd(&socket, &["kill-server"]).await;
         if let Err(e) = result {
             panic!("{e}");
         }

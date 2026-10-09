@@ -19,7 +19,16 @@
 
 use std::time::{Duration, Instant};
 
-use lmux_app::pty::{attach_argv, tmux_bin, LocalPty};
+use lmux_app::pty::{attach_argv, kill_scratch_server, tmux_bin, LocalPty};
+
+/// Kills the scratch server however the bench ends.
+struct Scratch<'a>(&'a str, &'a str);
+
+impl Drop for Scratch<'_> {
+    fn drop(&mut self) {
+        kill_scratch_server(self.0, self.1);
+    }
+}
 
 const ITERATIONS: usize = 200;
 /// Printed by the pane command once the line discipline stops echoing.
@@ -107,12 +116,12 @@ fn keystroke_to_echo_through_tmux_attach() {
         eprintln!("skipping: could not start a scratch tmux server ({e})");
         return;
     }
+    let _scratch = Scratch(&tmux, &socket);
     let pane = match run(&tmux, &["-L", &socket, "display-message", "-p", "-t", "lmux", "#{pane_id}"])
     {
         Ok(out) => out.trim().to_owned(),
         Err(e) => {
             eprintln!("skipping: no pane id ({e})");
-            let _ = run(&tmux, &["-L", &socket, "kill-server"]);
             return;
         }
     };
@@ -124,7 +133,6 @@ fn keystroke_to_echo_through_tmux_attach() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("skipping: could not attach ({e})");
-            let _ = run(&tmux, &["-L", &socket, "kill-server"]);
             return;
         }
     };
@@ -149,7 +157,6 @@ fn keystroke_to_echo_through_tmux_attach() {
         !sessions.lines().any(|s| s == "view-surface-1"),
         "destroy-unattached should have taken the view session with the client: {sessions:?}"
     );
-    let _ = run(&tmux, &["-L", &socket, "kill-server"]);
 
     let p50 = samples[samples.len() / 2];
     println!("(informational) tmux attach p50 = {p50:?}");

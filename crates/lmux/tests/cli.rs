@@ -18,11 +18,22 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // tmux leaves the socket file behind; remove it with the server.
+        let path = Command::new("tmux")
+            .args(["-L", &self.tmux_socket, "display-message", "-p", "#{socket_path}"])
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .filter(|p| !p.is_empty());
         let _ = Command::new("tmux")
             .args(["-L", &self.tmux_socket, "kill-server"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        if let Some(path) = path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
