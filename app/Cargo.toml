@@ -11,7 +11,7 @@ license = "MIT"
 
 [dependencies]
 lmux-proto = { path = "../crates/lmux-proto" }
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts"] }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "persistence"] }
 egui = "0.36"
 alacritty_terminal = "0.26"
 ewebsock = "0.8"

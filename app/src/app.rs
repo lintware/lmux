@@ -12,6 +12,23 @@ use crate::ui::{self, drag, icons, notifications, pane, sidebar, tabstrip};
 use crate::util::ellipsize;
 use crate::{fonts, keys, wire};
 
+/// What the window remembers between launches (eframe's storage): layout
+/// and view preferences, never anything a daemon owns.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct UiPrefs {
+    sidebar_w: Option<f32>,
+    sidebar_hidden: bool,
+    term_font: Option<f32>,
+    /// The host on screen, by name.
+    active_host: Option<String>,
+    /// Hosts whose sidebar group is folded, by name.
+    collapsed_hosts: Vec<String>,
+    /// Folders folded in the sidebar, per host: `(host, folder ref)`.
+    collapsed_folders: Vec<(String, String)>,
+}
+
+const PREFS_KEY: &str = "lmux-ui";
+
 /// One host's connection and the state of its tree. The app holds one per
 /// host, all connected at once, and shows them in one sidebar.
 struct HostSession {
@@ -55,8 +72,31 @@ impl LmuxApp {
                 HostSession { state, net, was_connected: false }
             })
             .collect();
-        // Start on this machine: lmux is a local tool that can also reach out.
-        let active = hosts.iter().position(|h| h.net.is_local_host()).unwrap_or(0);
+        // Restore the window's own preferences, then start on the host that
+        // was on screen last (this machine the first time).
+        let prefs: UiPrefs = cc.storage.and_then(|s| eframe::get_value(s, PREFS_KEY)).unwrap_or_default();
+        for h in &mut hosts {
+            let name = h.net.host_name();
+            if let Some(w) = prefs.sidebar_w {
+                h.state.sidebar_w = w;
+            }
+            h.state.sidebar_hidden = prefs.sidebar_hidden;
+            if let Some(f) = prefs.term_font {
+                h.state.term_font = f;
+            }
+            h.state.host_collapsed = prefs.collapsed_hosts.contains(&name);
+            for (host, folder) in &prefs.collapsed_folders {
+                if *host == name {
+                    h.state.collapsed.insert(folder.clone());
+                }
+            }
+        }
+        let active = prefs
+            .active_host
+            .as_ref()
+            .and_then(|name| hosts.iter().position(|h| h.net.host_name() == *name))
+            .or_else(|| hosts.iter().position(|h| h.net.is_local_host()))
+            .unwrap_or(0);
         if let (Some(err), Some(h)) = (local_error, hosts.get_mut(active)) {
             eprintln!("[local] {err}");
             h.state.banner = Some((err, true));
@@ -71,20 +111,21 @@ impl LmuxApp {
             .collect()
     }
 
-    /// Put `index` on screen. The sidebar's width and visibility are the
-    /// window's, not a host's, so they carry over.
+    /// Put `index` on screen. The sidebar's width and visibility and the
+    /// terminal font size are the window's, not a host's, so they carry over.
     fn activate(&mut self, index: usize) {
         if index == self.active || index >= self.hosts.len() {
             return;
         }
-        let (w, hidden) = {
+        let (w, hidden, font) = {
             let s = &self.hosts[self.active].state;
-            (s.sidebar_w, s.sidebar_hidden)
+            (s.sidebar_w, s.sidebar_hidden, s.term_font)
         };
         self.active = index;
         let s = &mut self.hosts[index].state;
         s.sidebar_w = w;
         s.sidebar_hidden = hidden;
+        s.term_font = font;
     }
 }
 
@@ -209,6 +250,31 @@ impl eframe::App for LmuxApp {
         for i in removals.into_iter().rev() {
             self.remove_host(i);
         }
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let Some(on_screen) = self.hosts.get(self.active) else { return };
+        let prefs = UiPrefs {
+            sidebar_w: Some(on_screen.state.sidebar_w),
+            sidebar_hidden: on_screen.state.sidebar_hidden,
+            term_font: Some(on_screen.state.term_font),
+            active_host: Some(on_screen.net.host_name()),
+            collapsed_hosts: self
+                .hosts
+                .iter()
+                .filter(|h| h.state.host_collapsed)
+                .map(|h| h.net.host_name())
+                .collect(),
+            collapsed_folders: self
+                .hosts
+                .iter()
+                .flat_map(|h| {
+                    let name = h.net.host_name();
+                    h.state.collapsed.iter().map(move |f| (name.clone(), f.clone()))
+                })
+                .collect(),
+        };
+        eframe::set_value(storage, PREFS_KEY, &prefs);
     }
 
     /// Runs even when the window is hidden (as long as a repaint was requested),
