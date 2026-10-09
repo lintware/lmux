@@ -235,7 +235,7 @@ impl eframe::App for LmuxApp {
             if minimized {
                 h.state.native_rects.clear();
             }
-            self.webviews.sync(frame, &ctx, &h.net.host_name(), &mut h.state, over);
+            self.webviews.place(frame, &ctx, &h.net.host_name(), &mut h.state, over);
         }
 
         self.poll_installs(&ctx);
@@ -339,8 +339,18 @@ impl eframe::App for LmuxApp {
 
     /// Runs even when the window is hidden (as long as a repaint was requested),
     /// so streaming stops promptly on minimise and reconnects are not missed.
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.pump(ctx);
+        // In-app browsers answer agents even while the window is not drawn.
+        #[cfg(target_os = "macos")]
+        {
+            for h in &mut self.hosts {
+                self.webviews.service(frame, ctx, &h.net.host_name(), &mut h.state);
+            }
+            self.flush();
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = frame;
         // While minimised, `ui` may not run at all; keep the link alive here and
         // tell the daemon to stop streaming.
         if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {

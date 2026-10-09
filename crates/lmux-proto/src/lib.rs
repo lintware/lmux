@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod frame;
+pub mod browser_js;
 pub mod methods;
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -299,6 +300,31 @@ pub enum ClientMsg {
         surface: Ref,
         seq: u32,
     },
+    /// The outcome of an [`ServerMsg::AppBrowserCall`]: a value, or an error.
+    AppBrowserResult {
+        id: u64,
+        #[serde(default)]
+        value: serde_json::Value,
+        #[serde(default)]
+        error: Option<String>,
+    },
+}
+
+/// One step of an agent's browser command, for a browser the app draws
+/// (`SurfaceKind::Browser { in_app: true }`). The daemon turns a command into
+/// steps; the app runs each in its WebKit view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum AppBrowserOp {
+    /// Evaluate a script; the value is what WebKit returns for it, as JSON.
+    Eval { script: String },
+    Navigate { url: String },
+    Back,
+    Forward,
+    Reload,
+    Stop,
+    /// The visible page as a PNG: `{"png_base64": "..."}`.
+    Screenshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -342,6 +368,13 @@ pub enum ServerMsg {
     Log {
         workspace: Option<Ref>,
         entry: LogEntry,
+    },
+    /// Run a step in a browser the app draws; answered by
+    /// [`ClientMsg::AppBrowserResult`] with the same `id`.
+    AppBrowserCall {
+        id: u64,
+        surface: Ref,
+        op: AppBrowserOp,
     },
 }
 

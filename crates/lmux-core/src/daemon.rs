@@ -219,6 +219,9 @@ impl ClientSink {
 #[derive(Default)]
 struct Clients {
     conns: HashMap<u64, Arc<ClientSink>>,
+    /// Connections that are lmux apps (they said so in `hello`), oldest
+    /// first: they draw in-app browsers and run steps in them.
+    apps: Vec<u64>,
     /// surface -> connection ids subscribed.
     subs: HashMap<Ref, HashSet<u64>>,
     next_id: u64,
@@ -284,6 +287,8 @@ pub struct Inner {
     scrollback_dirty: std::sync::Mutex<HashSet<Ref>>,
     /// Pull request lookups by `cwd\0branch`, with when they were made.
     prs: std::sync::Mutex<HashMap<String, (Option<lmux_proto::PullRequest>, Instant)>>,
+    /// Steps sent to an app for its in-app browsers, awaiting answers.
+    pub(crate) app_calls: std::sync::Mutex<crate::app_browser::AppCalls>,
 }
 
 #[derive(Default)]
@@ -357,6 +362,7 @@ impl Inner {
         let orphaned: Vec<Ref> = {
             let mut c = self.clients.lock().await;
             c.conns.remove(&id);
+            c.apps.retain(|a| *a != id);
             c.subs
                 .iter_mut()
                 .filter_map(|(surface, set)| (set.remove(&id) && set.is_empty()).then(|| surface.clone()))
@@ -370,6 +376,28 @@ impl Inner {
                 }
             }
         }
+    }
+
+    /// Send a step to the app that draws `surface` (the newest app connected),
+    /// returning the call id and where its answer will arrive.
+    pub(crate) async fn call_app(
+        &self,
+        surface: &str,
+        op: AppBrowserOp,
+    ) -> Result<(u64, tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>>), String> {
+        let sink = {
+            let c = self.clients.lock().await;
+            c.apps.iter().rev().find_map(|a| c.conns.get(a).cloned())
+        };
+        let Some(sink) = sink else {
+            return Err("this browser runs in the lmux app, and no lmux app is connected".into());
+        };
+        let (id, rx) = self.app_calls.lock().unwrap().start();
+        if !sink.push(Out::Msg(ServerMsg::AppBrowserCall { id, surface: surface.to_owned(), op })) {
+            self.app_calls.lock().unwrap().forget(id);
+            return Err("the lmux app is not keeping up".into());
+        }
+        Ok((id, rx))
     }
 
     async fn add_subscription(&self, id: u64, surface: &str) -> usize {
@@ -1248,6 +1276,7 @@ pub async fn run(cfg: Config, browser: Option<Arc<dyn BrowserBackend>>) -> anyho
         respawn: std::sync::Mutex::new(RespawnState::default()),
         scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
         prs: std::sync::Mutex::new(HashMap::new()),
+        app_calls: Default::default(),
     });
 
     tokio::spawn(tmux_event_loop(inner.clone(), ev_rx));
@@ -1709,7 +1738,14 @@ impl Inner {
         outbox: &Arc<ClientSink>,
     ) {
         match msg {
-            ClientMsg::Hello { .. } => {}
+            ClientMsg::Hello { client_name, .. } => {
+                if client_name.starts_with("lmux-app") {
+                    self.clients.lock().await.apps.push(id);
+                }
+            }
+            ClientMsg::AppBrowserResult { id: call, value, error } => {
+                self.app_calls.lock().unwrap().finish(call, value, error);
+            }
             ClientMsg::Rpc { request } => {
                 let resp = crate::rpc::dispatch(self, &request).await;
                 outbox.push(Out::Msg(ServerMsg::RpcResult { response: resp }));
@@ -2094,6 +2130,7 @@ mod tests {
             respawn: std::sync::Mutex::new(RespawnState::default()),
             scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
             prs: std::sync::Mutex::new(HashMap::new()),
+            app_calls: Default::default(),
         });
         let call = |method: &str, params: serde_json::Value| RpcRequest { id: 1, method: method.into(), params };
 
@@ -2203,6 +2240,7 @@ mod tests {
             respawn: std::sync::Mutex::new(RespawnState::default()),
             scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
             prs: std::sync::Mutex::new(HashMap::new()),
+            app_calls: Default::default(),
         });
 
         // A restart reopens the saved browser tab at its URL.
@@ -2310,6 +2348,7 @@ mod tests {
             respawn: std::sync::Mutex::new(RespawnState::default()),
             scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
             prs: std::sync::Mutex::new(HashMap::new()),
+            app_calls: Default::default(),
         });
 
         let result = async {

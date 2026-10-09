@@ -1666,10 +1666,20 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             ok(id, json!({"surface": surface}))
         }
         m if m.starts_with("browser.") => {
+            // A browser the app draws: the app runs the command's steps.
+            let in_app = {
+                let state = inner.state.lock().await;
+                resolve_browser_surface(&state, params).filter(|sf| {
+                    matches!(state.surface(sf).map(|x| &x.kind), Some(SurfaceKind::Browser { in_app: true, .. }))
+                })
+            };
+            if let Some(surface) = in_app {
+                return match crate::app_browser::handle_rpc(inner, &surface, m, params).await {
+                    Ok(v) => ok(id, v),
+                    Err(e) => RpcResponse { id, result: None, error: Some(e) },
+                };
+            }
             let Some(backend) = &inner.browser else {
-                if inner.cfg.app_browser {
-                    return err(id, RpcErrorCode::Unsupported, "browsers here run in the lmux app; agent control of them is not wired up yet");
-                }
                 return err(id, RpcErrorCode::Unsupported, unsupported(m).message);
             };
             let surface = {

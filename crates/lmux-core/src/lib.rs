@@ -8,6 +8,7 @@
 //! - [`rpc`]: RPC dispatch over the shared `lmux_proto` methods.
 //! - [`daemon`]: the daemon itself — unix socket, websocket server, persistence.
 
+pub mod app_browser;
 pub mod browser;
 pub mod daemon;
 pub mod keys;

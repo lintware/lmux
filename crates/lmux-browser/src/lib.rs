@@ -9,7 +9,7 @@
 
 mod cdp;
 mod chromium;
-mod js;
+use lmux_proto::browser_js as js;
 mod surface;
 
 pub use chromium::BrowserConfig;
@@ -77,17 +77,7 @@ fn req(p: &Value, k: &str) -> Result<String, RpcError> {
     pstr(p, k).ok_or_else(|| err_invalid(format!("missing required param `{k}`")))
 }
 /// `e12` -> `[data-lmux-ref="e12"]`; anything else is treated as a CSS selector.
-fn is_ref(t: &str) -> bool {
-    let b = t.as_bytes();
-    b.len() >= 2 && b[0] == b'e' && b[1..].iter().all(u8::is_ascii_digit)
-}
-fn target_selector(target: &str) -> String {
-    if is_ref(target) {
-        format!("[data-lmux-ref=\"{target}\"]")
-    } else {
-        target.to_string()
-    }
-}
+use lmux_proto::browser_js::target_selector;
 
 // ---------------------------------------------------------------------------
 // Screencast pacing / adaptation
@@ -1754,11 +1744,11 @@ mod tests {
 
     #[test]
     fn ref_detection() {
-        assert!(is_ref("e1"));
-        assert!(is_ref("e42"));
-        assert!(!is_ref("e"));
-        assert!(!is_ref("e1x"));
-        assert!(!is_ref(".button"));
+        assert!(js::is_ref("e1"));
+        assert!(js::is_ref("e42"));
+        assert!(!js::is_ref("e"));
+        assert!(!js::is_ref("e1x"));
+        assert!(!js::is_ref(".button"));
         assert_eq!(target_selector("e3"), "[data-lmux-ref=\"e3\"]");
         assert_eq!(target_selector("#go"), "#go");
     }

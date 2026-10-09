@@ -130,6 +130,16 @@ pub enum NativeCmd {
     Goto(String),
 }
 
+/// A step of an agent's browser command, from the daemon, for a browser the
+/// app draws; answered with `ClientMsg::AppBrowserResult`.
+#[derive(Debug, Clone)]
+pub struct AppCall {
+    pub id: u64,
+    pub surface: Ref,
+    pub op: lmux_proto::AppBrowserOp,
+    pub since: Instant,
+}
+
 pub struct AppState {
     pub tree: Tree,
     /// The host the tree came from, so a create can be aimed at another one.
@@ -249,6 +259,8 @@ pub struct AppState {
     pub native_rects: HashMap<Ref, egui::Rect>,
     /// Toolbar commands for native browsers, run by `crate::webview`.
     pub native_cmds: Vec<(Ref, NativeCmd)>,
+    /// An agent's browser steps for native browsers, run by `crate::webview`.
+    pub app_calls: Vec<AppCall>,
     /// Where each chip was drawn last frame, keyed by surface. Kept so tests can
     /// click the real chip geometry rather than recomputing the layout.
     pub chip_rects: HashMap<Ref, egui::Rect>,
@@ -592,6 +604,7 @@ impl AppState {
             visible: HashSet::new(),
             native_rects: HashMap::new(),
             native_cmds: Vec::new(),
+            app_calls: Vec::new(),
             chip_rects: HashMap::new(),
             card_rects: HashMap::new(),
             folder_rects: HashMap::new(),
@@ -1432,6 +1445,9 @@ impl AppState {
                 }
             }
             ServerMsg::Log { .. } => {}
+            ServerMsg::AppBrowserCall { id, surface, op } => {
+                self.app_calls.push(AppCall { id, surface, op, since: Instant::now() });
+            }
             ServerMsg::RpcResult { response } => {
                 if let Some(reply) = self.browser_replies.remove(&response.id) {
                     self.on_browser_reply(reply, response.result.as_ref());
