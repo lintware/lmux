@@ -300,6 +300,10 @@ struct RespawnState {
     in_flight: HashSet<Ref>,
     /// When an agent was last typed into a respawned pane (see `RESUME_GRACE`).
     resumed_at: HashMap<Ref, Instant>,
+    /// Terminals the user closed. Their windows are never adopted back: a
+    /// kill that failed under load, or a reconcile that listed the windows
+    /// just before the close, used to bring a closed workspace back.
+    closed: HashSet<Ref>,
 }
 
 /// A terminal whose tmux pane is gone and must be started again.
@@ -775,11 +779,21 @@ impl Inner {
             }
 
             // 2. Adopt tagged windows the file did not know about.
+            let closed = self.respawn.lock().unwrap().closed.clone();
             for w in &wins {
                 let Some(surf) = w.surface.clone() else {
                     continue;
                 };
                 if state.surface(&surf).is_some() {
+                    continue;
+                }
+                if closed.contains(&surf) {
+                    tracing::info!(surface = %surf, window = %w.window, "killing a closed terminal's leftover window");
+                    let tmux = self.tmux.clone();
+                    let window = w.window.clone();
+                    tokio::spawn(async move {
+                        let _ = tmux.kill_window(&window).await;
+                    });
                     continue;
                 }
                 let ws_ref = w
@@ -1260,6 +1274,15 @@ impl Inner {
         }
         scrollback::prune(&self.cfg.state_dir, &terminals).await;
         written
+    }
+
+    /// Kill a terminal the user closed, and remember it was closed so its
+    /// window is never adopted back if the kill did not take.
+    pub(crate) async fn kill_closed_terminal(&self, surface: &str, window: &str) {
+        self.respawn.lock().unwrap().closed.insert(surface.to_owned());
+        if let Err(e) = self.tmux.kill_window(window).await {
+            tracing::warn!(%surface, %window, "closing terminal: {e}");
+        }
     }
 
     /// Drop a closed terminal's saved scrollback.
@@ -2331,6 +2354,119 @@ mod tests {
         let started = wait_for(5, || async { inner.is_streaming(&surf).await }).await;
         assert!(started, "no stream for the second viewer: {:?}", fake.calls.lock().unwrap());
         assert_eq!(fake.calls.lock().unwrap().last().unwrap(), &format!("start {surf} 900x600"));
+    }
+
+    /// A closed workspace whose window outlived the kill (tmux too busy to
+    /// answer) is not adopted back by the next reconcile: the window is killed.
+    #[tokio::test]
+    async fn a_closed_workspace_is_not_adopted_back() {
+        if !tmux_cmd("lmux-test-probe-unused", &["-V"]).await {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        let socket = format!("lmux-test-closed-{}", std::process::id());
+        let _scratch = crate::tmux::ScratchServer(socket.clone());
+        let state_dir = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(work.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let tmux = match Tmux::spawn(
+            TmuxConfig {
+                socket: socket.clone(),
+                session: "lmux".into(),
+            },
+            ev_tx,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping: could not start tmux ({e})");
+                return;
+            }
+        };
+        // A plain shell keeps the test independent of the user's rc files.
+        tmux_cmd(&socket, &["set-option", "-g", "default-shell", "/bin/sh"]).await;
+
+        let mut state = SessionState::new("t");
+        let ws = state.next_workspace();
+        let pane_ref = state.next_pane();
+        let surf = state.next_surface();
+        state.add_workspace(Workspace {
+            id: ws.clone(),
+            title: "w".into(),
+            folder: None,
+            cwd: cwd.clone(),
+            git_branch: None,
+            agent: AgentState::None,
+            summary: None,
+            unread_notifications: 0,
+            status_pills: vec![],
+            progress: None,
+            layout: Layout::Pane {
+                pane: pane_ref.clone(),
+            },
+            panes: vec![Pane {
+                id: pane_ref.clone(),
+                surfaces: vec![terminal_surface(surf.clone(), "t", 80, 24)],
+                active_surface: Some(surf.clone()),
+            }],
+            focused_pane: Some(pane_ref),
+            ports: vec![],
+            pr: None,
+        });
+        let inner = Arc::new(Inner {
+            cfg: Config {
+                state_dir: state_dir.path().to_path_buf(),
+                socket: None,
+                tmux_socket: socket.clone(),
+                ws_addr: "127.0.0.1:1".into(),
+                host: "t".into(),
+                app_browser: false,
+            },
+            state: Mutex::new(state),
+            tmux,
+            browser: None,
+            browser_streaming: Mutex::new(HashSet::new()),
+            browser_sizes: Default::default(),
+            clients: Mutex::new(Clients::default()),
+            dirty: Notify::new(),
+            tree_dirty: Notify::new(),
+            respawn: std::sync::Mutex::new(RespawnState::default()),
+            scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
+            pane_activity: Default::default(),
+            paused_output: Default::default(),
+            prs: std::sync::Mutex::new(HashMap::new()),
+            app_calls: Default::default(),
+        });
+
+        let result = async {
+            let (window, _pane) =
+                crate::rpc::spawn_terminal(&inner, &ws, &surf, "t", &cwd, None, 80, 24)
+                    .await
+                    .map_err(|e| format!("spawn: {e}"))?;
+            // The close as it went under load: the workspace left the state,
+            // the kill never reached tmux.
+            inner.respawn.lock().unwrap().closed.insert(surf.clone());
+            inner.state.lock().await.remove_workspace(&ws);
+            inner.reconcile().await;
+            if inner.state.lock().await.workspace(&ws).is_some() {
+                return Err("the closed workspace was adopted back".to_string());
+            }
+            let gone = wait_for(5, || async { !inner.tmux.window_exists(&window).await }).await;
+            if !gone {
+                return Err("the closed terminal's window was left running".to_string());
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            panic!("{e}");
+        }
     }
 
     /// End to end: output in a terminal is saved to its scrollback file; after

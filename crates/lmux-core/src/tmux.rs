@@ -434,10 +434,30 @@ impl Tmux {
         Ok(())
     }
 
+    /// Kill a window, by way of a separate tmux process when the control
+    /// client cannot (it is restarting, or tmux is too busy to answer it).
+    /// A window that is already gone counts as killed.
     pub async fn kill_window(&self, window: &str) -> anyhow::Result<()> {
-        // Ignore "window not found" style errors; the goal is gone-ness.
-        let _ = self.command(format!("kill-window -t {window}")).await;
-        Ok(())
+        let line = format!("kill-window -t {window}");
+        let via_control = tokio::time::timeout(Duration::from_secs(5), self.command(line)).await;
+        if matches!(via_control, Ok(Ok(_))) {
+            return Ok(());
+        }
+        let out = Command::new("tmux")
+            .args(["-L", &self.shared.socket, "kill-window", "-t", window])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output();
+        let out = tokio::time::timeout(Duration::from_secs(10), out)
+            .await
+            .map_err(|_| anyhow!("kill-window {window} timed out"))?
+            .context("running tmux kill-window")?;
+        let err = String::from_utf8_lossy(&out.stderr);
+        if out.status.success() || err.contains("can't find window") || err.contains("no server running") {
+            Ok(())
+        } else {
+            Err(anyhow!("kill-window {window}: {}", err.trim()))
+        }
     }
 
     /// True while `window` (an `@N` id) is alive. tmux answers

@@ -2149,7 +2149,7 @@ async fn close_surface(inner: &Arc<Inner>, surface: &str) {
         )
     };
     if let Some(term) = term {
-        let _ = inner.tmux.kill_window(&term.window).await;
+        inner.kill_closed_terminal(surface, &term.window).await;
         inner.state.lock().await.remove_term(surface);
     }
     if is_browser {
@@ -2190,7 +2190,7 @@ async fn close_workspace(inner: &Arc<Inner>, ws: &str) {
     };
     for (surface, is_browser) in surfaces {
         if let Some(term) = inner.surface_term(&surface).await {
-            let _ = inner.tmux.kill_window(&term.window).await;
+            inner.kill_closed_terminal(&surface, &term.window).await;
             inner.state.lock().await.remove_term(&surface);
         }
         inner.forget_scrollback(&surface).await;
