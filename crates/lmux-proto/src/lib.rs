@@ -269,6 +269,11 @@ pub enum ClientMsg {
     /// (`term_snapshot`, or for browsers a first frame) and then live updates.
     Subscribe {
         surface: Ref,
+        /// For a terminal: also this many lines of tmux's history before the
+        /// screen. The app asks when it is scrolled back, so what it shows is
+        /// tmux's history, not its own replay of the stream.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        history: Option<u32>,
     },
     /// Stop streaming. Browser screencasts stop when no client is subscribed.
     Unsubscribe {

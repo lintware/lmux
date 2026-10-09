@@ -382,6 +382,7 @@ async fn ws_probe(addr: &str, surface: &str, timeout_secs: u64, resizes: u64) ->
     sink.send(Message::Text(serde_json::to_string(&hello)?)).await?;
     let sub = ClientMsg::Subscribe {
         surface: surface.to_string(),
+        history: None,
     };
     sink.send(Message::Text(serde_json::to_string(&sub)?)).await?;
     println!("subscribed to {surface}");

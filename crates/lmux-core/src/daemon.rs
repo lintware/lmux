@@ -1750,7 +1750,7 @@ impl Inner {
                 let resp = crate::rpc::dispatch(self, &request).await;
                 outbox.push(Out::Msg(ServerMsg::RpcResult { response: resp }));
             }
-            ClientMsg::Subscribe { surface } => {
+            ClientMsg::Subscribe { surface, history } => {
                 let count = self.add_subscription(id, &surface).await;
                 let kind = self
                     .state
@@ -1761,7 +1761,7 @@ impl Inner {
                 match kind {
                     Some(SurfaceKind::Terminal { .. }) => {
                         if let Some(term) = self.surface_term(&surface).await {
-                            match self.tmux.snapshot(&term.pane).await {
+                            match self.tmux.snapshot_with_history(&term.pane, history.unwrap_or(0)).await {
                                 Ok((cols, rows, data)) => {
                                     outbox.push(Out::Msg(ServerMsg::TermSnapshot {
                                         surface,
@@ -2249,7 +2249,7 @@ mod tests {
 
         let a_sink = ClientSink::new(64);
         let a = inner.register(a_sink.clone()).await;
-        inner.handle_client_msg(a, ClientMsg::Subscribe { surface: surf.clone() }, &a_sink).await;
+        inner.handle_client_msg(a, ClientMsg::Subscribe { surface: surf.clone(), history: None }, &a_sink).await;
         let resize = ClientMsg::BrowserResize { surface: surf.clone(), width: 900, height: 600, device_scale_factor: 1.0 };
         inner.handle_client_msg(a, resize, &a_sink).await;
         inner.unregister(a).await;
@@ -2258,7 +2258,7 @@ mod tests {
 
         let b_sink = ClientSink::new(64);
         let b = inner.register(b_sink.clone()).await;
-        inner.handle_client_msg(b, ClientMsg::Subscribe { surface: surf.clone() }, &b_sink).await;
+        inner.handle_client_msg(b, ClientMsg::Subscribe { surface: surf.clone(), history: None }, &b_sink).await;
         let started = wait_for(5, || async { inner.is_streaming(&surf).await }).await;
         tmux_cmd(&socket, &["kill-server"]).await;
         assert!(started, "no stream for the second viewer: {:?}", fake.calls.lock().unwrap());

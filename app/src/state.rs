@@ -120,6 +120,9 @@ impl BrowserView {
     }
 }
 
+/// Lines of tmux history fetched when a streamed terminal is scrolled back.
+pub const STREAMED_HISTORY: u32 = 3000;
+
 /// What the toolbar asks of a browser the app draws itself (`crate::webview`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum NativeCmd {
@@ -1643,7 +1646,7 @@ impl AppState {
             b.wants_visible = visible_now;
             if visible_now && !b.subscribed {
                 b.subscribed = true;
-                self.pending.push(ClientMsg::Subscribe { surface: id.clone() });
+                self.pending.push(ClientMsg::Subscribe { surface: id.clone(), history: None });
             } else if !visible_now && b.subscribed {
                 b.subscribed = false;
                 b.sent_size = None;
@@ -1662,7 +1665,7 @@ impl AppState {
             t.wants_visible = visible_now;
             if visible_now && !t.subscribed {
                 t.subscribed = true;
-                self.pending.push(ClientMsg::Subscribe { surface: id.clone() });
+                self.pending.push(ClientMsg::Subscribe { surface: id.clone(), history: None });
             } else if !visible_now && t.subscribed {
                 t.subscribed = false;
                 self.pending.push(ClientMsg::Unsubscribe { surface: id.clone() });
@@ -1869,6 +1872,24 @@ impl AppState {
         self.terms.values_mut().flat_map(|t| t.take_clipboard()).collect()
     }
 
+    /// Scroll a terminal the daemon streams. Its local history is a replay of
+    /// the stream, which goes wrong when the size changed mid-stream or a
+    /// program redrew its whole frame; so leaving the bottom first fetches
+    /// tmux's own history (a snapshot with it) and scrolls once that is in.
+    pub fn scroll_streamed(&mut self, surface: &str, lines: i32) {
+        let Some(tv) = self.terms.get_mut(surface) else { return };
+        if let Some(pending) = tv.history_scroll.as_mut() {
+            *pending = (*pending + lines).max(0);
+            return;
+        }
+        if lines > 0 && tv.display_offset() == 0 && tv.subscribed {
+            tv.history_scroll = Some(lines);
+            self.pending.push(ClientMsg::Subscribe { surface: surface.to_owned(), history: Some(STREAMED_HISTORY) });
+            return;
+        }
+        tv.scroll(lines);
+    }
+
     pub fn send_term_input(&mut self, surface: &str, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -1907,6 +1928,7 @@ impl AppState {
     pub fn reset_subscriptions(&mut self) {
         for t in self.terms.values_mut() {
             t.subscribed = false;
+            t.history_scroll = None;
         }
         for b in self.browsers.values_mut() {
             b.subscribed = false;
@@ -1952,6 +1974,27 @@ impl AppState {
 mod tests {
     use super::*;
     use lmux_proto::{AgentState, Layout, Pane, Progress, SplitDirection, Surface, SurfaceKind, Tree, Workspace};
+    /// Scrolling back a streamed terminal fetches tmux's history first, then
+    /// scrolls into it once the snapshot carrying it is in.
+    #[test]
+    fn streamed_scrollback_comes_from_tmux() {
+        let mut s = AppState::new();
+        let tv = s.terms.entry("surface:1".into()).or_insert_with(|| TermView::new(20, 3));
+        tv.subscribed = true;
+        s.scroll_streamed("surface:1", 2);
+        assert!(s.pending.iter().any(|m| matches!(m,
+            ClientMsg::Subscribe { surface, history: Some(_) } if surface == "surface:1")));
+        assert_eq!(s.terms["surface:1"].display_offset(), 0, "nothing to scroll into yet");
+        // More wheel while waiting adds up.
+        s.scroll_streamed("surface:1", 1);
+        let history: String = (1..=10).map(|i| format!("{i}\r\n")).collect();
+        s.terms.get_mut("surface:1").unwrap().apply_snapshot(20, 3, &history);
+        assert_eq!(s.terms["surface:1"].display_offset(), 3);
+        // Further scrolling is local, until back at the bottom.
+        s.scroll_streamed("surface:1", -3);
+        assert_eq!(s.terms["surface:1"].display_offset(), 0);
+    }
+
 
     fn term(id: &str) -> Surface {
         Surface {
@@ -2106,7 +2149,7 @@ mod tests {
         assert!(
             st.pending
                 .iter()
-                .any(|m| matches!(m, ClientMsg::Subscribe { surface } if surface == "b1")),
+                .any(|m| matches!(m, ClientMsg::Subscribe { surface, .. } if surface == "b1")),
             "a browser pane still subscribes on the local host: {:?}",
             st.pending
         );

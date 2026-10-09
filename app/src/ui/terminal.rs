@@ -301,8 +301,12 @@ fn wheel_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Grid,
         let app_cursor = mode.contains(TermMode::APP_CURSOR);
         let seq = crate::keys::terminal_key_mode(key, egui::Modifiers::default(), app_cursor).unwrap_or_default();
         c.state.write_local(surface, &seq.repeat(count));
-    } else if let Some(tv) = c.state.terms.get_mut(surface) {
-        tv.scroll(lines);
+    } else if pty_attached {
+        if let Some(tv) = c.state.terms.get_mut(surface) {
+            tv.scroll(lines);
+        }
+    } else {
+        c.state.scroll_streamed(surface, lines);
     }
 }
 

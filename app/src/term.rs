@@ -66,6 +66,9 @@ pub struct TermView {
     /// Wheel remainder: points that did not add up to a whole line yet, so a
     /// trackpad's small deltas still scroll instead of rounding away to zero.
     scroll_accum: f32,
+    /// Lines to scroll back once the snapshot with tmux's history arrives
+    /// (asked for when a streamed terminal starts scrolling back).
+    pub history_scroll: Option<i32>,
     /// Wanted by the UI as visible (drives subscribe/unsubscribe).
     pub wants_visible: bool,
     /// Currently subscribed on the daemon.
@@ -111,6 +114,7 @@ impl TermView {
             processor: Processor::new(),
             size,
             scroll_accum: 0.0,
+            history_scroll: None,
             wants_visible: false,
             subscribed: false,
             have_snapshot: false,
@@ -156,6 +160,9 @@ impl TermView {
         self.size = size;
         self.feed(data.as_bytes());
         self.have_snapshot = true;
+        if let Some(lines) = self.history_scroll.take() {
+            self.scroll(lines);
+        }
     }
 
     /// Text programs copied with OSC 52 since the last call, oldest first.

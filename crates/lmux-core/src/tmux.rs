@@ -391,8 +391,16 @@ impl Tmux {
     /// Full screen snapshot as ANSI text that reproduces the pane in a fresh
     /// terminal, ending with the cursor positioned.
     pub async fn snapshot(&self, pane: &str) -> anyhow::Result<(u16, u16, String)> {
-        let cap = self.capture(pane, true, None).await?;
+        self.snapshot_with_history(pane, 0).await
+    }
+
+    /// [`Self::snapshot`] with up to `history` lines of scrollback written
+    /// first, so they scroll off the top of a fresh terminal into its history.
+    /// A program on the alternate screen has none.
+    pub async fn snapshot_with_history(&self, pane: &str, history: u32) -> anyhow::Result<(u16, u16, String)> {
         let (cx, cy, alt, cols, rows) = self.pane_meta(pane).await?;
+        let start = (history > 0 && !alt).then(|| -(history.min(i32::MAX as u32) as i32));
+        let cap = self.capture(pane, true, start).await?;
         let mut out = String::with_capacity(cap.len() + 32);
         if alt {
             out.push_str("\x1b[?1049h\x1b[H");
@@ -1136,5 +1144,41 @@ mod tests {
         assert!(sent.is_ok(), "send_bytes failed: {sent:?}");
         assert_eq!(got.len(), payload.len(), "every byte arrives");
         assert!(got == payload, "in order");
+    }
+
+    /// A snapshot can carry tmux's history before the screen, for a viewer
+    /// scrolled back; the plain one is the screen alone.
+    #[tokio::test]
+    async fn snapshot_carries_history_when_asked() {
+        if Command::new("tmux").arg("-V").output().await.is_err() {
+            return;
+        }
+        let socket = format!("lmux-test-hist-{}", std::process::id());
+        let cfg = TmuxConfig { socket: socket.clone(), session: "lmux".into() };
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let tmux = match Tmux::spawn(cfg, ev_tx).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping: could not start tmux ({e})");
+                return;
+            }
+        };
+        let (_w, pane) = tmux
+            .new_terminal("/tmp", Some("seq 1 100; sleep 30"), &[], 80, 24, "h", "surface:1", "workspace:1")
+            .await
+            .expect("new_terminal");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let plain = tmux.snapshot(&pane).await.map(|(_, _, d)| d);
+        let full = tmux.snapshot_with_history(&pane, 1000).await.map(|(_, _, d)| d);
+        let _ = Command::new("tmux")
+            .args(["-L", &socket, "kill-server"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        let (plain, full) = (plain.expect("snapshot"), full.expect("snapshot with history"));
+        assert!(full.contains("\r\n1\r\n2\r\n3\r\n") || full.contains("H1\r\n2\r\n3\r\n"), "history from the first line: {full:?}");
+        assert!(!plain.contains("\r\n2\r\n3\r\n"), "the plain snapshot is the screen alone");
+        assert!(plain.contains("100"));
     }
 }
