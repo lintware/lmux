@@ -118,6 +118,13 @@ pub struct ServerArgs {
     /// Chromium here (implies --no-browser).
     #[arg(long)]
     pub app_browser: bool,
+    /// The WebKit helper that runs browser pages here (default
+    /// ~/.local/libexec/lmux/lmux-webkit when it exists; else Chromium).
+    #[arg(long)]
+    pub webkit_helper: Option<PathBuf>,
+    /// Use Chromium even when a WebKit helper is installed.
+    #[arg(long)]
+    pub chromium: bool,
 }
 
 /// `--surface` / `--workspace`, as most terminal commands take them.

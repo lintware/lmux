@@ -59,7 +59,20 @@ ssh -o BatchMode=yes "$target" "$env_path"'set -e
   cargo=$(command -v cargo)
   cd ~/lmux.new && "$cargo" build --release -p lmux 2>&1 | tail -1
   rm -rf ~/lmux.old; [ -d ~/lmux ] && mv ~/lmux ~/lmux.old; mv ~/lmux.new ~/lmux
-  mkdir -p ~/.local/bin && install -m755 ~/lmux/target/release/lmux ~/.local/bin/lmux'
+  mkdir -p ~/.local/bin && install -m755 ~/lmux/target/release/lmux ~/.local/bin/lmux
+  # Browser pages run in WebKit on the host when its helper is installed
+  # (else the daemon uses Chromium).
+  mkdir -p ~/.local/libexec/lmux
+  helper=~/.local/libexec/lmux/lmux-webkit
+  if [ "$(uname)" = Darwin ]; then
+    rm -f "$helper.new"
+    command -v swiftc >/dev/null && swiftc -O -o "$helper.new" ~/lmux/helpers/webkit-mac/main.swift 2>&1 | tail -3
+    if [ -x "$helper.new" ]; then
+      mv "$helper.new" "$helper" && echo "WebKit helper built"
+    else
+      echo "no WebKit helper (swiftc missing or failed: xcode-select --install); browsers use Chromium"
+    fi
+  fi'
 
 echo "==> starting lmuxd"
 ssh -o BatchMode=yes "$target" "$env_path"'set -e

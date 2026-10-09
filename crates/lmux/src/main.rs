@@ -102,9 +102,26 @@ async fn run() -> anyhow::Result<()> {
             };
             // Browser backend is wired in here: this is the only crate that
             // sees both the daemon's trait and the engine.
+            // WebKit when a helper is installed (as cmux, but on the host),
+            // unless Chromium is asked for.
+            let webkit = args.webkit_helper.clone().or_else(|| {
+                let p = dirs_home()?.join(".local/libexec/lmux/lmux-webkit");
+                (!args.chromium && args.chromium_path.is_none() && p.is_file()).then_some(p)
+            });
             let browser: Option<std::sync::Arc<dyn lmux_core::BrowserBackend>> = if args.no_browser || args.app_browser {
-                tracing::info!("no Chromium here (--no-browser or --app-browser)");
+                tracing::info!("no browser engine here (--no-browser or --app-browser)");
                 None
+            } else if let Some(helper) = webkit {
+                match lmux_core::webkit::WebKitBackend::launch(helper.clone()).await {
+                    Ok(b) => {
+                        tracing::info!(helper = %helper.display(), "browser backend ready (WebKit)");
+                        Some(std::sync::Arc::new(b) as std::sync::Arc<dyn lmux_core::BrowserBackend>)
+                    }
+                    Err(e) => {
+                        tracing::warn!("WebKit helper unavailable ({e}); terminals only");
+                        None
+                    }
+                }
             } else {
                 match browser_adapter::ChromiumBackend::launch(args.chromium_path.clone()).await {
                     Ok(backend) => {
@@ -485,4 +502,9 @@ async fn ws_probe(addr: &str, surface: &str, timeout_secs: u64, resizes: u64) ->
         "probe summary: snapshot={got_snapshot} input_sent={sent_input} output_bytes={output_bytes} tree_msgs={tree_msgs}"
     );
     Ok(())
+}
+
+/// `$HOME`, where the installer puts the WebKit helper.
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }

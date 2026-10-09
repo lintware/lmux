@@ -1,14 +1,15 @@
-//! Agent control of browsers the app draws (`in_app` surfaces, under
-//! `lmux server --app-browser`). The page lives in a WebKit view in the lmux
-//! app, so each `browser.*` command becomes steps ([`AppBrowserOp`]) sent to a
-//! connected app, which runs them and answers. The steps are mostly the same
-//! JavaScript the Chromium backend runs (`lmux_proto::browser_js`); input is
-//! DOM events, since WebKit has no CDP.
+//! Agent control of WebKit browsers. Each `browser.*` command becomes steps
+//! ([`AppBrowserOp`]) run in one page by a [`Steps`]: the lmux app, for the
+//! browsers it draws (`in_app` surfaces, under `lmux server --app-browser`),
+//! or a WebKit helper process on the host (`crate::webkit`). The steps are
+//! mostly the same JavaScript the Chromium backend runs
+//! (`lmux_proto::browser_js`); input is DOM events, since WebKit has no CDP.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use base64::Engine as _;
 use lmux_proto::browser_js as js;
 use lmux_proto::browser_js::target_selector;
@@ -72,8 +73,26 @@ fn req(params: &Value, key: &str) -> Result<String, RpcError> {
     pstr(params, key).ok_or_else(|| invalid(format!("missing `{key}`")))
 }
 
+/// Runs one step of a command in a WebKit page. An `Eval` answers with
+/// WebKit's JSON for the script's value, as text (see [`decode`]); a
+/// `Screenshot` with `{"png_base64": ...}`.
+#[async_trait]
+pub trait Steps: Send + Sync {
+    async fn step(&self, surface: &str, op: AppBrowserOp) -> Result<Value, RpcError>;
+}
+
+/// Steps run by the lmux app connected to this daemon, for in-app browsers.
+pub struct ViaApp<'a>(pub &'a Arc<Inner>);
+
+#[async_trait]
+impl Steps for ViaApp<'_> {
+    async fn step(&self, surface: &str, op: AppBrowserOp) -> Result<Value, RpcError> {
+        step_via_app(self.0, surface, op).await
+    }
+}
+
 /// Run one step in the app drawing `surface`.
-async fn step(inner: &Arc<Inner>, surface: &str, op: AppBrowserOp) -> Result<Value, RpcError> {
+async fn step_via_app(inner: &Arc<Inner>, surface: &str, op: AppBrowserOp) -> Result<Value, RpcError> {
     let (id, rx) = inner
         .call_app(surface, op)
         .await
@@ -111,8 +130,8 @@ fn decode(raw: &Value) -> Result<Value, RpcError> {
 }
 
 /// Evaluate a JS expression in the page and return its value.
-async fn eval(inner: &Arc<Inner>, surface: &str, expr: &str) -> Result<Value, RpcError> {
-    let raw = step(inner, surface, AppBrowserOp::Eval { script: js::wrap_expr(expr) }).await?;
+async fn eval(s: &dyn Steps, surface: &str, expr: &str) -> Result<Value, RpcError> {
+    let raw = s.step(surface, AppBrowserOp::Eval { script: js::wrap_expr(expr) }).await?;
     decode(&raw)
 }
 
@@ -163,26 +182,31 @@ fn parse_key(combo: &str) -> (String, bool, bool, bool, bool) {
     (key, ctrl, alt, shift, meta)
 }
 
-/// Every `browser.*` method for an in-app browser, with the results the
+/// Every `browser.*` method for a WebKit browser, with the results the
 /// Chromium backend gives.
-pub async fn handle_rpc(inner: &Arc<Inner>, surface: &str, method: &str, params: &Value) -> Result<Value, RpcError> {
+pub async fn handle_rpc(s: &dyn Steps, surface: &str, method: &str, params: &Value) -> Result<Value, RpcError> {
     match method {
         m::BROWSER_GOTO => {
             let url = req(params, "url")?;
-            step(inner, surface, AppBrowserOp::Navigate { url: url.clone() }).await?;
+            s.step(surface, AppBrowserOp::Navigate { url: url.clone() }).await?;
             Ok(json!({ "url": url }))
         }
-        m::BROWSER_BACK => step(inner, surface, AppBrowserOp::Back).await.map(|_| json!({})),
-        m::BROWSER_FORWARD => step(inner, surface, AppBrowserOp::Forward).await.map(|_| json!({})),
-        m::BROWSER_RELOAD => step(inner, surface, AppBrowserOp::Reload).await.map(|_| json!({})),
-        m::BROWSER_STOP => step(inner, surface, AppBrowserOp::Stop).await.map(|_| json!({})),
+        m::BROWSER_BACK => s.step(surface, AppBrowserOp::Back).await.map(|_| json!({})),
+        m::BROWSER_FORWARD => s.step(surface, AppBrowserOp::Forward).await.map(|_| json!({})),
+        m::BROWSER_RELOAD => s.step(surface, AppBrowserOp::Reload).await.map(|_| json!({})),
+        m::BROWSER_STOP => s.step(surface, AppBrowserOp::Stop).await.map(|_| json!({})),
+        m::BROWSER_LINK_AT => {
+            let num = |k: &str| params.get(k).and_then(Value::as_f64).ok_or_else(|| invalid(format!("missing `{k}`")));
+            let href = eval(s, surface, &js::link_at_expr(num("x")?, num("y")?)).await?;
+            Ok(json!({ "href": href }))
+        }
         m::BROWSER_URL => {
-            let v = eval(inner, surface, "({url: location.href, title: document.title})").await?;
+            let v = eval(s, surface, "({url: location.href, title: document.title})").await?;
             Ok(json!({ "url": v.get("url").cloned().unwrap_or(Value::Null), "title": v.get("title").cloned().unwrap_or(Value::Null) }))
         }
         m::BROWSER_SNAPSHOT => {
             let interactive = params.get("interactive").and_then(Value::as_bool).unwrap_or(false);
-            let v = eval(inner, surface, &js::snapshot_expr(interactive)).await?;
+            let v = eval(s, surface, &js::snapshot_expr(interactive)).await?;
             Ok(json!({
                 "text": v.get("text").and_then(Value::as_str).unwrap_or(""),
                 "refs": v.get("refs").cloned().unwrap_or_else(|| json!([])),
@@ -195,39 +219,39 @@ pub async fn handle_rpc(inner: &Arc<Inner>, surface: &str, method: &str, params:
                 m::BROWSER_DBLCLICK => 2,
                 _ => 0,
             };
-            found(&eval(inner, surface, &js::pointer_expr(&sel, count)).await?, &sel)?;
+            found(&eval(s, surface, &js::pointer_expr(&sel, count)).await?, &sel)?;
             Ok(json!({}))
         }
         m::BROWSER_TYPE => {
             let sel = target_selector(&req(params, "target")?);
             let text = req(params, "text")?;
-            found(&eval(inner, surface, &js::type_expr(Some(&sel), &text)).await?, &sel)?;
+            found(&eval(s, surface, &js::type_expr(Some(&sel), &text)).await?, &sel)?;
             Ok(json!({ "typed": text.chars().count() }))
         }
         m::BROWSER_FILL => {
             let sel = target_selector(&req(params, "target")?);
             let text = pstr(params, "text").unwrap_or_default();
-            found(&eval(inner, surface, &js::clear_expr(&sel)).await?, &sel)?;
-            eval(inner, surface, &js::type_expr(Some(&sel), &text)).await?;
+            found(&eval(s, surface, &js::clear_expr(&sel)).await?, &sel)?;
+            eval(s, surface, &js::type_expr(Some(&sel), &text)).await?;
             Ok(json!({ "filled": text.chars().count() }))
         }
         m::BROWSER_PRESS => {
             let combo = req(params, "key")?;
             if let Some(target) = pstr(params, "target") {
                 let sel = target_selector(&target);
-                found(&eval(inner, surface, &js::focus_expr(&sel)).await?, &sel)?;
+                found(&eval(s, surface, &js::focus_expr(&sel)).await?, &sel)?;
             }
             let (key, ctrl, alt, shift, meta) = parse_key(&combo);
             if key.is_empty() {
                 return Err(invalid(format!("unknown key `{combo}`")));
             }
-            eval(inner, surface, &js::press_expr(&key, ctrl, alt, shift, meta)).await?;
+            eval(s, surface, &js::press_expr(&key, ctrl, alt, shift, meta)).await?;
             Ok(json!({}))
         }
         m::BROWSER_SELECT => {
             let sel = target_selector(&req(params, "target")?);
             let value = req(params, "value")?;
-            let r = eval(inner, surface, &js::select_expr(&sel, &value)).await?;
+            let r = eval(s, surface, &js::select_expr(&sel, &value)).await?;
             found(&r, &sel)?;
             if r.get("ok").and_then(Value::as_bool) != Some(true) {
                 return Err(not_found(format!("no option matching `{value}`")));
@@ -238,7 +262,7 @@ pub async fn handle_rpc(inner: &Arc<Inner>, surface: &str, method: &str, params:
             let dx = params.get("dx").and_then(Value::as_f64).unwrap_or(0.0);
             let dy = params.get("dy").and_then(Value::as_f64).unwrap_or(0.0);
             let sel = pstr(params, "target").map(|t| target_selector(&t));
-            let r = eval(inner, surface, &js::scroll_expr(sel.as_deref(), dx, dy)).await?;
+            let r = eval(s, surface, &js::scroll_expr(sel.as_deref(), dx, dy)).await?;
             if r.get("found").and_then(Value::as_bool) == Some(false) {
                 return Err(not_found("scroll target not found"));
             }
@@ -248,7 +272,7 @@ pub async fn handle_rpc(inner: &Arc<Inner>, surface: &str, method: &str, params:
             let timeout = Duration::from_millis(params.get("timeout_ms").and_then(Value::as_u64).unwrap_or(5000));
             let start = Instant::now();
             loop {
-                if wait_condition(inner, surface, params).await? {
+                if wait_condition(s, surface, params).await? {
                     return Ok(json!({ "waited_ms": start.elapsed().as_millis() as u64 }));
                 }
                 if start.elapsed() >= timeout {
@@ -261,17 +285,17 @@ pub async fn handle_rpc(inner: &Arc<Inner>, surface: &str, method: &str, params:
             let script = req(params, "script")?;
             // An expression first; statements (`const x = 1; x`) parse only
             // through `eval`.
-            let raw = step(inner, surface, AppBrowserOp::Eval { script: js::wrap_expr(&script) }).await?;
+            let raw = s.step(surface, AppBrowserOp::Eval { script: js::wrap_expr(&script) }).await?;
             let v = if raw.as_str().is_some_and(|s| !s.is_empty()) {
                 decode(&raw)?
             } else {
-                let raw = step(inner, surface, AppBrowserOp::Eval { script: js::wrap_statements(&script) }).await?;
+                let raw = s.step(surface, AppBrowserOp::Eval { script: js::wrap_statements(&script) }).await?;
                 decode(&raw)?
             };
             Ok(json!({ "value": v }))
         }
         m::BROWSER_SCREENSHOT => {
-            let r = step(inner, surface, AppBrowserOp::Screenshot).await?;
+            let r = s.step(surface, AppBrowserOp::Screenshot).await?;
             let b64 = r
                 .get("png_base64")
                 .and_then(Value::as_str)
@@ -295,18 +319,18 @@ pub async fn handle_rpc(inner: &Arc<Inner>, surface: &str, method: &str, params:
             let name = pstr(params, "name");
             let expr = js::get_expr(&what, sel.as_deref(), name.as_deref())
                 .ok_or_else(|| invalid(format!("unknown what `{what}`")))?;
-            Ok(json!({ "value": eval(inner, surface, &expr).await? }))
+            Ok(json!({ "value": eval(s, surface, &expr).await? }))
         }
         m::BROWSER_CONSOLE | m::BROWSER_ERRORS => {
             let clear = params.get("clear").and_then(Value::as_bool).unwrap_or(false);
             let which = if method == m::BROWSER_CONSOLE { "console" } else { "errors" };
-            Ok(json!({ "entries": eval(inner, surface, &js::log_expr(which, clear)).await? }))
+            Ok(json!({ "entries": eval(s, surface, &js::log_expr(which, clear)).await? }))
         }
         m::BROWSER_TABS => match pstr(params, "action").as_deref() {
             // One page per lmux tab: another page is another tab
             // (`lmux new-surface --type browser`).
             Some("list") => {
-                let v = eval(inner, surface, "({url: location.href, title: document.title})").await?;
+                let v = eval(s, surface, "({url: location.href, title: document.title})").await?;
                 Ok(json!({ "tabs": [{ "index": 0, "url": v["url"], "title": v["title"], "active": true }], "active": 0 }))
             }
             _ => Err(error(
@@ -318,27 +342,27 @@ pub async fn handle_rpc(inner: &Arc<Inner>, surface: &str, method: &str, params:
     }
 }
 
-async fn wait_condition(inner: &Arc<Inner>, surface: &str, params: &Value) -> Result<bool, RpcError> {
+async fn wait_condition(s: &dyn Steps, surface: &str, params: &Value) -> Result<bool, RpcError> {
     if let Some(sel) = pstr(params, "selector") {
         let expr = format!("!!document.querySelector({})", js::json_string(&target_selector(&sel)));
-        if eval(inner, surface, &expr).await?.as_bool() != Some(true) {
+        if eval(s, surface, &expr).await?.as_bool() != Some(true) {
             return Ok(false);
         }
     }
     if let Some(text) = pstr(params, "text") {
         let expr = format!("!!document.body && document.body.innerText.includes({})", js::json_string(&text));
-        if eval(inner, surface, &expr).await?.as_bool() != Some(true) {
+        if eval(s, surface, &expr).await?.as_bool() != Some(true) {
             return Ok(false);
         }
     }
     if let Some(frag) = pstr(params, "url_contains") {
-        let url = eval(inner, surface, "location.href").await?;
+        let url = eval(s, surface, "location.href").await?;
         if !url.as_str().unwrap_or("").contains(&frag) {
             return Ok(false);
         }
     }
     if let Some(state) = pstr(params, "load_state") {
-        let ready = eval(inner, surface, "document.readyState").await?;
+        let ready = eval(s, surface, "document.readyState").await?;
         let ready = ready.as_str().unwrap_or("");
         let ok = match state.as_str() {
             "load" | "networkidle" => ready == "complete",

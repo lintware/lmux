@@ -17,6 +17,7 @@ pub mod rpc;
 pub mod scrollback;
 pub mod tmux;
 pub mod tree;
+pub mod webkit;
 
 pub use browser::{BrowserBackend, BrowserEvent};
 pub use daemon::{run, Config, Inner};

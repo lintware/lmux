@@ -1674,7 +1674,7 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
                 })
             };
             if let Some(surface) = in_app {
-                return match crate::app_browser::handle_rpc(inner, &surface, m, params).await {
+                return match crate::app_browser::handle_rpc(&crate::app_browser::ViaApp(inner), &surface, m, params).await {
                     Ok(v) => ok(id, v),
                     Err(e) => RpcResponse { id, result: None, error: Some(e) },
                 };
