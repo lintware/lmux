@@ -814,9 +814,21 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             ok(id, json!({"notifications": state.notifications}))
         }
         methods::NOTIFY_CLEAR => {
+            let one = s(params, "id");
             let ws = s(params, "workspace").or_else(|| s(params, "caller_workspace"));
             {
                 let mut state = inner.state.lock().await;
+                if let Some(nid) = one {
+                    // Dismiss one notification; an unread one leaves its count.
+                    if let Some(pos) = state.notifications.iter().position(|n| n.id == nid) {
+                        let n = state.notifications.remove(pos);
+                        if let (false, Some(ws)) = (n.read, n.workspace) {
+                            if let Some(w) = state.workspace_mut(&ws) {
+                                w.unread_notifications = w.unread_notifications.saturating_sub(1);
+                            }
+                        }
+                    }
+                } else {
                 match ws {
                     Some(ws) => {
                         state
@@ -832,6 +844,7 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
                             w.unread_notifications = 0;
                         }
                     }
+                }
                 }
             }
             inner.tree_changed();

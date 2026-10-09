@@ -48,7 +48,7 @@ pub const TERM_CLEAR_HISTORY: &str = "term.clear_history"; // {surface?}
 // --- agent awareness ---
 pub const NOTIFY: &str = "notify.create"; // {title, subtitle?, body?, workspace?, surface?} -> {id}
 pub const NOTIFY_LIST: &str = "notify.list"; // {} -> {notifications: [..]}
-pub const NOTIFY_CLEAR: &str = "notify.clear"; // {workspace?}
+pub const NOTIFY_CLEAR: &str = "notify.clear"; // {id? | workspace?}
 pub const NOTIFY_MARK_READ: &str = "notify.mark_read"; // {id? | workspace?}
 pub const STATUS_SET: &str = "status.set"; // {key, value, icon?, color?, workspace?}
 pub const STATUS_CLEAR: &str = "status.clear"; // {key, workspace?}
