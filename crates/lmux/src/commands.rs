@@ -244,7 +244,7 @@ pub async fn run(cmd: Cmd, socket: &str, json: bool) -> anyhow::Result<()> {
             print_json_or(&v, json, |_| println!("OK"));
             return Ok(());
         }
-        Cmd::Browser { cmd: BrowserCmd::Open { url, side: _, workspace: _, focus: _, target } }
+        Cmd::Browser { cmd: BrowserCmd::Open { url, side: _, focus: _, target } }
             if target.surface.is_some() =>
         {
             // `browser <surface> open <url>` navigates, as in cmux.
@@ -698,26 +698,26 @@ fn pick(flag: Option<String>, pos: Option<String>, what: &str) -> anyhow::Result
 
 fn build_browser(cmd: BrowserCmd) -> anyhow::Result<Req> {
     Ok(match cmd {
-        BrowserCmd::Open { url, side, workspace, focus, target } | BrowserCmd::OpenSplit { url, side, workspace, focus, target } => {
+        BrowserCmd::Open { url, side, focus, target } | BrowserCmd::OpenSplit { url, side, focus, target } => {
             let url = words(&url);
             req(
                 methods::BROWSER_OPEN,
                 compact(json!({
                     "url": (!url.is_empty()).then_some(url), "side": side,
-                    "surface": target.surface, "workspace": workspace, "focus": focus,
+                    "surface": target.surface, "workspace": target.workspace, "focus": focus,
                 })),
                 refs(&["surface", "pane", "workspace"]),
             )
         }
         BrowserCmd::Goto { url, target } => {
-            req(methods::BROWSER_GOTO, json!({"url": words(&url), "surface": target.surface}), ok_box())
+            req(methods::BROWSER_GOTO, json!({"url": words(&url), "surface": target.surface, "workspace": target.workspace}), ok_box())
         }
-        BrowserCmd::Back { target } => req(methods::BROWSER_BACK, json!({"surface": target.surface}), ok_box()),
-        BrowserCmd::Forward { target } => req(methods::BROWSER_FORWARD, json!({"surface": target.surface}), ok_box()),
-        BrowserCmd::Reload { target } => req(methods::BROWSER_RELOAD, json!({"surface": target.surface}), ok_box()),
+        BrowserCmd::Back { target } => req(methods::BROWSER_BACK, json!({"surface": target.surface, "workspace": target.workspace}), ok_box()),
+        BrowserCmd::Forward { target } => req(methods::BROWSER_FORWARD, json!({"surface": target.surface, "workspace": target.workspace}), ok_box()),
+        BrowserCmd::Reload { target } => req(methods::BROWSER_RELOAD, json!({"surface": target.surface, "workspace": target.workspace}), ok_box()),
         BrowserCmd::Url { target } => req(
             methods::BROWSER_URL,
-            json!({"surface": target.surface}),
+            json!({"surface": target.surface, "workspace": target.workspace}),
             Box::new(|v, j| {
                 print_json_or(v, j, |v| {
                     println!("{}\t{}", v["url"].as_str().unwrap_or(""), v["title"].as_str().unwrap_or(""))
@@ -726,51 +726,51 @@ fn build_browser(cmd: BrowserCmd) -> anyhow::Result<Req> {
         ),
         BrowserCmd::Snapshot { interactive, target } => req(
             methods::BROWSER_SNAPSHOT,
-            json!({"surface": target.surface, "interactive": interactive}),
+            json!({"surface": target.surface, "workspace": target.workspace, "interactive": interactive}),
             text_box(),
         ),
         BrowserCmd::Click { selector_arg, selector, target } => req(
             methods::BROWSER_CLICK,
-            json!({"target": pick(selector, selector_arg, "target")?, "surface": target.surface}),
+            json!({"target": pick(selector, selector_arg, "target")?, "surface": target.surface, "workspace": target.workspace}),
             ok_box(),
         ),
         BrowserCmd::Dblclick { selector_arg, selector, target } => req(
             methods::BROWSER_DBLCLICK,
-            json!({"target": pick(selector, selector_arg, "target")?, "surface": target.surface}),
+            json!({"target": pick(selector, selector_arg, "target")?, "surface": target.surface, "workspace": target.workspace}),
             ok_box(),
         ),
         BrowserCmd::Hover { selector_arg, selector, target } => req(
             methods::BROWSER_HOVER,
-            json!({"target": pick(selector, selector_arg, "target")?, "surface": target.surface}),
+            json!({"target": pick(selector, selector_arg, "target")?, "surface": target.surface, "workspace": target.workspace}),
             ok_box(),
         ),
         BrowserCmd::Type { args, selector, text, target } => {
             let (sel, text) = selector_and_text(args, selector, text, "text")?;
-            req(methods::BROWSER_TYPE, json!({"target": sel, "text": text, "surface": target.surface}), ok_box())
+            req(methods::BROWSER_TYPE, json!({"target": sel, "text": text, "surface": target.surface, "workspace": target.workspace}), ok_box())
         }
         BrowserCmd::Fill { args, selector, text, target } => {
             let (sel, text) = selector_and_text(args, selector, text, "text")?;
-            req(methods::BROWSER_FILL, json!({"target": sel, "text": text, "surface": target.surface}), ok_box())
+            req(methods::BROWSER_FILL, json!({"target": sel, "text": text, "surface": target.surface, "workspace": target.workspace}), ok_box())
         }
         BrowserCmd::Press { key_arg, key, target } => req(
             methods::BROWSER_PRESS,
-            json!({"key": pick(key, key_arg, "key")?, "surface": target.surface}),
+            json!({"key": pick(key, key_arg, "key")?, "surface": target.surface, "workspace": target.workspace}),
             ok_box(),
         ),
         BrowserCmd::Select { args, selector, value, target } => {
             let (sel, value) = selector_and_text(args, selector, value, "value")?;
-            req(methods::BROWSER_SELECT, json!({"target": sel, "value": value, "surface": target.surface}), ok_box())
+            req(methods::BROWSER_SELECT, json!({"target": sel, "value": value, "surface": target.surface, "workspace": target.workspace}), ok_box())
         }
         BrowserCmd::Scroll { selector_arg, selector, dx, dy, target } => req(
             methods::BROWSER_SCROLL,
-            json!({"target": selector.or(selector_arg), "dx": dx, "dy": dy, "surface": target.surface}),
+            json!({"target": selector.or(selector_arg), "dx": dx, "dy": dy, "surface": target.surface, "workspace": target.workspace}),
             ok_box(),
         ),
         BrowserCmd::Wait { selector, text, url_contains, load_state, timeout_ms, timeout, target } => req(
             methods::BROWSER_WAIT,
             json!({
                 "selector": selector, "text": text, "url_contains": url_contains, "load_state": load_state,
-                "timeout_ms": timeout_ms.or(timeout.map(|s| (s * 1000.0) as u64)), "surface": target.surface,
+                "timeout_ms": timeout_ms.or(timeout.map(|s| (s * 1000.0) as u64)), "surface": target.surface, "workspace": target.workspace,
             }),
             ok_box(),
         ),
@@ -781,13 +781,13 @@ fn build_browser(cmd: BrowserCmd) -> anyhow::Result<Req> {
             }
             req(
                 methods::BROWSER_EVAL,
-                json!({"script": script, "surface": target.surface}),
+                json!({"script": script, "surface": target.surface, "workspace": target.workspace}),
                 Box::new(|v, j| print_json_or(v, j, |v| println!("{}", v["value"]))),
             )
         }
         BrowserCmd::Screenshot { path, target } => req(
             methods::BROWSER_SCREENSHOT,
-            json!({"path": path, "surface": target.surface}),
+            json!({"path": path, "surface": target.surface, "workspace": target.workspace}),
             refs(&["path"]),
         ),
         BrowserCmd::Get { what, args, target_selector, name, target } => {
@@ -796,7 +796,7 @@ fn build_browser(cmd: BrowserCmd) -> anyhow::Result<Req> {
             let name = name.or_else(|| pos.next());
             req(
                 methods::BROWSER_GET,
-                json!({"what": what, "target": sel, "name": name, "surface": target.surface}),
+                json!({"what": what, "target": sel, "name": name, "surface": target.surface, "workspace": target.workspace}),
                 Box::new(|v, j| {
                     print_json_or(v, j, |v| match &v["value"] {
                         Value::String(s) => println!("{s}"),
@@ -807,12 +807,12 @@ fn build_browser(cmd: BrowserCmd) -> anyhow::Result<Req> {
         }
         BrowserCmd::Console { action, clear, target } => req(
             methods::BROWSER_CONSOLE,
-            json!({"clear": clear || action.as_deref() == Some("clear"), "surface": target.surface}),
+            json!({"clear": clear || action.as_deref() == Some("clear"), "surface": target.surface, "workspace": target.workspace}),
             Box::new(|v, j| print_json_or(v, j, |v| println!("{}", v["entries"]))),
         ),
         BrowserCmd::Errors { action, clear, target } => req(
             methods::BROWSER_ERRORS,
-            json!({"clear": clear || action.as_deref() == Some("clear"), "surface": target.surface}),
+            json!({"clear": clear || action.as_deref() == Some("clear"), "surface": target.surface, "workspace": target.workspace}),
             Box::new(|v, j| print_json_or(v, j, |v| println!("{}", v["entries"]))),
         ),
         BrowserCmd::Tab { action, arg, index, url, target } => {
@@ -827,7 +827,7 @@ fn build_browser(cmd: BrowserCmd) -> anyhow::Result<Req> {
             };
             req(
                 methods::BROWSER_TABS,
-                json!({"action": action, "index": index, "url": url, "surface": target.surface}),
+                json!({"action": action, "index": index, "url": url, "surface": target.surface, "workspace": target.workspace}),
                 Box::new(|v, j| {
                     if j || v.as_object().is_some_and(|o| !o.is_empty()) {
                         print_json(v);

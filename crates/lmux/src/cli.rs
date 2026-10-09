@@ -726,6 +726,9 @@ pub struct BrowserTarget {
     /// Browser surface (default: a browser in the caller's workspace).
     #[arg(long)]
     pub surface: Option<String>,
+    /// Without --surface, a browser in this workspace instead of the caller's.
+    #[arg(long, value_name = "WORKSPACE")]
+    pub workspace: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -736,8 +739,6 @@ pub enum BrowserCmd {
         url: Vec<String>,
         #[arg(long, value_parser = ["left", "right", "up", "down"])]
         side: Option<String>,
-        #[arg(long)]
-        workspace: Option<String>,
         #[arg(long, value_parser = boolish())]
         focus: Option<bool>,
         #[command(flatten)]
@@ -750,8 +751,6 @@ pub enum BrowserCmd {
         url: Vec<String>,
         #[arg(long, value_parser = ["left", "right", "up", "down"])]
         side: Option<String>,
-        #[arg(long)]
-        workspace: Option<String>,
         #[arg(long, value_parser = boolish())]
         focus: Option<bool>,
         #[command(flatten)]
@@ -1010,7 +1009,8 @@ pub fn mark_end_of_flags(mut args: Vec<String>) -> Vec<String> {
 
 /// cmux takes a browser surface before the subcommand, as
 /// `browser surface:4 snapshot` or `browser --surface surface:4 snapshot`;
-/// clap wants flags on the subcommand. Move such a surface after it.
+/// clap wants flags on the subcommand. Move such a surface (and a
+/// `--workspace`) after it.
 pub fn rewrite_browser_surface(args: Vec<String>, subcommands: &[String]) -> Vec<String> {
     // Find `browser` as the first word that is not a global flag.
     let i = subcommand_index(&args);
@@ -1019,8 +1019,17 @@ pub fn rewrite_browser_surface(args: Vec<String>, subcommands: &[String]) -> Vec
     }
     let mut j = i + 1;
     let mut surface = None;
+    let mut workspace = None;
     loop {
         match args.get(j).map(String::as_str) {
+            Some("--workspace") if j + 1 < args.len() => {
+                workspace = Some(args[j + 1].clone());
+                j += 2;
+            }
+            Some(a) if a.starts_with("--workspace=") => {
+                workspace = Some(a["--workspace=".len()..].to_string());
+                j += 1;
+            }
             Some("--surface") if j + 1 < args.len() => {
                 surface = Some(args[j + 1].clone());
                 j += 2;
@@ -1036,14 +1045,18 @@ pub fn rewrite_browser_surface(args: Vec<String>, subcommands: &[String]) -> Vec
             _ => break,
         }
     }
-    let Some(surface) = surface else {
+    if surface.is_none() && workspace.is_none() {
         return args;
-    };
+    }
     let mut out: Vec<String> = args[..=i].to_vec();
     if let Some(sub) = args.get(j) {
         out.push(sub.clone());
-        out.push("--surface".into());
-        out.push(surface);
+        for (flag, v) in [("--surface", surface), ("--workspace", workspace)] {
+            if let Some(v) = v {
+                out.push(flag.into());
+                out.push(v);
+            }
+        }
         out.extend(args[j + 1..].iter().cloned());
     } else {
         // No subcommand: leave it for clap to report.
@@ -1108,6 +1121,15 @@ mod tests {
             rewrite_browser_surface(v("lmux browser --surface=surface:4 url"), &subs),
             v("lmux browser url --surface surface:4")
         );
+        assert_eq!(
+            rewrite_browser_surface(v("lmux browser --workspace 2 get title"), &subs),
+            v("lmux browser get --workspace 2 title")
+        );
+        // Either order parses, for every subcommand.
+        for s in ["lmux browser --workspace 2 get title", "lmux browser get title --workspace 2", "lmux browser open --workspace w x"] {
+            let args = rewrite_browser_surface(v(s), &subs);
+            assert!(Cli::try_parse_from(&args).is_ok(), "{s}");
+        }
         // Already in clap's order, or not a browser command: unchanged.
         for s in ["lmux browser snapshot --surface surface:4", "lmux send browser", "lmux browser open"] {
             assert_eq!(rewrite_browser_surface(v(s), &subs), v(s));
