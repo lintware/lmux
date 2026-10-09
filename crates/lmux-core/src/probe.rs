@@ -121,6 +121,84 @@ pub async fn ports_by_workspace(roots: &HashMap<String, Vec<u32>>) -> HashMap<St
         .collect()
 }
 
+/// The session id in a Codex rollout path:
+/// `…/.codex/sessions/2026/07/11/rollout-2026-07-11T04-37-24-<uuid>.jsonl`.
+pub fn codex_session_id(path: &str) -> Option<String> {
+    if !path.contains("/.codex/sessions/") {
+        return None;
+    }
+    let name = path.rsplit('/').next()?.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    let id = name.get(name.len().checked_sub(36)?..)?;
+    let ok = id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| if [8, 13, 18, 23].contains(&i) { b == b'-' } else { b.is_ascii_hexdigit() });
+    ok.then(|| id.to_owned())
+}
+
+/// Files a process has open (Linux: /proc/<pid>/fd; macOS: lsof).
+async fn open_files(pids: &[u32]) -> Vec<(u32, String)> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    if cfg!(target_os = "linux") {
+        let mut out = Vec::new();
+        for pid in pids {
+            if let Ok(mut rd) = tokio::fs::read_dir(format!("/proc/{pid}/fd")).await {
+                while let Ok(Some(e)) = rd.next_entry().await {
+                    if let Ok(t) = tokio::fs::read_link(e.path()).await {
+                        out.push((*pid, t.to_string_lossy().into_owned()));
+                    }
+                }
+            }
+        }
+        return out;
+    }
+    let list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+    let Some(out) = run("lsof", &["-n", "-P", "-p", &list, "-F", "pn"], None, Duration::from_secs(3)).await else {
+        return Vec::new();
+    };
+    let mut pid = None;
+    let mut files = Vec::new();
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix('p') {
+            pid = p.parse().ok();
+        } else if let (Some(n), Some(pid)) = (line.strip_prefix('n'), pid) {
+            files.push((pid, n.to_owned()));
+        }
+    }
+    files
+}
+
+/// For each pane (by id, given its shell's pid), the Codex session running
+/// in it: the rollout file a `codex` process under the pane has open.
+pub async fn codex_sessions(pane_pids: &HashMap<String, u32>) -> HashMap<String, String> {
+    let Some(ps) = run("ps", &["-axo", "pid=,ppid=,comm="], None, Duration::from_secs(3)).await else {
+        return HashMap::new();
+    };
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut names: HashMap<u32, String> = HashMap::new();
+    for line in ps.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(pid), Some(ppid)) = (it.next().and_then(|p| p.parse().ok()), it.next().and_then(|p| p.parse().ok()))
+        else {
+            continue;
+        };
+        children.entry(ppid).or_default().push(pid);
+        names.insert(pid, it.collect::<Vec<_>>().join(" "));
+    }
+    let is_codex = |pid: &u32| names.get(pid).is_some_and(|n| n.rsplit('/').next().unwrap_or(n).starts_with("codex"));
+    let mut found = HashMap::new();
+    for (pane, root) in pane_pids {
+        let codex: Vec<u32> = descendants(&children, &[*root]).into_iter().filter(|p| is_codex(p)).collect();
+        if codex.is_empty() {
+            continue;
+        }
+        if let Some(id) = open_files(&codex).await.iter().find_map(|(_, f)| codex_session_id(f)) {
+            found.insert(pane.clone(), id);
+        }
+    }
+    found
+}
+
 /// `gh pr view --json number,state,isDraft,url` output.
 pub fn parse_gh_pr(out: &str) -> Option<PullRequest> {
     let v: serde_json::Value = serde_json::from_str(out).ok()?;
@@ -170,6 +248,14 @@ mod tests {
                   LISTEN 0 128 [::]:22 [::]:* \n\
                   LISTEN 0 511 127.0.0.1:5432 0.0.0.0:* users:((\"postgres\",pid=9,fd=5),(\"postgres\",pid=10,fd=5))\n";
         assert_eq!(parse_ss(ss), vec![(1234, 8080), (9, 5432), (10, 5432)]);
+    }
+
+    #[test]
+    fn codex_rollout_paths_give_the_session_id() {
+        let p = "/home/u/.codex/sessions/2026/07/11/rollout-2026-07-11T04-37-24-019f4dbf-d058-78d0-a3cc-1c0f28477ca6.jsonl";
+        assert_eq!(codex_session_id(p).as_deref(), Some("019f4dbf-d058-78d0-a3cc-1c0f28477ca6"));
+        assert_eq!(codex_session_id("/tmp/rollout-x.jsonl"), None);
+        assert_eq!(codex_session_id("/home/u/.codex/sessions/2026/history.jsonl"), None);
     }
 
     #[test]
