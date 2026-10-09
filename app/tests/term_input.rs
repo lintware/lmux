@@ -2,7 +2,7 @@
 //! bracketed paste, selection and copy, mouse reports, URLs, the context menu.
 //! Driven through the same `route_input`/`render` path the app uses.
 
-use egui::Vec2;
+use egui::{Modifiers, PointerButton, Pos2, Vec2};
 use egui_kittest::Harness;
 use lmux_app::net::{ConnState, HostConfig, Net};
 use lmux_app::state::AppState;
@@ -120,4 +120,99 @@ fn paste_is_bracketed_when_the_program_asks_for_it() {
     h.input_mut().events.push(egui::Event::Paste("rm x\x1b[201~\n".into()));
     h.run();
     assert_eq!(term_inputs(h.state()), vec!["\x1b[200~rm x\n\x1b[201~".to_owned()]);
+}
+
+/// Screen position of the centre of viewport cell `(row, col)`.
+fn cell(h: &Harness<Fixture>, row: usize, col: usize) -> Pos2 {
+    let tv = &h.state().state.terms["surface:1"];
+    tv.grid_origin + Vec2::new((col as f32 + 0.5) * tv.cell_size.x, (row as f32 + 0.5) * tv.cell_size.y)
+}
+
+/// The left quarter of a cell: a selection that starts here includes it.
+fn cell_left(h: &Harness<Fixture>, row: usize, col: usize) -> Pos2 {
+    let w = h.state().state.terms["surface:1"].cell_size.x;
+    cell(h, row, col) - Vec2::new(w * 0.25, 0.0)
+}
+
+fn button(h:&mut Harness<Fixture>, pos: Pos2, b: PointerButton, pressed: bool, modifiers: Modifiers) {
+    h.input_mut().events.push(egui::Event::PointerButton { pos, button: b, pressed, modifiers });
+    h.step();
+}
+
+fn move_to(h: &mut Harness<Fixture>, pos: Pos2) {
+    h.input_mut().events.push(egui::Event::PointerMoved(pos));
+    h.step();
+}
+
+fn click(h: &mut Harness<Fixture>, pos: Pos2, b: PointerButton, modifiers: Modifiers) {
+    move_to(h, pos);
+    button(h, pos, b, true, modifiers);
+    button(h, pos, b, false, modifiers);
+}
+
+fn drag(h: &mut Harness<Fixture>, from: Pos2, to: Pos2, modifiers: Modifiers) {
+    move_to(h, from);
+    button(h, from, PointerButton::Primary, true, modifiers);
+    move_to(h, (from + to.to_vec2()) / 2.0);
+    move_to(h, to);
+    button(h, to, PointerButton::Primary, false, modifiers);
+}
+
+fn selection(h: &Harness<Fixture>) -> Option<String> {
+    h.state().state.terms["surface:1"].selection_text()
+}
+
+/// Copy with Cmd+C (egui-winit delivers it as `Event::Copy`) and return what
+/// reached the clipboard this frame.
+fn copy(h: &mut Harness<Fixture>) -> Option<String> {
+    h.input_mut().events.push(egui::Event::Copy);
+    h.step();
+    h.output().platform_output.commands.iter().find_map(|c| match c {
+        egui::OutputCommand::CopyText(t) => Some(t.clone()),
+        _ => None,
+    })
+}
+
+fn none() -> Modifiers {
+    Modifiers::default()
+}
+
+#[test]
+fn dragging_selects_text_and_cmd_c_copies_it() {
+    let mut h = harness(fixture());
+    feed(&mut h, b"hello world\r\nsecond line");
+    let (from, to) = (cell_left(&h, 0, 0), cell(&h, 1, 5));
+    drag(&mut h, from, to, none());
+    assert_eq!(selection(&h).as_deref(), Some("hello world\nsecond"));
+    assert_eq!(copy(&mut h).as_deref(), Some("hello world\nsecond"));
+    assert!(term_inputs(h.state()).is_empty(), "selecting must not type anything");
+}
+
+#[test]
+fn double_click_selects_a_word_and_triple_click_a_line() {
+    let mut h = harness(fixture());
+    feed(&mut h, b"hello world\r\nsecond line");
+    let p = cell(&h, 0, 8);
+    click(&mut h, p, PointerButton::Primary, none());
+    click(&mut h, p, PointerButton::Primary, none());
+    assert_eq!(selection(&h).as_deref(), Some("world"));
+    click(&mut h, p, PointerButton::Primary, none());
+    assert_eq!(selection(&h).as_deref().map(str::trim_end), Some("hello world"));
+}
+
+#[test]
+fn a_plain_click_clears_the_selection() {
+    let mut h = harness(fixture());
+    feed(&mut h, b"hello world");
+    let (from, to) = (cell_left(&h, 0, 0), cell(&h, 0, 4));
+    drag(&mut h, from, to, none());
+    assert_eq!(selection(&h).as_deref(), Some("hello"));
+    // Far enough in time that it is not a double click.
+    for _ in 0..10 {
+        h.step();
+    }
+    let p = cell(&h, 0, 2);
+    click(&mut h, p, PointerButton::Primary, none());
+    assert_eq!(selection(&h), None);
+    assert_eq!(copy(&mut h), None, "nothing selected copies nothing");
 }

@@ -18,7 +18,7 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 
 use super::Ctx;
-use crate::term::{cell_colors, is_wide_spacer, viewport_point};
+use crate::term::{cell_colors, is_wide_spacer, viewport_point, SelectionType};
 use crate::theme;
 
 const PAD: f32 = 6.0;
@@ -44,6 +44,8 @@ struct CellInfo {
     spacer: bool,
     /// Combining marks that belong to `ch`.
     zw: Vec<char>,
+    /// Inside the mouse selection.
+    selected: bool,
 }
 
 impl CellInfo {
@@ -56,8 +58,111 @@ impl CellInfo {
             wide: false,
             spacer: false,
             zw: Vec::new(),
+            selected: false,
         }
     }
+}
+
+/// Translucent wash over selected cells; the text stays drawn on top.
+const SELECTION: Color32 = Color32::from_rgba_premultiplied(0x05, 0x42, 0x80, 0x80);
+
+/// Where the grid sits on screen, for mapping the pointer to a cell.
+struct Grid {
+    origin: Pos2,
+    w: f32,
+    h: f32,
+    cols: usize,
+    rows: usize,
+}
+
+impl Grid {
+    /// The cell under `pos`, clamped into the grid, and whether `pos` is on
+    /// the cell's right half (which decides if a selection includes it).
+    fn cell_at(&self, pos: Pos2) -> (usize, usize, bool) {
+        let x = (pos.x - self.origin.x) / self.w;
+        let y = (pos.y - self.origin.y) / self.h;
+        let max_col = self.cols.saturating_sub(1);
+        let col = (x.floor().max(0.0) as usize).min(max_col);
+        let right_half = if x < 0.0 {
+            false
+        } else if x >= self.cols as f32 {
+            true
+        } else {
+            x - col as f32 >= 0.5
+        };
+        let row = (y.floor().max(0.0) as usize).min(self.rows.saturating_sub(1));
+        (row, col, right_half)
+    }
+}
+
+/// Presses this close together (seconds) on the same cell count as a double
+/// or triple click.
+const MULTI_CLICK: f64 = 0.4;
+
+/// Mouse presses, drags and releases over the grid: a local selection, or
+/// (later) mouse reports to the program.
+fn pointer_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Grid, c: &mut Ctx) {
+    let (events, now) = ui.input(|i| (i.events.clone(), i.time));
+    let over = resp.contains_pointer();
+    for ev in events {
+        match ev {
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. }
+                if over && grid_contains(grid, pos) =>
+            {
+                if let Some(pane) = c.state.pane_of_surface(surface) {
+                    c.state.focus_pane(&pane);
+                }
+                let (row, col, right) = grid.cell_at(pos);
+                let Some(tv) = c.state.terms.get_mut(surface) else { continue };
+                let p = &mut tv.pointer;
+                p.clicks = if now - p.last_press_time < MULTI_CLICK && p.press_cell == (row, col) {
+                    p.clicks % 3 + 1
+                } else {
+                    1
+                };
+                p.last_press_time = now;
+                p.press_cell = (row, col);
+                p.held = Some(egui::PointerButton::Primary);
+                p.reporting = false;
+                p.dragged = false;
+                let ty = match p.clicks {
+                    2 => SelectionType::Semantic,
+                    3 => SelectionType::Lines,
+                    _ => SelectionType::Simple,
+                };
+                tv.start_selection(ty, row, col, right);
+            }
+            egui::Event::PointerMoved(pos) => {
+                let Some(tv) = c.state.terms.get_mut(surface) else { continue };
+                if tv.pointer.held.is_none() || tv.pointer.reporting {
+                    continue;
+                }
+                let (row, col, right) = grid.cell_at(pos);
+                if (row, col) != tv.pointer.press_cell {
+                    tv.pointer.dragged = true;
+                }
+                tv.update_selection(row, col, right);
+            }
+            egui::Event::PointerButton { button, pressed: false, .. } => {
+                let Some(tv) = c.state.terms.get_mut(surface) else { continue };
+                if tv.pointer.held != Some(button) {
+                    continue;
+                }
+                tv.pointer.held = None;
+                // A plain click (no drag, not a word or line pick) clears.
+                if !tv.pointer.reporting && tv.pointer.clicks == 1 && !tv.pointer.dragged {
+                    tv.clear_selection();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn grid_contains(grid: &Grid, pos: Pos2) -> bool {
+    let size = Vec2::new(grid.cols as f32 * grid.w, grid.rows as f32 * grid.h);
+    // The padding around the grid counts as its nearest cell.
+    Rect::from_min_size(grid.origin, size).expand(PAD).contains(pos)
 }
 
 #[derive(Default)]
@@ -118,12 +223,19 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
     c.state.ensure_term(surface);
 
     // Click focuses this pane; the wheel scrolls scrollback when hovering.
-    let resp = ui.interact(rect, Id::new(("term", surface)), Sense::click());
+    let resp = ui.interact(rect, Id::new(("term", surface)), Sense::click_and_drag());
     if resp.clicked() {
         if let Some(pane) = c.state.pane_of_surface(surface) {
             c.state.focus_pane(&pane);
         }
     }
+    let origin = Pos2::new(rect.min.x + PAD, rect.min.y + PAD);
+    let grid = Grid { origin, w: metrics.w, h: metrics.h, cols: cols as usize, rows: rows as usize };
+    if let Some(tv) = c.state.terms.get_mut(surface) {
+        tv.grid_origin = origin;
+        tv.cell_size = Vec2::new(metrics.w, metrics.h);
+    }
+    pointer_input(ui, &resp, surface, &grid, c);
     if resp.hovered() {
         // Raw wheel events, converted to points. `smooth_scroll_delta` is
         // low-pass filtered over frames, so a single notch can arrive as a
@@ -177,7 +289,6 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
     let default_fg = Rgb { r: theme::TERM_FG.r(), g: theme::TERM_FG.g(), b: theme::TERM_FG.b() };
     let default_bg = Rgb { r: theme::TERM_BG.r(), g: theme::TERM_BG.g(), b: theme::TERM_BG.b() };
     let bg_default = color32(default_bg);
-    let origin = Pos2::new(rect.min.x + PAD, rect.min.y + PAD);
 
     let (cols_usize, rows_usize) = (cols as usize, rows as usize);
     let n = cols_usize * rows_usize;
@@ -196,9 +307,12 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
         };
         let content = tv.term().renderable_content();
         let display_offset = content.display_offset;
+        let selection = content.selection;
 
         for cell in content.display_iter {
-            let row = cell.point.line.0;
+            // Grid lines run negative into history; the viewport row adds back
+            // how far the view is scrolled.
+            let row = cell.point.line.0 + display_offset as i32;
             if row < 0 || row as usize >= rows_usize {
                 continue;
             }
@@ -218,6 +332,7 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
             dst.underline = info.flags.intersects(Flags::ALL_UNDERLINES);
             dst.wide = info.flags.contains(Flags::WIDE_CHAR);
             dst.spacer = spacer;
+            dst.selected = selection.is_some_and(|s| s.contains(cell.point));
             dst.zw.clear();
             if !spacer && !hidden {
                 if let Some(zw) = info.zerowidth() {
@@ -245,6 +360,23 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
             );
             painter.rect_filled(cell_rect, 0.0, bg);
         });
+        // Selection: one wash per run of selected cells, under the text.
+        let mut col = 0;
+        while col < cols_usize {
+            if !row[col].selected {
+                col += 1;
+                continue;
+            }
+            let start = col;
+            while col < cols_usize && row[col].selected {
+                col += 1;
+            }
+            let sel_rect = Rect::from_min_size(
+                Pos2::new(origin.x + start as f32 * metrics.w, y),
+                Vec2::new((col - start) as f32 * metrics.w, metrics.h),
+            );
+            painter.rect_filled(sel_rect, 0.0, SELECTION);
+        }
     }
 
     let draw_run = |run: &mut String, col: usize, y: f32, fg: Color32, underline: bool, len: usize| {

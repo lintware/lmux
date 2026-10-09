@@ -618,6 +618,7 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
             let mode = c.state.term_mode(&sid);
             let bracketed = mode.contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
             let mut bytes: Vec<u8> = Vec::new();
+            let mut copy = false;
             ctx.input(|i| {
                 for ev in &i.events {
                     match ev {
@@ -641,10 +642,15 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
                         egui::Event::Paste(t) => {
                             bytes.extend_from_slice(&crate::termio::paste_bytes(t, bracketed))
                         }
+                        // Cmd+C: egui-winit turns it into Copy, never a key.
+                        egui::Event::Copy => copy = true,
                         _ => {}
                     }
                 }
             });
+            if copy {
+                copy_selection(ctx, c, &sid);
+            }
             // A local pane is attached by this process: its keys go straight to
             // the PTY. Remote panes keep the daemon's input path.
             c.state.send_term_input(&sid, &bytes);
@@ -680,6 +686,18 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
             }
         }
         _ => {}
+    }
+}
+
+/// Put the terminal's mouse selection on the system clipboard. Nothing
+/// selected copies nothing (the clipboard keeps what it had).
+pub fn copy_selection(ctx: &egui::Context, c: &mut ui::Ctx, surface: &str) -> bool {
+    match c.state.terms.get(surface).and_then(|t| t.selection_text()) {
+        Some(text) => {
+            ctx.copy_text(text);
+            true
+        }
+        None => false,
     }
 }
 
