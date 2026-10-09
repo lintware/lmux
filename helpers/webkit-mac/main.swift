@@ -37,6 +37,13 @@ func fail(_ id: Any?, _ message: String) {
 /// Scripts every page runs at its start (the console capture), from the daemon.
 var initScripts: [String] = []
 
+/// `Version/18.5 Safari/605.1.15`, with this Mac's Safari version.
+let safariUserAgentSuffix: String = {
+    let plist = NSDictionary(contentsOfFile: "/Applications/Safari.app/Contents/Info.plist")
+    let version = plist?["CFBundleShortVersionString"] as? String ?? "18.0"
+    return "Version/\(version) Safari/605.1.15"
+}()
+
 /// How often a page being watched is captured, at most.
 let frameInterval = 1.0 / 15.0
 
@@ -62,6 +69,8 @@ final class Page: NSObject, WKNavigationDelegate, WKUIDelegate {
     init(surface: String, url: String, id: Any?) {
         self.surface = surface
         let config = WKWebViewConfiguration()
+        // As Safari introduces itself, so sites treat the page as Safari's.
+        config.applicationNameForUserAgent = safariUserAgentSuffix
         for js in initScripts {
             config.userContentController.addUserScript(
                 WKUserScript(source: js, injectionTime: .atDocumentStart, forMainFrameOnly: false))

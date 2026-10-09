@@ -72,6 +72,12 @@ ssh -o BatchMode=yes "$target" "$env_path"'set -e
     else
       echo "no WebKit helper (swiftc missing or failed: xcode-select --install); browsers use Chromium"
     fi
+  elif python3 -c "import gi; gi.require_version(\"Gtk\", \"3.0\"); gi.require_version(\"WebKit2\", \"4.1\")" 2>/dev/null \
+      && command -v Xvfb >/dev/null; then
+    install -m755 ~/lmux/helpers/webkit-linux/lmux-webkit "$helper" && echo "WebKit helper installed"
+  else
+    rm -f "$helper"
+    echo "no WebKit helper (sudo apt install python3-gi gir1.2-webkit2-4.1 xvfb); browsers use Chromium"
   fi'
 
 echo "==> starting lmuxd"

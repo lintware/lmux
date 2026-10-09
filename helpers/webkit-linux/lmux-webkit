@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""lmux-webkit: browser pages for lmux on a Linux host, in WebKitGTK.
+
+The Linux counterpart of helpers/webkit-mac: the daemon
+(crates/lmux-core/src/webkit.rs) starts it and speaks JSON lines on
+stdin/stdout; see that file for the protocol. Each page is a WebKit2 WebView
+in a GTK offscreen window; without a display it starts its own Xvfb. The app
+watches a page through JPEG frames, and its input comes back as GDK events
+(the wheel scrolls through the page, which off-screen GDK scrolling misses).
+
+Needs: python3-gi, gir1.2-webkit2-4.1, xvfb.
+"""
+
+import atexit
+import base64
+import json
+import os
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("WebKit2", "4.1")
+
+
+def start_xvfb():
+    """A private X display, for a daemon run with none (systemd)."""
+    r, w = os.pipe()
+    proc = subprocess.Popen(
+        ["Xvfb", "-displayfd", str(w), "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+        pass_fds=(w,), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    os.close(w)
+    num = b""
+    while not num.endswith(b"\n"):
+        c = os.read(r, 1)
+        if not c:
+            raise SystemExit("Xvfb did not start")
+        num += c
+    os.close(r)
+    atexit.register(proc.terminate)
+    os.environ["DISPLAY"] = ":" + num.decode().strip()
+
+
+if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+    start_xvfb()
+
+from gi.repository import Gdk, GLib, Gtk, WebKit2  # noqa: E402
+
+Gtk.init([])
+
+FRAME_MS = 66  # at most ~15 frames a second while watched
+init_scripts = []
+pages = {}
+
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def answer(mid, value=None):
+    if mid is not None:
+        send({"id": mid, "value": {} if value is None else value})
+
+
+def fail(mid, message):
+    if mid is not None:
+        send({"id": mid, "error": message})
+
+
+WHEEL_JS = """(function(x, y, dx, dy) {
+  var el = document.elementFromPoint(x, y);
+  while (el && el !== document.body && el !== document.documentElement) {
+    var s = getComputedStyle(el);
+    if ((/(auto|scroll)/.test(s.overflowY) && el.scrollHeight > el.clientHeight) ||
+        (/(auto|scroll)/.test(s.overflowX) && el.scrollWidth > el.clientWidth)) { el.scrollBy(dx, dy); return; }
+    el = el.parentElement;
+  }
+  window.scrollBy(dx, dy);
+})(%f, %f, %f, %f)"""
+
+SPECIAL_KEYS = {
+    "Enter": "Return", "Tab": "Tab", "Backspace": "BackSpace", "Escape": "Escape", "Delete": "Delete",
+    "ArrowLeft": "Left", "ArrowRight": "Right", "ArrowUp": "Up", "ArrowDown": "Down",
+    "Home": "Home", "End": "End", "PageUp": "Page_Up", "PageDown": "Page_Down", " ": "space",
+}
+
+
+class Page:
+    def __init__(self, surface, url, mid):
+        self.surface = surface
+        manager = WebKit2.UserContentManager()
+        for js in init_scripts:
+            manager.add_script(WebKit2.UserScript.new(
+                js, WebKit2.UserContentInjectedFrames.ALL_FRAMES,
+                WebKit2.UserScriptInjectionTime.START, None, None))
+        self.view = WebKit2.WebView.new_with_user_content_manager(manager)
+        self.window = Gtk.OffscreenWindow()
+        self.window.set_default_size(1280, 800)
+        self.window.add(self.view)
+        self.window.show_all()
+        self.cast = None
+        self.timer = None
+        self.seq = 0
+        self.waiting_ack = False
+        self.sent_at = 0.0
+        self.last_frame = None
+        self.capturing = False
+        self.on_commit = []
+        self.view.connect("load-changed", self.load_changed)
+        self.view.connect("load-failed", self.load_failed)
+        self.view.connect("create", self.create_view)
+        for prop in ("uri", "title", "is-loading"):
+            self.view.connect("notify::" + prop, lambda *_: self.meta())
+        self.load(url, mid)
+
+    def load(self, url, mid=None):
+        if mid is not None:
+            self.on_commit.append(mid)
+            GLib.timeout_add_seconds(15, lambda: (self.committed(None), False)[1])
+        if url.startswith("about:") or "://" not in url:
+            self.view.load_html("", "about:blank")
+        else:
+            self.view.load_uri(url)
+
+    def committed(self, error):
+        ids, self.on_commit = self.on_commit, []
+        for mid in ids:
+            if error:
+                fail(mid, "navigation failed: " + error)
+            else:
+                answer(mid)
+
+    def load_changed(self, _view, event):
+        if event == WebKit2.LoadEvent.COMMITTED:
+            self.committed(None)
+        if event == WebKit2.LoadEvent.FINISHED:
+            # A new page is worth a frame even if the last one was not acked.
+            self.waiting_ack = False
+        self.meta()
+
+    def load_failed(self, _view, _event, _uri, error):
+        if not error.matches(WebKit2.network_error_quark(), WebKit2.NetworkError.CANCELLED):
+            self.committed(error.message)
+        return False
+
+    def create_view(self, _view, action):
+        # `target=_blank` and `window.open`: the same page goes there.
+        self.view.load_request(action.get_request())
+        return None
+
+    def meta(self):
+        v = self.view
+        send({
+            "event": "meta", "surface": self.surface, "url": v.get_uri() or "",
+            "title": v.get_title() or "", "loading": v.is_loading(),
+            "can_go_back": v.can_go_back(), "can_go_forward": v.can_go_forward(),
+        })
+
+    def close(self):
+        if self.timer:
+            GLib.source_remove(self.timer)
+        self.view.stop_loading()
+        self.window.destroy()
+
+    # -- screencast -----------------------------------------------------
+
+    def set_cast(self, width, height, scale):
+        if width <= 0 or height <= 0:
+            self.cast = None
+            if self.timer:
+                GLib.source_remove(self.timer)
+                self.timer = None
+            return
+        w, h = int(width), int(height)
+        self.cast = (w, h)
+        self.window.set_default_size(w, h)
+        self.view.set_size_request(w, h)
+        self.window.resize(w, h)
+        self.last_frame = None
+        self.waiting_ack = False
+        if not self.timer:
+            # The first capture waits for the new size to be laid out.
+            self.timer = GLib.timeout_add(FRAME_MS, self.tick)
+
+    def ack(self, seq):
+        if seq == self.seq:
+            self.waiting_ack = False
+
+    def tick(self):
+        if not self.cast:
+            return False
+        now = GLib.get_monotonic_time() / 1e6
+        if self.capturing or (self.waiting_ack and now - self.sent_at < 2):
+            return True
+        self.capturing = True
+        self.view.get_snapshot(WebKit2.SnapshotRegion.VISIBLE, WebKit2.SnapshotOptions.NONE, None, self.snapped)
+        return True
+
+    def snapped(self, view, res):
+        self.capturing = False
+        try:
+            surf = view.get_snapshot_finish(res)
+        except GLib.Error:
+            return
+        pix = Gdk.pixbuf_get_from_surface(surf, 0, 0, surf.get_width(), surf.get_height())
+        if pix is None:
+            return
+        ok, jpeg = pix.save_to_bufferv("jpeg", ["quality"], ["70"])
+        if not ok or jpeg == self.last_frame:
+            return
+        self.last_frame = jpeg
+        self.seq = (self.seq + 1) & 0xFFFFFFFF
+        self.waiting_ack = True
+        self.sent_at = GLib.get_monotonic_time() / 1e6
+        send({
+            "event": "frame", "surface": self.surface, "seq": self.seq,
+            "width": pix.get_width(), "height": pix.get_height(),
+            "jpeg": base64.b64encode(jpeg).decode(),
+        })
+
+    # -- input ----------------------------------------------------------
+
+    def gdk_event(self, kind):
+        ev = Gdk.Event.new(kind)
+        seat = Gdk.Display.get_default().get_default_seat()
+        is_key = kind in (Gdk.EventType.KEY_PRESS, Gdk.EventType.KEY_RELEASE)
+        ev.set_device(seat.get_keyboard() if is_key else seat.get_pointer())
+        return ev
+
+    def input(self, e):
+        t = e.get("type")
+        mods = e.get("modifiers") or {}
+        state = Gdk.ModifierType(0)
+        if mods.get("shift"):
+            state |= Gdk.ModifierType.SHIFT_MASK
+        if mods.get("ctrl"):
+            state |= Gdk.ModifierType.CONTROL_MASK
+        if mods.get("alt"):
+            state |= Gdk.ModifierType.MOD1_MASK
+        if mods.get("meta"):
+            state |= Gdk.ModifierType.SUPER_MASK
+        win = self.view.get_window()
+        if win is None:
+            return
+        if t == "mouse":
+            action = e.get("action")
+            button = {"left": 1, "middle": 2, "right": 3}.get(e.get("button"), 1)
+            if action == "move":
+                ev = self.gdk_event(Gdk.EventType.MOTION_NOTIFY)
+                ev.motion.window = win
+                ev.motion.x, ev.motion.y = e.get("x", 0), e.get("y", 0)
+                ev.motion.state = state
+            else:
+                kind = Gdk.EventType.BUTTON_PRESS if action == "down" else Gdk.EventType.BUTTON_RELEASE
+                if action == "down" and e.get("click_count", 1) == 2:
+                    kind = Gdk.EventType.DOUBLE_BUTTON_PRESS
+                ev = self.gdk_event(kind)
+                ev.button.window = win
+                ev.button.x, ev.button.y = e.get("x", 0), e.get("y", 0)
+                ev.button.button = button
+                ev.button.state = state
+                ev.button.time = Gtk.get_current_event_time()
+            self.view.event(ev)
+        elif t == "wheel":
+            # GDK scrolling misses an off-screen view; scroll what is under
+            # the pointer, the way the wheel would.
+            js = WHEEL_JS % (e.get("x", 0), e.get("y", 0), -e.get("delta_x", 0), -e.get("delta_y", 0))
+            self.view.evaluate_javascript(js, -1, None, None, None, None)
+        elif t == "key" and e.get("action") == "down":
+            name = e.get("key", "")
+            text = e.get("text")
+            if name in SPECIAL_KEYS:
+                keyval = Gdk.keyval_from_name(SPECIAL_KEYS[name])
+            elif text:
+                for ch in text:
+                    self.key(Gdk.unicode_to_keyval(ord(ch)), state, win)
+                return
+            elif len(name) == 1:
+                keyval = Gdk.unicode_to_keyval(ord(name))
+            else:
+                return
+            self.key(keyval, state, win)
+        elif t == "insert_text":
+            for ch in e.get("text", ""):
+                self.key(Gdk.unicode_to_keyval(ord(ch)), state, win)
+
+    def key(self, keyval, state, win):
+        keymap = Gdk.Keymap.get_for_display(Gdk.Display.get_default())
+        ok, keys = keymap.get_entries_for_keyval(keyval)
+        for kind in (Gdk.EventType.KEY_PRESS, Gdk.EventType.KEY_RELEASE):
+            ev = self.gdk_event(kind)
+            ev.key.window = win
+            ev.key.keyval = keyval
+            ev.key.state = state
+            ev.key.time = Gtk.get_current_event_time()
+            if ok and keys:
+                ev.key.hardware_keycode = keys[0].keycode
+            self.view.event(ev)
+
+
+def step(page, op, mid):
+    v = page.view
+    kind = op.get("op")
+    if kind == "eval":
+        def done(view, res):
+            # As WebKit on a Mac hands it over: the value's JSON, as text;
+            # nothing when the script did not run.
+            try:
+                text = view.evaluate_javascript_finish(res).to_json(0) or ""
+            except GLib.Error:
+                text = ""
+            answer(mid, text)
+        v.evaluate_javascript(op.get("script", ""), -1, None, None, None, done)
+    elif kind == "navigate":
+        page.load(op.get("url", "about:blank"), mid)
+    elif kind == "back":
+        v.go_back(); answer(mid)
+    elif kind == "forward":
+        v.go_forward(); answer(mid)
+    elif kind == "reload":
+        v.reload(); answer(mid)
+    elif kind == "stop":
+        v.stop_loading(); answer(mid)
+    elif kind == "screenshot":
+        def done(view, res):
+            try:
+                surf = view.get_snapshot_finish(res)
+            except GLib.Error as e:
+                return fail(mid, "no snapshot: " + e.message)
+            pix = Gdk.pixbuf_get_from_surface(surf, 0, 0, surf.get_width(), surf.get_height())
+            ok, png = pix.save_to_bufferv("png", [], [])
+            answer(mid, {"png_base64": base64.b64encode(png).decode()})
+        v.get_snapshot(WebKit2.SnapshotRegion.VISIBLE, WebKit2.SnapshotOptions.NONE, None, done)
+    else:
+        fail(mid, "unknown step")
+
+
+def handle(msg):
+    global init_scripts
+    mid = msg.get("id")
+    surface = msg.get("surface", "")
+    cmd = msg.get("cmd")
+    page = pages.get(surface)
+    if cmd == "init":
+        init_scripts = msg.get("scripts", [])
+        answer(mid)
+    elif cmd == "create":
+        if page:
+            page.close()
+        pages[surface] = Page(surface, msg.get("url") or "about:blank", mid)
+    elif cmd == "close":
+        if page:
+            pages.pop(surface).close()
+        answer(mid)
+    elif page is None:
+        fail(mid, "no page " + surface)
+    elif cmd == "screencast":
+        page.set_cast(msg.get("width", 0), msg.get("height", 0), msg.get("scale", 1))
+        answer(mid)
+    elif cmd == "ack":
+        page.ack(msg.get("seq", 0))
+    elif cmd == "input":
+        page.input(msg.get("event") or {})
+    elif cmd == "step":
+        step(page, msg.get("op") or {}, mid)
+    else:
+        fail(mid, "unknown command")
+
+
+def on_stdin(channel, condition):
+    if condition & (GLib.IO_HUP | GLib.IO_ERR):
+        Gtk.main_quit()
+        return False
+    # Several lines can arrive in one read; all of them are handled now,
+    # since the rest would wait in the channel's buffer for the next input.
+    while True:
+        status, line, _, _ = channel.read_line()
+        if status == GLib.IOStatus.EOF:
+            # The daemon is gone.
+            Gtk.main_quit()
+            return False
+        if line and line.strip():
+            try:
+                handle(json.loads(line))
+            except Exception as e:  # one bad message must not end the helper
+                sys.stderr.write("lmux-webkit: %s\n" % e)
+        if not channel.get_buffer_condition() & GLib.IOCondition.IN:
+            return True
+
+
+channel = GLib.IOChannel.unix_new(sys.stdin.fileno())
+GLib.io_add_watch(channel, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, on_stdin)
+send({"event": "ready"})
+Gtk.main()
