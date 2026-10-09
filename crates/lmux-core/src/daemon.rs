@@ -788,9 +788,19 @@ impl Inner {
                 .filter(|d| is_dir(d))
                 .or_else(|| Some(r.workspace_cwd.clone()).filter(|d| is_dir(d)))
                 .unwrap_or_else(|| home.clone());
+            let agent = r
+                .agent
+                .clone()
+                .filter(|_| !saved_dir_gone)
+                .filter(|a| resume_command(a).is_some() && seen.insert(a.id.clone()));
             // Replay the saved screen: the window's first process prints a
-            // private copy of it, then execs the login shell in `cwd`.
-            let restore = scrollback::stage_restore(&self.cfg.state_dir, &r.surface).await;
+            // private copy of it, then execs the login shell in `cwd`. A pane
+            // that resumes an agent skips it: the agent redraws its own
+            // conversation, so the replay would show it twice.
+            let restore = match agent {
+                Some(_) => None,
+                None => scrollback::stage_restore(&self.cfg.state_dir, &r.surface).await,
+            };
             let (command, env) = match &restore {
                 Some(p) => (
                     Some(scrollback::restore_command()),
@@ -824,11 +834,6 @@ impl Inner {
                     continue;
                 }
             };
-            let agent = r
-                .agent
-                .clone()
-                .filter(|_| !saved_dir_gone)
-                .filter(|a| resume_command(a).is_some() && seen.insert(a.id.clone()));
             match agent {
                 Some(a) => {
                     // Let the shell come up before typing into it.
