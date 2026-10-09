@@ -766,13 +766,15 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
     // Unread badge, top right.
     if ws.unread_notifications > 0 {
         let badge = egui::pos2(rect.max.x - 12.0, rect.min.y + 11.0);
-        p.circle_filled(badge, 8.0, theme::BADGE);
+        // On the blue selected card a blue badge would vanish: invert it.
+        let (fill, fg) = if selected { (Color32::WHITE, theme::BADGE) } else { (theme::BADGE, Color32::WHITE) };
+        p.circle_filled(badge, 8.0, fill);
         p.text(
             badge,
             Align2::CENTER_CENTER,
             ws.unread_notifications.to_string(),
             theme::ui(theme::FS_TINY),
-            Color32::WHITE,
+            fg,
         );
     }
 

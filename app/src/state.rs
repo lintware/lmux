@@ -161,6 +161,8 @@ pub struct AppState {
     pub folder_rename: Option<FolderRename>,
     /// Inline rename of a workspace card's title (`folder` holds the workspace).
     pub ws_rename: Option<FolderRename>,
+    /// The pane shown alone over its workspace (Cmd+Shift+Enter), if any.
+    pub zoomed_pane: Option<Ref>,
     /// The command palette, while it is open.
     pub palette: Option<Palette>,
     /// Terminal font size in points (Cmd+= / Cmd+- / Cmd+0).
@@ -429,6 +431,7 @@ impl AppState {
             folder_rename: None,
             ws_rename: None,
             palette: None,
+            zoomed_pane: None,
             term_font: crate::theme::FS_TERM,
             folder_toggle: None,
             folder_rename_pending: None,
@@ -889,6 +892,15 @@ impl AppState {
         let Some(id) = id else { return };
         let Some(title) = self.workspace(&id).map(|w| w.title.clone()) else { return };
         self.ws_rename = Some(FolderRename { folder: id, text: title, focus_requested: false });
+    }
+
+    /// Cmd+Shift+Enter: show the focused pane alone, or go back to the split.
+    pub fn toggle_zoom(&mut self) {
+        self.zoomed_pane = match (&self.zoomed_pane, self.focused_pane()) {
+            (Some(_), _) => None,
+            (None, Some(p)) if self.selected_workspace().is_some_and(|w| w.panes.len() > 1) => Some(p),
+            _ => None,
+        };
     }
 
     /// Cmd+= / Cmd+- / Cmd+0. Sizes stay between 8 and 32 points.

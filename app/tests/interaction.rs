@@ -990,3 +990,34 @@ fn escape_closes_the_palette() {
     press(&mut h, Modifiers::NONE, Key::Escape);
     assert!(h.state().state.palette.is_none());
 }
+
+#[test]
+fn cmd_shift_enter_zooms_the_focused_pane_and_back() {
+    let mut fx = fixture();
+    {
+        use wire::*;
+        let ws = &mut fx.state.tree.workspaces[0];
+        ws.panes.push(Pane {
+            id: "pane:9".into(),
+            surfaces: vec![term("surface:9", "right")],
+            active_surface: Some("surface:9".into()),
+        });
+        ws.layout = Layout::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(Layout::Pane { pane: "pane:1".into() }),
+            second: Box::new(Layout::Pane { pane: "pane:9".into() }),
+        };
+    }
+    let mut h = harness(fx);
+    assert!(h.state().state.pane_rects.contains_key("pane:9"));
+    let mods = Modifiers { command: true, shift: true, ..Default::default() };
+    press(&mut h, mods, Key::Enter);
+    h.run();
+    assert_eq!(h.state().state.zoomed_pane.as_deref(), Some("pane:1"));
+    assert!(!h.state().state.pane_rects.contains_key("pane:9"), "only the zoomed pane is drawn");
+    press(&mut h, mods, Key::Enter);
+    h.run();
+    assert!(h.state().state.zoomed_pane.is_none());
+    assert!(h.state().state.pane_rects.contains_key("pane:9"));
+}

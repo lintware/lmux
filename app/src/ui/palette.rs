@@ -28,6 +28,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("Previous Tab", "⇧⌘["),
     ("Split Right", "⌘D"),
     ("Split Down", "⇧⌘D"),
+    ("Toggle Pane Zoom", "⇧⌘↩"),
     ("Toggle Sidebar", "⌘B"),
     ("Show Notifications", "⌘I"),
     ("Jump to Latest Unread", "⇧⌘U"),

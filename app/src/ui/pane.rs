@@ -1,6 +1,6 @@
 //! Split layout: pane rectangles, focus ring, inline tabs and draggable dividers.
 
-use egui::{Align2, CornerRadius, Id, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
+use egui::{Align2, CornerRadius, Id, Rect, Sense, Stroke, Ui, Vec2};
 use lmux_proto::methods as m;
 use lmux_proto::{SplitDirection, SurfaceKind, Workspace};
 
@@ -32,6 +32,17 @@ pub fn show(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
     }
     let mut solved = Solved::default();
     layout::solve(&tree, rect, theme::DIVIDER_W, &mut solved);
+
+    // A zoomed pane (Cmd+Shift+Enter) takes the whole area on its own.
+    let zoomed = c
+        .state
+        .zoomed_pane
+        .clone()
+        .filter(|z| solved.panes.iter().any(|s| s.pane == *z));
+    if let Some(z) = zoomed {
+        draw_pane(ui, rect, &z, &ws, false, c);
+        return;
+    }
     let multi = solved.panes.len() > 1;
 
     for slot in &solved.panes {
@@ -70,13 +81,10 @@ fn draw_pane(ui: &mut Ui, rect: Rect, pane_id: &str, ws: &Workspace, multi: bool
         ui.painter_at(content).rect_filled(content, 0.0, theme::TERM_BG);
     }
 
-    if multi && focused {
-        ui.painter_at(rect).rect_stroke(
-            rect.shrink(1.0),
-            CornerRadius::ZERO,
-            Stroke::new(2.0, theme::ACCENT),
-            StrokeKind::Inside,
-        );
+    // Unfocused splits are dimmed, as Ghostty's unfocused-split-opacity does
+    // in cmux, so the focused one reads at a glance without a border.
+    if multi && !focused {
+        ui.painter_at(content).rect_filled(content, 0.0, theme::UNFOCUSED_DIM);
     }
 }
 

@@ -74,6 +74,8 @@ pub fn titlebar_inset() -> f32 {
 }
 pub const TAB_STRIP_H: f32 = 32.0;
 pub const STATUS_H: f32 = 24.0;
+/// Laid over an unfocused split's content (Ghostty's unfocused-split-opacity 0.7).
+pub const UNFOCUSED_DIM: Color32 = Color32::from_black_alpha(77);
 pub const SIDEBAR_DEFAULT_W: f32 = 216.0;
 pub const SIDEBAR_MIN_W: f32 = 168.0;
 pub const SIDEBAR_MAX_W: f32 = 380.0;

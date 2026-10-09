@@ -601,6 +601,9 @@ pub fn shortcuts(ctx: &egui::Context, c: &mut ui::Ctx) {
     if key(cmd_shift, Key::R) {
         c.state.begin_ws_rename(None);
     }
+    if key(cmd_shift, Key::Enter) {
+        c.state.toggle_zoom();
+    }
     // Notifications: jump to the newest unread.
     if key(cmd_shift, Key::U) {
         c.state.jump_to_unread();
@@ -893,6 +896,7 @@ pub fn run_command(c: &mut ui::Ctx, name: &str) {
         "Previous Tab" => c.state.cycle_tab(-1),
         "Split Right" => split(c, &focused_pane, &active_surface, "right"),
         "Split Down" => split(c, &focused_pane, &active_surface, "down"),
+        "Toggle Pane Zoom" => c.state.toggle_zoom(),
         "Toggle Sidebar" => c.state.sidebar_hidden = !c.state.sidebar_hidden,
         "Show Notifications" => c.state.notif_open = true,
         "Jump to Latest Unread" => {
