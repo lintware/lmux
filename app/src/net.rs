@@ -530,6 +530,13 @@ impl Net {
         self.current_host().map(|h| h.label.clone()).unwrap_or_default()
     }
 
+    /// True while the connected host is the machine this app runs on. Terminal
+    /// panes there attach through a local PTY instead of the daemon's stream.
+    pub fn is_local_host(&self) -> bool {
+        self.current_host()
+            .is_some_and(|h| h.name == LOCAL_HOST_NAME)
+    }
+
     /// Device scale factor for the browser stream. Defaults to 1.0 over the
     /// network (a Retina 2.0 would cost 4× the pixels); `LMUX_BROWSER_SCALE`
     /// or the host's `browser_scale` opts into more (review #9).

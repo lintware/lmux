@@ -2,12 +2,18 @@
 //! the subscribe/unsubscribe bookkeeping that keeps hidden panes idle.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use egui::ColorImage;
 use lmux_proto::{Layout, Notification, Pane, ServerMsg, Surface, SurfaceKind, Tree};
 
+use crate::pty::LocalPty;
 use crate::term::TermView;
 use crate::wire::{self, m, ClientMsg, Ref};
+
+/// How long to wait before attaching a local pane again after its tmux client
+/// died, so a tmux that cannot serve the pane is not respawned every frame.
+const LOCAL_PTY_RETRY: Duration = Duration::from_secs(1);
 
 pub struct BrowserView {
     pub url: String,
@@ -109,6 +115,20 @@ pub struct AppState {
     pub pending_create: Option<PendingCreate>,
     pub terms: HashMap<Ref, TermView>,
     pub browsers: HashMap<Ref, BrowserView>,
+    /// PTYs owned by this process, one per local terminal surface. Present only
+    /// while the connected host is this machine (see [`AppState::local_mode`]).
+    pub local_ptys: HashMap<Ref, LocalPty>,
+    /// True while the connected host is the machine the app runs on. Terminal
+    /// panes then attach through a local PTY instead of the daemon's stream.
+    pub local_mode: bool,
+    /// Local surfaces the user has shown; their PTY is kept (and retried) even
+    /// while the tab is hidden, so switching back is instant.
+    local_wanted: HashSet<Ref>,
+    /// Earliest next attach attempt per surface, so a failing tmux cannot be
+    /// respawned every frame.
+    local_retry: HashMap<Ref, Instant>,
+    /// egui context, used to wake the UI when a local PTY delivers output.
+    wake: Option<egui::Context>,
     pub notifications: Vec<Notification>,
     pub selected: Option<Ref>,
     /// Local tab selection per pane (the protocol has no activate-surface RPC).
@@ -339,6 +359,11 @@ impl AppState {
             pending_create: None,
             terms: HashMap::new(),
             browsers: HashMap::new(),
+            local_ptys: HashMap::new(),
+            local_mode: false,
+            local_wanted: HashSet::new(),
+            local_retry: HashMap::new(),
+            wake: None,
             notifications: Vec::new(),
             selected: None,
             pane_active: HashMap::new(),
@@ -957,6 +982,11 @@ impl AppState {
             }
             keep
         });
+        // A local PTY exists only while its surface does. Dropping it hangs up
+        // the tmux client, and the view session goes with it.
+        self.local_ptys.retain(|k, _| live.contains(k));
+        self.local_wanted.retain(|k| live.contains(k));
+        self.local_retry.retain(|k, _| live.contains(k));
 
         // A create aimed at this host can go out now.
         self.fire_pending_create();
@@ -1013,7 +1043,32 @@ impl AppState {
             return;
         }
 
-        // Terminals.
+        // Terminals: streamed from the daemon, or attached by this process.
+        if self.local_mode {
+            self.sync_local_terms(&visible);
+        } else {
+            self.sync_streamed_terms(&visible);
+        }
+
+        // Browsers.
+        let ids: Vec<Ref> = self.browsers.keys().cloned().collect();
+        for id in &ids {
+            let visible_now = visible.contains(id);
+            let Some(b) = self.browsers.get_mut(id) else { continue };
+            b.wants_visible = visible_now;
+            if visible_now && !b.subscribed {
+                b.subscribed = true;
+                self.pending.push(ClientMsg::Subscribe { surface: id.clone() });
+            } else if !visible_now && b.subscribed {
+                b.subscribed = false;
+                self.pending.push(ClientMsg::Unsubscribe { surface: id.clone() });
+            }
+        }
+    }
+
+    /// Terminals the daemon streams: subscribe while visible, unsubscribe while
+    /// hidden, and let the daemon resize their tmux windows.
+    fn sync_streamed_terms(&mut self, visible: &HashSet<Ref>) {
         let ids: Vec<Ref> = self.terms.keys().cloned().collect();
         for id in &ids {
             let visible_now = visible.contains(id);
@@ -1037,21 +1092,131 @@ impl AppState {
                 }
             }
         }
+    }
 
-        // Browsers.
-        let ids: Vec<Ref> = self.browsers.keys().cloned().collect();
+    /// Terminals on this machine. The daemon gets no subscribe, no unsubscribe
+    /// and no resize for these: the PTY is the pane's only attachment, and with
+    /// `window-size latest` set on the window it is the PTY that decides the
+    /// size. A PTY is spawned the first time its surface is visible and kept
+    /// until the surface leaves the tree, so a hidden tab comes back instantly.
+    fn sync_local_terms(&mut self, visible: &HashSet<Ref>) {
+        let ids: Vec<Ref> = self.terms.keys().cloned().collect();
+        let now = Instant::now();
         for id in &ids {
             let visible_now = visible.contains(id);
-            let Some(b) = self.browsers.get_mut(id) else { continue };
-            b.wants_visible = visible_now;
-            if visible_now && !b.subscribed {
-                b.subscribed = true;
-                self.pending.push(ClientMsg::Subscribe { surface: id.clone() });
-            } else if !visible_now && b.subscribed {
-                b.subscribed = false;
-                self.pending.push(ClientMsg::Unsubscribe { surface: id.clone() });
+            let pane = self.surface_tmux_pane(id);
+            if let Some(t) = self.terms.get_mut(id) {
+                t.wants_visible = visible_now;
+                t.subscribed = false;
+            }
+            if visible_now {
+                self.local_wanted.insert(id.clone());
+            }
+            // Without a tmux pane id there is nothing to attach to yet; the next
+            // tree carries it.
+            let Some(pane) = pane else { continue };
+
+            // A PTY attached to a window that is no longer this surface's is
+            // replaced; a PTY whose tmux client exited is retried after a pause.
+            let stale = self
+                .local_ptys
+                .get(id)
+                .is_some_and(|p| p.tmux_pane.as_deref() != Some(pane.as_str()));
+            if stale {
+                self.local_ptys.remove(id);
+            } else if self.local_ptys.get_mut(id).is_some_and(|p| !p.is_alive()) {
+                self.local_ptys.remove(id);
+                self.local_retry.insert(id.clone(), now + LOCAL_PTY_RETRY);
+            }
+
+            if self.local_ptys.contains_key(id) {
+                let size = self.desired_sizes.get(id).copied().unwrap_or((80, 24));
+                if let Some(p) = self.local_ptys.get_mut(id) {
+                    p.resize(size.0, size.1);
+                }
+                if let Some(t) = self.terms.get_mut(id) {
+                    t.resize(size.0, size.1);
+                }
+                continue;
+            }
+
+            if !self.local_wanted.contains(id) {
+                continue;
+            }
+            if self.local_retry.get(id).is_some_and(|t| *t > now) {
+                continue;
+            }
+            let (cols, rows) = self.desired_sizes.get(id).copied().unwrap_or((80, 24));
+            match LocalPty::spawn(id, &pane, cols, rows, self.wake.clone()) {
+                Ok(pty) => {
+                    self.local_retry.remove(id);
+                    self.local_ptys.insert(id.clone(), pty);
+                }
+                Err(e) => {
+                    eprintln!("[localpty] {id}: {e}");
+                    self.local_retry.insert(id.clone(), now + LOCAL_PTY_RETRY);
+                }
             }
         }
+    }
+
+    /// The tmux pane backing a terminal surface, if the tree names one yet.
+    fn surface_tmux_pane(&self, surface: &str) -> Option<String> {
+        match self.surface(surface).map(|s| &s.kind) {
+            Some(SurfaceKind::Terminal { tmux_pane, .. }) => tmux_pane.clone(),
+            _ => None,
+        }
+    }
+
+    /// egui context the PTY reader threads wake when output arrives.
+    pub fn set_wake(&mut self, ctx: egui::Context) {
+        self.wake = Some(ctx);
+    }
+
+    /// Record whether the connected host is this machine. Leaving the local host
+    /// closes every local attachment; the surfaces belong to its tree.
+    pub fn set_local_mode(&mut self, local: bool) {
+        if self.local_mode == local {
+            return;
+        }
+        self.local_mode = local;
+        if !local {
+            self.local_ptys.clear();
+            self.local_wanted.clear();
+            self.local_retry.clear();
+        }
+    }
+
+    /// True while this surface is a terminal served by a PTY in this process.
+    pub fn local_terminal(&self, surface: &str) -> bool {
+        self.local_mode && self.surface_tmux_pane(surface).is_some()
+    }
+
+    /// Feed everything the local PTYs produced since the last frame into their
+    /// terminal views (the same grid the daemon streams into for remote panes).
+    pub fn pump_local_ptys(&mut self) {
+        let ids: Vec<Ref> = self.local_ptys.keys().cloned().collect();
+        for id in ids {
+            let chunks = self.local_ptys.get_mut(&id).map(|p| p.drain()).unwrap_or_default();
+            if chunks.is_empty() {
+                continue;
+            }
+            let tv = self.terms.entry(id).or_insert_with(|| TermView::new(80, 24));
+            for chunk in &chunks {
+                tv.feed(chunk);
+            }
+            tv.exited = false;
+        }
+    }
+
+    /// Write key bytes (or paste) straight to a local PTY. `false` when this
+    /// surface has no PTY, so the caller can fall back to the daemon.
+    pub fn write_local(&mut self, surface: &str, bytes: &[u8]) -> bool {
+        let Some(pty) = self.local_ptys.get_mut(surface) else { return false };
+        if let Err(e) = pty.write(bytes) {
+            eprintln!("[localpty] write {surface}: {e}");
+        }
+        true
     }
 
     /// Unsubscribe everything (window minimised/occluded): hidden panes must
@@ -1220,6 +1385,47 @@ mod tests {
         // Once the size has held for the window, the settled size goes out once.
         assert!(b.resize_decision((900, 600, 1.0), t0 + Duration::from_millis(200), d).0);
         assert!(!b.resize_decision((900, 600, 1.0), t0 + Duration::from_millis(400), d).0);
+    }
+
+    #[test]
+    fn local_panes_are_never_streamed_from_the_daemon() {
+        let mut st = state_with(&["s1"], "s1");
+        // Give the surface the tmux window it would have in a real tree, and hold
+        // the attach off so the test never starts a tmux client: the real attach
+        // is covered by the PTY benchmark, which uses a scratch socket.
+        if let SurfaceKind::Terminal { tmux_pane, .. } =
+            &mut st.tree.workspaces[0].panes[0].surfaces[0].kind
+        {
+            *tmux_pane = Some("%7".into());
+        }
+        st.set_local_mode(true);
+        st.ensure_term("s1");
+        st.local_retry.insert("s1".into(), Instant::now() + Duration::from_secs(3600));
+        st.visible.insert("s1".into());
+        st.desired_sizes.insert("s1".into(), (100, 30));
+
+        st.sync_subscriptions(true);
+        assert!(
+            st.pending.is_empty(),
+            "a pane on this machine must not be subscribed, unsubscribed or resized \
+             through the daemon: {:?}",
+            st.pending
+        );
+        assert!(!st.terms["s1"].subscribed, "nothing is streamed for a local pane");
+        assert!(st.terms["s1"].wants_visible, "the pane is still tracked as visible");
+        assert!(st.local_terminal("s1"), "a terminal with a tmux window is a local pane");
+
+        // Browsers have no local path: they keep streaming from the daemon.
+        st.browsers.insert("b1".into(), BrowserView::new("https://example.com/".into()));
+        st.visible.insert("b1".into());
+        st.sync_subscriptions(true);
+        assert!(
+            st.pending
+                .iter()
+                .any(|m| matches!(m, ClientMsg::Subscribe { surface } if surface == "b1")),
+            "a browser pane still subscribes on the local host: {:?}",
+            st.pending
+        );
     }
 
     #[test]

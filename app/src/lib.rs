@@ -6,6 +6,7 @@ pub mod fonts;
 pub mod keys;
 pub mod layout;
 pub mod net;
+pub mod pty;
 pub mod state;
 pub mod term;
 pub mod theme;
