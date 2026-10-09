@@ -232,3 +232,30 @@ fn snapshot_notifications_from_every_host() {
     let mut h = harness(fx, 2.0);
     h.snapshot("notifications_multi_host");
 }
+
+/// Typing an SSH target into the Add Remote Host dialog and pressing Enter
+/// queues the host to be added, and closes the dialog.
+#[test]
+fn the_add_host_dialog_queues_the_typed_target() {
+    let mut fx = fixture();
+    fx.hosts[0].state.add_host_draft = Some(String::new());
+    let mut h = harness(fx, 1.0);
+    h.run();
+    h.input_mut().events.push(egui::Event::Text("cloud-box-1".into()));
+    h.run();
+    h.input_mut().events.push(egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Default::default(),
+    });
+    h.run();
+    let st = &h.state().hosts[0].state;
+    assert!(st.add_host_draft.is_none(), "the dialog closed");
+    assert!(
+        st.actions.iter().any(|a| matches!(a, lmux_app::state::Action::AddHost(t) if t == "cloud-box-1")),
+        "AddHost queued: {:?}",
+        st.actions
+    );
+}
