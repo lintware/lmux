@@ -615,6 +615,8 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
 
     match kind {
         Some(SurfaceKind::Terminal { .. }) => {
+            let mode = c.state.term_mode(&sid);
+            let bracketed = mode.contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
             let mut bytes: Vec<u8> = Vec::new();
             ctx.input(|i| {
                 for ev in &i.events {
@@ -635,20 +637,17 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
                                 bytes.extend_from_slice(&b);
                             }
                         }
-                        egui::Event::Paste(t) => bytes.extend_from_slice(t.as_bytes()),
+                        // Cmd+V: egui-winit reads the clipboard and delivers it here.
+                        egui::Event::Paste(t) => {
+                            bytes.extend_from_slice(&crate::termio::paste_bytes(t, bracketed))
+                        }
                         _ => {}
                     }
                 }
             });
-            if !bytes.is_empty() {
-                // A local pane is attached by this process: its keys go straight
-                // to the PTY. Remote panes keep the daemon's input path.
-                let wrote = c.state.local_terminal(&sid) && c.state.write_local(&sid, &bytes);
-                if !wrote {
-                    let data = String::from_utf8_lossy(&bytes).into_owned();
-                    c.state.pending.push(ClientMsg::TermInput { surface: sid, data });
-                }
-            }
+            // A local pane is attached by this process: its keys go straight to
+            // the PTY. Remote panes keep the daemon's input path.
+            c.state.send_term_input(&sid, &bytes);
         }
         Some(SurfaceKind::Browser { .. }) => {
             let mut events: Vec<BrowserInputEvent> = Vec::new();
