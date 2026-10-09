@@ -242,7 +242,9 @@ fn wheel_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Grid,
         // tmux drives this PTY through the alternate screen, which keeps no
         // history, so the local grid has nothing to scroll: arrow keys are
         // what the pane's application (and tmux's own copy-mode) understands.
-        let seq: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
+        let key = if lines > 0 { egui::Key::ArrowUp } else { egui::Key::ArrowDown };
+        let app_cursor = mode.contains(TermMode::APP_CURSOR);
+        let seq = crate::keys::terminal_key_mode(key, egui::Modifiers::default(), app_cursor).unwrap_or_default();
         c.state.write_local(surface, &seq.repeat(count));
     } else if let Some(tv) = c.state.terms.get_mut(surface) {
         tv.scroll(lines);

@@ -5,6 +5,22 @@ use egui::{Key, Modifiers};
 /// Terminal input for a special or control key. Printable text is handled
 /// separately (see [`text_input`]) so IME and dead keys work.
 pub fn terminal_key(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
+    terminal_key_mode(key, mods, false)
+}
+
+/// [`terminal_key`] for a terminal whose program may have switched the cursor
+/// keys to application mode (DECCKM, `ESC[?1h`): then the unmodified arrows,
+/// Home and End send SS3 (`ESC O A`) instead of CSI (`ESC [ A`).
+pub fn terminal_key_mode(key: Key, mods: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
+    let out = terminal_key_normal(key, mods)?;
+    let plain = !(mods.shift || mods.alt || mods.ctrl);
+    if app_cursor && plain && is_cursor(key) && out.len() == 3 && out.starts_with(b"\x1b[") {
+        return Some(vec![0x1b, b'O', out[2]]);
+    }
+    Some(out)
+}
+
+fn terminal_key_normal(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
     let ctrl = mods.ctrl;
     let alt = mods.alt;
     let shift = mods.shift;
@@ -209,6 +225,21 @@ mod tests {
     fn arrows() {
         assert_eq!(terminal_key(Key::ArrowUp, m()), Some(b"\x1b[A".to_vec()));
         assert_eq!(terminal_key(Key::ArrowLeft, m()), Some(b"\x1b[D".to_vec()));
+    }
+
+    #[test]
+    fn application_cursor_keys_use_ss3() {
+        assert_eq!(terminal_key_mode(Key::ArrowUp, m(), true), Some(b"\x1bOA".to_vec()));
+        assert_eq!(terminal_key_mode(Key::ArrowDown, m(), true), Some(b"\x1bOB".to_vec()));
+        assert_eq!(terminal_key_mode(Key::ArrowRight, m(), true), Some(b"\x1bOC".to_vec()));
+        assert_eq!(terminal_key_mode(Key::ArrowLeft, m(), true), Some(b"\x1bOD".to_vec()));
+        assert_eq!(terminal_key_mode(Key::Home, m(), true), Some(b"\x1bOH".to_vec()));
+        assert_eq!(terminal_key_mode(Key::End, m(), true), Some(b"\x1bOF".to_vec()));
+        // Modified cursor keys and everything else are unchanged.
+        let ctrl = Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(terminal_key_mode(Key::ArrowRight, ctrl, true), Some(b"\x1b[1;5C".to_vec()));
+        assert_eq!(terminal_key_mode(Key::PageUp, m(), true), Some(b"\x1b[5~".to_vec()));
+        assert_eq!(terminal_key_mode(Key::ArrowUp, m(), false), Some(b"\x1b[A".to_vec()));
     }
 
     #[test]

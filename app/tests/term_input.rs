@@ -134,7 +134,7 @@ fn cell_left(h: &Harness<Fixture>, row: usize, col: usize) -> Pos2 {
     cell(h, row, col) - Vec2::new(w * 0.25, 0.0)
 }
 
-fn button(h:&mut Harness<Fixture>, pos: Pos2, b: PointerButton, pressed: bool, modifiers: Modifiers) {
+fn button(h: &mut Harness<Fixture>, pos: Pos2, b: PointerButton, pressed: bool, modifiers: Modifiers) {
     h.input_mut().events.push(egui::Event::PointerButton { pos, button: b, pressed, modifiers });
     h.step();
 }
@@ -249,7 +249,33 @@ fn cmd_click_opens_the_url_under_the_pointer() {
     assert_eq!(reports.len(), 4, "only the two clicks off a link reach the program: {reports:?}");
 }
 
-fn wheel(h:&mut Harness<Fixture>, pos: Pos2, lines: f32) {
+fn press_key(h: &mut Harness<Fixture>, key: egui::Key) {
+    h.input_mut().events.push(egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::default(),
+    });
+    h.step();
+}
+
+#[test]
+fn arrows_follow_the_application_cursor_mode() {
+    let mut h = harness(fixture());
+    press_key(&mut h, egui::Key::ArrowUp);
+    feed(&mut h, b"\x1b[?1h");
+    press_key(&mut h, egui::Key::ArrowUp);
+    press_key(&mut h, egui::Key::Home);
+    feed(&mut h, b"\x1b[?1l");
+    press_key(&mut h, egui::Key::ArrowLeft);
+    assert_eq!(
+        term_inputs(h.state()),
+        vec!["\x1b[A".to_owned(), "\x1bOA".to_owned(), "\x1bOH".to_owned(), "\x1b[D".to_owned()]
+    );
+}
+
+fn wheel(h: &mut Harness<Fixture>, pos: Pos2, lines: f32) {
     move_to(h, pos);
     h.input_mut().events.push(egui::Event::MouseWheel {
         unit: egui::MouseWheelUnit::Line,

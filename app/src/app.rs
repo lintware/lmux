@@ -617,6 +617,7 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
         Some(SurfaceKind::Terminal { .. }) => {
             let mode = c.state.term_mode(&sid);
             let bracketed = mode.contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+            let app_cursor = mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR);
             let mut bytes: Vec<u8> = Vec::new();
             let mut copy = false;
             ctx.input(|i| {
@@ -634,7 +635,7 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
                             if modifiers.command {
                                 continue;
                             }
-                            if let Some(b) = keys::terminal_key(*key, *modifiers) {
+                            if let Some(b) = keys::terminal_key_mode(*key, *modifiers, app_cursor) {
                                 bytes.extend_from_slice(&b);
                             }
                         }
