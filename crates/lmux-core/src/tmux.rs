@@ -478,6 +478,18 @@ fn split_lines(s: &str) -> Vec<&str> {
     trimmed.split('\n').collect()
 }
 
+/// `set-clipboard on`: tmux passes programs' OSC 52 copies on to its
+/// clients, so a copy in a local pane reaches the app and this Mac's
+/// clipboard. With the default (`external`) tmux ignores them.
+async fn set_clipboard_on(cfg: &TmuxConfig) {
+    let _ = Command::new("tmux")
+        .args(["-L", &cfg.socket, "set-option", "-s", "set-clipboard", "on"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
 async fn ensure_session(cfg: &TmuxConfig) -> anyhow::Result<()> {
     let has = Command::new("tmux")
         .args(["-L", &cfg.socket, "has-session", "-t", &cfg.session])
@@ -487,6 +499,8 @@ async fn ensure_session(cfg: &TmuxConfig) -> anyhow::Result<()> {
         .await
         .context("running tmux has-session")?;
     if has.success() {
+        // Servers made by an older daemon get the clipboard setting too.
+        set_clipboard_on(cfg).await;
         return Ok(());
     }
     let new = Command::new("tmux")
@@ -521,6 +535,9 @@ async fn ensure_session(cfg: &TmuxConfig) -> anyhow::Result<()> {
         vec!["set-option", "-g", "destroy-unattached", "off"],
         vec!["set-option", "-g", "exit-empty", "off"],
         vec!["set-option", "-g", "window-size", "latest"],
+        // Let programs' OSC 52 copies through to attached clients (the app's
+        // local panes are tmux clients); the default `external` drops them.
+        vec!["set-option", "-s", "set-clipboard", "on"],
     ] {
         let mut a = vec!["-L", &cfg.socket];
         a.extend(args);

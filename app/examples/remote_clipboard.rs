@@ -89,8 +89,13 @@ impl Rig {
     }
 }
 
-fn ssh(host: &str, cmd: &str) -> String {
-    let out = std::process::Command::new("ssh").args(["-o", "BatchMode=yes", host, cmd]).output().expect("ssh");
+/// Run `cmd` on the host: over ssh, or here for this Mac.
+fn on_host(host: Option<&str>, cmd: &str) -> String {
+    let out = match host {
+        Some(h) => std::process::Command::new("ssh").args(["-o", "BatchMode=yes", h, cmd]).output(),
+        None => std::process::Command::new("sh").args(["-c", cmd]).output(),
+    }
+    .expect("run");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -98,7 +103,8 @@ fn main() {
     let want = std::env::args().nth(1).unwrap_or_else(|| "my-server".into());
     let hosts = lmux_app::net::app_hosts();
     let index = hosts.iter().position(|h| h.name == want).unwrap_or_else(|| panic!("no host {want} in hosts.json"));
-    let ssh_target = hosts[index].ssh_target.clone().unwrap_or_else(|| want.clone());
+    let local = hosts[index].name == lmux_app::net::LOCAL_HOST_NAME;
+    let ssh_target = (!local).then(|| hosts[index].ssh_target.clone().unwrap_or_else(|| want.clone()));
     let ctx = egui::Context::default();
     let mut rig = Rig { net: Net::for_host(hosts, index), state: AppState::new(), ctx: ctx.clone() };
     rig.net.begin_connect(&ctx);
@@ -111,7 +117,11 @@ fn main() {
     let before: Vec<String> = rig.state.tree.workspaces.iter().map(|w| w.id.clone()).collect();
     rig.state.rpc(
         "workspace.new",
-        serde_json::json!({ "name": "lmux-clipboard-test", "command": "env PS1='READY$ ' bash --norc --noprofile" }),
+        // macOS's /bin/bash 3.2 predates bracketed paste; zsh has it.
+        serde_json::json!({
+            "name": "lmux-clipboard-test",
+            "command": if local { "env PS1='READY$ ' zsh -f" } else { "env PS1='READY$ ' bash --norc --noprofile" },
+        }),
     );
     rig.wait("the new workspace", Duration::from_secs(10), |r| {
         r.state.tree.workspaces.iter().any(|w| !before.contains(&w.id))
@@ -151,7 +161,7 @@ fn main() {
     rig.type_text(&sid, "\u{4}");
     rig.pump_for(Duration::from_millis(700));
     rig.type_text(&sid, "stty echo\r");
-    let got = ssh(&ssh_target, "cat /tmp/lmux-paste-test.txt; rm -f /tmp/lmux-paste-test.txt");
+    let got = on_host(ssh_target.as_deref(), "cat /tmp/lmux-paste-test.txt; rm -f /tmp/lmux-paste-test.txt");
     let first_diff = payload.lines().zip(got.lines()).position(|(a, b)| a != b);
     check(
         &format!("paste of {} bytes / {} lines arrives byte for byte", payload.len(), payload.lines().count()),
@@ -182,7 +192,7 @@ fn main() {
     rig.type_text(&sid, "clear\r");
     rig.pump_for(Duration::from_millis(500));
     let copied = "copied on the server ✓ 漢字";
-    rig.type_text(&sid, "printf '\\033]52;c;%s\\a' \"$(printf 'copied on the server ✓ 漢字' | base64 -w0)\"; echo OSC_SENT\r");
+    rig.type_text(&sid, "printf '\\033]52;c;%s\\a' \"$(printf 'copied on the server ✓ 漢字' | base64 | tr -d '\\n')\"; echo OSC_SENT\r");
     rig.pump_for(Duration::from_millis(1500));
     let clip = rig.state.take_clipboard_requests();
     check(
