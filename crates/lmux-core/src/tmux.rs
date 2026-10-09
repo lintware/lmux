@@ -387,8 +387,13 @@ impl Tmux {
         Ok(())
     }
 
+    /// True while `window` (an `@N` id) is alive. tmux answers
+    /// `display-message` for a missing window with empty output and no
+    /// error, so the answer must name the window itself.
     pub async fn window_exists(&self, window: &str) -> bool {
-        self.display(window, "#{window_id}").await.is_ok()
+        self.display(window, "#{window_id}")
+            .await
+            .is_ok_and(|out| out.trim() == window)
     }
 
     pub async fn list_windows(&self) -> anyhow::Result<Vec<WinInfo>> {
@@ -907,5 +912,42 @@ mod tests {
         let tag = |id: &str| wins.iter().find(|w| w.window == id).and_then(|w| w.surface.clone());
         assert_eq!(tag(&w1).as_deref(), Some("surface:1"));
         assert_eq!(tag(&w2).as_deref(), Some("surface:2"));
+    }
+
+    /// tmux answers display-message for a missing window with empty output
+    /// and no error; window_exists must not read that as alive. The daemon
+    /// relies on it to ignore the %window-close tmux sends when a session
+    /// grouped with ours (an app view session) ends.
+    #[tokio::test]
+    async fn window_exists_is_false_once_the_window_is_killed() {
+        if !tmux_available().await {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        let socket = format!("lmux-test-exists-{}", std::process::id());
+        let cfg = TmuxConfig { socket: socket.clone(), session: "lmux".into() };
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let tmux = match Tmux::spawn(cfg, ev_tx).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping: could not start tmux ({e})");
+                return;
+            }
+        };
+        let (win, _) = tmux
+            .new_terminal("/tmp", None, &[], 80, 24, "t", "surface:1", "workspace:1")
+            .await
+            .expect("new_terminal");
+        let alive = tmux.window_exists(&win).await;
+        let _ = tmux.command(format!("kill-window -t {win}")).await;
+        let after = tmux.window_exists(&win).await;
+        let _ = Command::new("tmux")
+            .args(["-L", &socket, "kill-server"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        assert!(alive, "a live window exists");
+        assert!(!after, "a killed window does not");
     }
 }

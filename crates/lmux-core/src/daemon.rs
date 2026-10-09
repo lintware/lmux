@@ -1022,6 +1022,14 @@ impl Inner {
     }
 
     async fn handle_window_closed(self: &Arc<Self>, window: &str) {
+        // tmux also reports `%window-close` when a session grouped with ours
+        // goes away (the app's per-pane view sessions for local panes), for
+        // windows that are still alive in our session. Only a window that is
+        // really gone closes its surface.
+        if self.tmux.window_exists(window).await {
+            tracing::debug!(%window, "window-close for a window that still exists; ignored");
+            return;
+        }
         let surface = { self.state.lock().await.remove_window(window) };
         let Some(surface) = surface else { return };
         {
