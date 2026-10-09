@@ -249,7 +249,86 @@ fn cmd_click_opens_the_url_under_the_pointer() {
     assert_eq!(reports.len(), 4, "only the two clicks off a link reach the program: {reports:?}");
 }
 
-fn press_key(h: &mut Harness<Fixture>, key: egui::Key) {
+fn rpcs(fx: &Fixture) -> Vec<(String, serde_json::Value)> {
+    fx.state
+        .pending
+        .iter()
+        .filter_map(|m| match m {
+            ClientMsg::Rpc { request } => Some((request.method.clone(), request.params.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_context_menu_offers_copy_paste_and_splits() {
+    use egui_kittest::kittest::Queryable;
+
+    let mut h = harness(fixture());
+    feed(&mut h, b"hello world");
+    let (from, to) = (cell_left(&h, 0, 0), cell(&h, 0, 4));
+    drag(&mut h, from, to, none());
+    let p = cell(&h, 3, 3);
+    click(&mut h, p, PointerButton::Secondary, none());
+    h.run();
+    for label in ["Copy", "Paste", "Split Right", "Split Down", "Clear Scrollback"] {
+        assert!(h.query_by_label(label).is_some(), "the terminal menu must offer {label}");
+    }
+    assert_eq!(selection(&h).as_deref(), Some("hello"), "a right click keeps the selection");
+
+    h.get_by_label("Copy").click();
+    h.step();
+    let copied = h.output().platform_output.commands.iter().find_map(|c| match c {
+        egui::OutputCommand::CopyText(t) => Some(t.clone()),
+        _ => None,
+    });
+    assert_eq!(copied.as_deref(), Some("hello"));
+    h.run();
+    assert!(h.query_by_label("Split Right").is_none(), "choosing an item closes the menu");
+
+    click(&mut h, p, PointerButton::Secondary, none());
+    h.run();
+    h.get_by_label("Split Down").click();
+    h.run();
+    let all = rpcs(h.state());
+    let split = all.iter().find(|(m, _)| m == "pane.split").expect("pane.split sent");
+    assert_eq!(split.1["side"], "down");
+    assert_eq!(split.1["pane"], "pane:1");
+    assert_eq!(split.1["surface"], "surface:1");
+
+    click(&mut h, p, PointerButton::Secondary, none());
+    h.run();
+    h.get_by_label("Paste").click();
+    h.step();
+    assert!(
+        h.output()
+            .viewport_output
+            .values()
+            .any(|v| v.commands.contains(&egui::ViewportCommand::RequestPaste)),
+        "Paste asks the integration for the clipboard"
+    );
+}
+
+#[test]
+fn a_program_taking_mouse_reports_gets_the_right_button() {
+    use egui_kittest::kittest::Queryable;
+
+    let mut h = harness(fixture());
+    feed(&mut h, b"\x1b[?1000h\x1b[?1006h");
+    let p = cell(&h, 0, 0);
+    click(&mut h, p, PointerButton::Secondary, none());
+    h.run();
+    assert!(h.query_by_label("Split Right").is_none(), "no menu while the program takes the mouse");
+    assert_eq!(term_inputs(h.state()).concat(), "\x1b[<2;1;1M\x1b[<2;1;1m");
+
+    let shift = Modifiers { shift: true, ..Default::default() };
+    h.input_mut().events.push(egui::Event::ModifiersChanged(shift));
+    click(&mut h, p, PointerButton::Secondary, shift);
+    h.run();
+    assert!(h.query_by_label("Split Right").is_some(), "Shift brings the menu back");
+}
+
+fn press_key(h:&mut Harness<Fixture>, key: egui::Key) {
     h.input_mut().events.push(egui::Event::Key {
         key,
         physical_key: None,

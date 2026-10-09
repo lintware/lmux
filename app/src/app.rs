@@ -581,7 +581,7 @@ pub fn shortcuts(ctx: &egui::Context, c: &mut ui::Ctx) {
     }
 }
 
-fn split(
+pub(crate) fn split(
     c: &mut ui::Ctx,
     focused_pane: &Option<String>,
     active_surface: &Option<String>,

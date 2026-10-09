@@ -217,6 +217,61 @@ fn pointer_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Gri
     c.state.send_term_input(surface, &out);
 }
 
+#[derive(Clone, Copy)]
+enum MenuAction {
+    Copy,
+    Paste,
+    ClearScrollback,
+    Split(&'static str),
+}
+
+/// Right-click menu. A program that takes mouse reports gets the right
+/// button instead, unless Shift is held.
+fn context_menu(ui: &egui::Ui, resp: &egui::Response, surface: &str, c: &mut Ctx) {
+    let mode = c.state.term_mode(surface);
+    let shift = ui.input(|i| i.modifiers.shift);
+    if !resp.context_menu_opened() && termio::mouse_reporting(mode) && !shift {
+        return;
+    }
+    let has_selection = c.state.terms.get(surface).is_some_and(|t| t.selection_text().is_some());
+    let mut action = None;
+    resp.context_menu(|ui| {
+        ui.set_min_width(150.0);
+        let mut item = |ui: &mut egui::Ui, label: &str, enabled: bool, a: MenuAction| {
+            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                action = Some(a);
+                ui.close();
+            }
+        };
+        item(ui, "Copy", has_selection, MenuAction::Copy);
+        item(ui, "Paste", true, MenuAction::Paste);
+        ui.separator();
+        item(ui, "Split Right", true, MenuAction::Split("right"));
+        item(ui, "Split Down", true, MenuAction::Split("down"));
+        ui.separator();
+        item(ui, "Clear Scrollback", true, MenuAction::ClearScrollback);
+    });
+    let Some(action) = action else { return };
+    match action {
+        MenuAction::Copy => {
+            crate::app::copy_selection(ui.ctx(), c, surface);
+        }
+        // The integration reads the clipboard and delivers it as
+        // `Event::Paste` next frame, which `route_input` sends to the focused
+        // pane: the one this click focused.
+        MenuAction::Paste => ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+        MenuAction::ClearScrollback => {
+            if let Some(tv) = c.state.terms.get_mut(surface) {
+                tv.clear_scrollback();
+            }
+        }
+        MenuAction::Split(side) => {
+            let pane = c.state.pane_of_surface(surface);
+            crate::app::split(c, &pane, &Some(surface.to_owned()), side);
+        }
+    }
+}
+
 /// Wheel input over a terminal, in whole lines (positive = back in history).
 fn wheel_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Grid, lines: i32, c: &mut Ctx) {
     let mode = c.state.term_mode(surface);
@@ -328,6 +383,7 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
         tv.cell_size = Vec2::new(metrics.w, metrics.h);
     }
     pointer_input(ui, &resp, surface, &grid, c);
+    context_menu(ui, &resp, surface, c);
 
     // Cmd held over a link: underline it and show a hand.
     let hover_link = match resp.hover_pos() {

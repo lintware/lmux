@@ -191,6 +191,14 @@ impl TermView {
         }
     }
 
+    /// Drop the local history and return to the live screen. Only this
+    /// client's copy: the program and the daemon are not told.
+    pub fn clear_scrollback(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+        self.term.grid_mut().clear_history();
+        self.term.selection = None;
+    }
+
     pub fn clear_selection(&mut self) {
         self.term.selection = None;
     }
@@ -501,6 +509,19 @@ mod tests {
         let l = t.link_at(1, 3).expect("osc 8 link");
         assert_eq!((l.start, l.end, l.url.as_str()), (0, 8, "https://b.dev/"));
         assert!(t.link_at(1, 10).is_none());
+    }
+
+    #[test]
+    fn clearing_scrollback_keeps_the_screen() {
+        let mut t = TermView::new(10, 2);
+        for i in 0..10 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        t.scroll(3);
+        t.clear_scrollback();
+        assert_eq!(t.term().grid().history_size(), 0);
+        assert_eq!(t.display_offset(), 0);
+        assert_eq!(t.row_chars(0).iter().collect::<String>().trim_end(), "line 9");
     }
 
     #[test]
