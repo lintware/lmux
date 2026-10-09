@@ -35,6 +35,8 @@ fn tree() -> wire::Tree {
                 active_surface: Some("surface:1".into()),
             }],
             focused_pane: Some("pane:1".into()),
+            ports: vec![],
+            pr: None,
         }],
         selected_workspace: Some("workspace:1".into()),
     }

@@ -907,6 +907,21 @@ impl AppState {
         true
     }
 
+    /// Open `url` in a new browser tab in a workspace's focused pane, and
+    /// show that workspace. The browser runs on the workspace's host, so
+    /// `http://localhost:PORT` reaches a server running there.
+    pub fn open_in_browser_tab(&mut self, ws: &str, url: &str) {
+        self.select_workspace(ws);
+        let Some(pane) = self
+            .workspace(ws)
+            .and_then(|w| w.focused_pane.clone().or_else(|| w.panes.first().map(|p| p.id.clone())))
+        else {
+            return;
+        };
+        self.pane_active.remove(&pane);
+        self.rpc(m::SURFACE_NEW, serde_json::json!({ "pane": pane, "type": "browser", "url": url }));
+    }
+
     /// Start editing the selected (or given) workspace's title in place.
     pub fn begin_ws_rename(&mut self, ws: Option<&str>) {
         let id = ws.map(str::to_owned).or_else(|| self.selected.clone());
@@ -1628,6 +1643,8 @@ mod tests {
             layout: Layout::Pane { pane: "pane:1".into() },
             panes: vec![pane],
             focused_pane: Some("pane:1".into()),
+            ports: vec![],
+            pr: None,
         };
         let tree = Tree {
             host: "h".into(),
@@ -1899,6 +1916,8 @@ mod tests {
             layout: Layout::Pane { pane: "pane:1".into() },
             panes: vec![],
             focused_pane: None,
+            ports: vec![],
+            pr: None,
         };
         Tree {
             host: "h".into(),

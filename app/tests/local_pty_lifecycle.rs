@@ -58,6 +58,8 @@ fn tree(pane: &str) -> Tree {
         layout: Layout::Pane { pane: "pane:1".into() },
         panes: vec![p],
         focused_pane: Some("pane:1".into()),
+        ports: vec![],
+        pr: None,
     };
     Tree {
         host: "this mac".into(),

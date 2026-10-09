@@ -36,6 +36,8 @@ fn sample_tree() -> wire::Tree {
         layout: Layout::Pane { pane: pane_id.into() },
         panes: vec![pane(pane_id, vec![term(surface_id, title)], surface_id)],
         focused_pane: Some(pane_id.into()),
+        ports: vec![],
+        pr: None,
     };
     Tree {
         host: "my-server".into(),

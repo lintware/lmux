@@ -720,6 +720,55 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
         y += LINE - 1.0;
     }
 
+    // Listening ports and the pull request, as links: a port opens in a
+    // browser tab on the workspace's own host, the PR in the system browser.
+    if !ws.ports.is_empty() || ws.pr.is_some() {
+        let font = theme::ui(theme::FS_SMALL);
+        let mut lx = x;
+        let link = if selected { Color32::WHITE } else { theme::ACCENT };
+        let mut links: Vec<(String, Color32, Option<u16>)> =
+            ws.ports.iter().map(|p| (format!(":{p}"), link, Some(*p))).collect();
+        if let Some(pr) = &ws.pr {
+            let color = if selected {
+                Color32::WHITE
+            } else {
+                match pr.state.as_str() {
+                    "open" => theme::GREEN,
+                    "merged" => Color32::from_rgb(0xA3, 0x71, 0xF7),
+                    "closed" => theme::RED,
+                    _ => theme::DIM,
+                }
+            };
+            links.push((format!("#{} {}", pr.number, pr.state), color, None));
+        }
+        for (text, color, port) in links {
+            let w = crate::util::measure(ui.ctx(), &text, &font);
+            if lx + w > rect.max.x - PAD_X {
+                break;
+            }
+            let r = Rect::from_min_size(egui::pos2(lx, y), Vec2::new(w, LINE));
+            let id = Id::new(("cardlink", &c.state.host_salt, &ws.id, &text));
+            let resp = ui.interact(r, id, Sense::click());
+            p.text(r.min, Align2::LEFT_TOP, &text, font.clone(), color);
+            if resp.hovered() {
+                p.line_segment(
+                    [egui::pos2(r.min.x, r.max.y - 1.0), egui::pos2(r.max.x, r.max.y - 1.0)],
+                    Stroke::new(1.0, color),
+                );
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
+                match (port, &ws.pr) {
+                    (Some(port), _) => c.state.open_in_browser_tab(&ws.id, &format!("http://localhost:{port}/")),
+                    (None, Some(pr)) => ui.ctx().open_url(egui::OpenUrl::new_tab(&pr.url)),
+                    _ => {}
+                }
+            }
+            lx = r.max.x + 10.0;
+        }
+        y += LINE;
+    }
+
     // Status pills.
     if !ws.status_pills.is_empty() {
         y += 2.0;
@@ -970,6 +1019,9 @@ fn card_height(ctx: &egui::Context, ws: &Workspace, inner_w: f32, selected: bool
     }
     if !ws.cwd.is_empty() {
         h += LINE - 1.0;
+    }
+    if !ws.ports.is_empty() || ws.pr.is_some() {
+        h += LINE;
     }
     if !ws.status_pills.is_empty() {
         h += 19.0;

@@ -63,6 +63,8 @@ fn sample_tree() -> wire::Tree {
             "surface:2",
         )],
         focused_pane: Some("pane:1".into()),
+        ports: vec![],
+        pr: None,
     };
 
     // A single chip, one level down in a nested folder.
@@ -80,6 +82,8 @@ fn sample_tree() -> wire::Tree {
         layout: Layout::Pane { pane: "pane:2".into() },
         panes: vec![pane("pane:2", vec![term("surface:4", "zsh", 80, 24)], "surface:4")],
         focused_pane: Some("pane:2".into()),
+        ports: vec![],
+        pr: None,
     };
 
     // Terminal + browser split.
@@ -105,6 +109,8 @@ fn sample_tree() -> wire::Tree {
             pane("pane:4", vec![browser("surface:6", "lmux.dev", "https://lmux.dev/docs")], "surface:6"),
         ],
         focused_pane: Some("pane:4".into()),
+        ports: vec![],
+        pr: None,
     };
 
     // Three panes: the focused one has three chips with the middle active, the
@@ -145,6 +151,8 @@ fn sample_tree() -> wire::Tree {
             pane("pane:7", vec![term("surface:12", "shell", 60, 12)], "surface:12"),
         ],
         focused_pane: Some("pane:6".into()),
+        ports: vec![],
+        pr: None,
     };
 
     Tree {

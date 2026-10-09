@@ -540,6 +540,8 @@ mod tests {
             },
             panes: vec![p1, p2],
             focused_pane: Some("pane:1".into()),
+            ports: vec![],
+            pr: None,
         };
         let tree = Tree {
             host: "h".into(),
@@ -701,6 +703,8 @@ mod tests {
             layout: Layout::Pane { pane: format!("pane-{id}") },
             panes: vec![],
             focused_pane: None,
+            ports: vec![],
+            pr: None,
         };
         let folder = |id: &str, parent: Option<&str>| Folder {
             id: id.into(),

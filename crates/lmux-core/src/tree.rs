@@ -988,6 +988,8 @@ mod tests {
             layout: Layout::Pane { pane: p1.clone() },
             panes: vec![pane1, pane2],
             focused_pane: Some(p1.clone()),
+            ports: vec![],
+            pr: None,
         });
         (s, ws)
     }
@@ -1309,6 +1311,8 @@ mod tests {
             layout,
             panes,
             focused_pane: Some(first),
+            ports: vec![],
+            pr: None,
         });
         (s, ws_ref, refs)
     }
@@ -1425,6 +1429,8 @@ mod tests {
                 active_surface: None,
             }],
             focused_pane: Some(p.clone()),
+            ports: vec![],
+            pr: None,
         });
         assert_eq!(
             two.move_surface(&s0, &p, None),

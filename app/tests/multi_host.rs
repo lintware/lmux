@@ -60,6 +60,8 @@ fn tree(host: &str, folder: &str, title: &str, cwd: &str) -> wire::Tree {
                 active_surface: Some("surface:1".into()),
             }],
             focused_pane: Some("pane:1".into()),
+            ports: vec![],
+            pr: None,
         }],
         selected_workspace: Some("workspace:1".into()),
     }
@@ -299,4 +301,37 @@ fn snapshot_go_to_workspace_palette() {
     });
     let mut h = harness(fx, 2.0);
     h.snapshot("palette_workspaces");
+}
+
+/// A card shows its listening ports and its PR as links under the cwd.
+#[test]
+fn snapshot_card_ports_and_pr() {
+    let mut fx = fixture();
+    let ws = &mut fx.hosts[1].state.tree.workspaces[0];
+    ws.git_branch = Some("feat/login".into());
+    ws.ports = vec![3000, 5173];
+    ws.pr = Some(lmux_proto::PullRequest { number: 42, state: "open".into(), url: "https://github.com/x/y/pull/42".into() });
+    let mut h = harness(fx, 2.0);
+    h.snapshot("card_ports_pr");
+}
+
+/// Clicking a port opens it in a browser tab on the workspace's own host.
+#[test]
+fn opening_a_port_makes_a_browser_tab_in_that_workspace() {
+    let mut fx = fixture();
+    fx.hosts[1].state.open_in_browser_tab("workspace:1", "http://localhost:3000/");
+    let st = &fx.hosts[1].state;
+    assert_eq!(st.selected.as_deref(), Some("workspace:1"));
+    let call = st
+        .pending
+        .iter()
+        .find_map(|m| match m {
+            lmux_app::wire::ClientMsg::Rpc { request } if request.method == "surface.new" => Some(request.params.clone()),
+            _ => None,
+        })
+        .expect("surface.new queued");
+    assert_eq!(call["type"], "browser");
+    assert_eq!(call["url"], "http://localhost:3000/");
+    assert_eq!(call["pane"], "pane:1");
+    assert!(fx.hosts[0].state.pending.is_empty(), "nothing goes to the other host");
 }

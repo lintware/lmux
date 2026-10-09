@@ -11,6 +11,7 @@
 pub mod browser;
 pub mod daemon;
 pub mod keys;
+pub mod probe;
 pub mod rpc;
 pub mod scrollback;
 pub mod tmux;

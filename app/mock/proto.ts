@@ -55,6 +55,10 @@ export interface Workspace {
   layout: Layout;
   panes: Pane[];
   focused_pane: Ref | null;
+  /** TCP ports a process in this workspace listens on. */
+  ports?: number[];
+  /** The pull request for the workspace's branch. */
+  pr?: { number: number; state: string; url: string } | null;
 }
 
 export type SplitDirection = "horizontal" | "vertical";

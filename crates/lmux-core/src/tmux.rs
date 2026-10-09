@@ -10,7 +10,7 @@
 //! client on the first high byte. A supervisor task also respawns the control
 //! client if it ever exits, so a broken stream can never be permanent.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -394,6 +394,18 @@ impl Tmux {
         self.display(window, "#{window_id}")
             .await
             .is_ok_and(|out| out.trim() == window)
+    }
+
+    /// Every pane's shell pid, by pane id (`%N`).
+    pub async fn pane_pids(&self) -> anyhow::Result<HashMap<String, u32>> {
+        let out = self.command("list-panes -a -F \"#{pane_id} #{pane_pid}\"").await?;
+        Ok(split_lines(&out)
+            .into_iter()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                Some((it.next()?.to_string(), it.next()?.parse().ok()?))
+            })
+            .collect())
     }
 
     pub async fn list_windows(&self) -> anyhow::Result<Vec<WinInfo>> {

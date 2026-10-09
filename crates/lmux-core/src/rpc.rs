@@ -403,6 +403,8 @@ pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
                     },
                     panes: vec![pane],
                     focused_pane: Some(pane_ref.clone()),
+                    ports: vec![],
+                    pr: None,
                 };
                 state.add_workspace(ws);
                 if state.selected_workspace.is_none() {
@@ -1486,6 +1488,8 @@ mod tests {
                 active_surface: Some(surface.clone()),
             }],
             focused_pane: Some(pane),
+            ports: vec![],
+            pr: None,
         });
         s
     }

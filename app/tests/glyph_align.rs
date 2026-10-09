@@ -36,6 +36,8 @@ fn fixture() -> (AppState, Net) {
         layout: wire::Layout::Pane { pane: "pane:1".into() },
         panes: vec![pane],
         focused_pane: Some("pane:1".into()),
+        ports: vec![],
+        pr: None,
     };
     let tree = wire::Tree {
         host: "h".into(),

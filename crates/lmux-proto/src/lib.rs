@@ -62,6 +62,20 @@ pub struct Workspace {
     pub layout: Layout,
     pub panes: Vec<Pane>,
     pub focused_pane: Option<Ref>,
+    /// TCP ports a process in this workspace is listening on, ascending.
+    #[serde(default)]
+    pub ports: Vec<u16>,
+    /// The pull request for the workspace's branch, when `gh` knows one.
+    #[serde(default)]
+    pub pr: Option<PullRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PullRequest {
+    pub number: u32,
+    /// `open`, `draft`, `merged` or `closed`.
+    pub state: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

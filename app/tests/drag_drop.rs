@@ -48,6 +48,8 @@ fn two_pane_tree() -> wire::Tree {
             pane("pane:2", vec![term("surface:3", "three")], "surface:3"),
         ],
         focused_pane: Some("pane:1".into()),
+        ports: vec![],
+        pr: None,
     };
     Tree {
         host: "h".into(),
@@ -196,6 +198,8 @@ fn sidebar_tree() -> wire::Tree {
         layout: Layout::Pane { pane: format!("pane:{id}") },
         panes: vec![pane(&format!("pane:{id}"), vec![term(surf, title)], surf)],
         focused_pane: Some(format!("pane:{id}")),
+        ports: vec![],
+        pr: None,
     };
     Tree {
         host: "h".into(),

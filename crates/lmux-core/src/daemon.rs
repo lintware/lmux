@@ -75,6 +75,10 @@ const TREE_COALESCE: Duration = Duration::from_millis(50);
 
 /// Background branch-refresh cadence. Resizes never run `git`.
 const BRANCH_REFRESH: Duration = Duration::from_secs(5);
+/// How often listening ports and pull requests are looked up for the cards.
+const PROBE_REFRESH: Duration = Duration::from_secs(10);
+/// How long a workspace's pull request lookup (`gh`) is reused.
+const PR_TTL: Duration = Duration::from_secs(60);
 
 /// Persist debounce: coalesce a burst of changes into one write.
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -271,6 +275,8 @@ pub struct Inner {
     respawn: std::sync::Mutex<RespawnState>,
     /// Terminals with output since their scrollback was last saved.
     scrollback_dirty: std::sync::Mutex<HashSet<Ref>>,
+    /// Pull request lookups by `cwd\0branch`, with when they were made.
+    prs: std::sync::Mutex<HashMap<String, (Option<lmux_proto::PullRequest>, Instant)>>,
 }
 
 #[derive(Default)]
@@ -520,6 +526,69 @@ impl Inner {
         changed
     }
 
+    /// Refresh every workspace's listening ports and pull request. Returns
+    /// true if anything changed.
+    pub async fn refresh_probes(&self) -> bool {
+        // Each pane's shell pid, from tmux.
+        let pids = self.tmux.pane_pids().await.unwrap_or_default();
+        let (roots, repos): (HashMap<String, Vec<u32>>, Vec<(Ref, String, String)>) = {
+            let state = self.state.lock().await;
+            let roots = state
+                .workspaces
+                .iter()
+                .map(|w| {
+                    let pids = w
+                        .panes
+                        .iter()
+                        .flat_map(|p| p.surfaces.iter())
+                        .filter_map(|s| state.term_cloned(&s.id))
+                        .filter_map(|t| pids.get(&t.pane).copied())
+                        .collect();
+                    (w.id.clone(), pids)
+                })
+                .collect();
+            let repos = state
+                .workspaces
+                .iter()
+                .filter_map(|w| w.git_branch.clone().map(|b| (w.id.clone(), w.cwd.clone(), b)))
+                .collect();
+            (roots, repos)
+        };
+        let ports = crate::probe::ports_by_workspace(&roots).await;
+
+        // Pull requests, one `gh` per repo and branch per PR_TTL.
+        let mut prs: HashMap<Ref, Option<lmux_proto::PullRequest>> = HashMap::new();
+        for (ws, cwd, branch) in repos {
+            let key = format!("{cwd}\0{branch}");
+            let cached = self.prs.lock().unwrap().get(&key).cloned();
+            let pr = match cached {
+                Some((pr, at)) if at.elapsed() < PR_TTL => pr,
+                _ => {
+                    let pr = crate::probe::pull_request(&cwd).await;
+                    self.prs.lock().unwrap().insert(key, (pr.clone(), Instant::now()));
+                    pr
+                }
+            };
+            prs.insert(ws, pr);
+        }
+
+        let mut changed = false;
+        let mut state = self.state.lock().await;
+        for w in state.workspaces.iter_mut() {
+            let p = ports.get(&w.id).cloned().unwrap_or_default();
+            if w.ports != p {
+                w.ports = p;
+                changed = true;
+            }
+            let pr = prs.remove(&w.id).flatten();
+            if w.pr != pr {
+                w.pr = pr;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub async fn surface_for_pane(&self, pane: &str) -> Option<Ref> {
         self.state.lock().await.surface_of_pane(pane)
     }
@@ -665,6 +734,8 @@ impl Inner {
                         },
                         panes: vec![],
                         focused_pane: None,
+                        ports: vec![],
+                        pr: None,
                     });
                 }
                 state.observe_ref(&surf);
@@ -1084,6 +1155,7 @@ pub async fn run(cfg: Config, browser: Option<Arc<dyn BrowserBackend>>) -> anyho
         tree_dirty: Notify::new(),
         respawn: std::sync::Mutex::new(RespawnState::default()),
         scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
+        prs: std::sync::Mutex::new(HashMap::new()),
     });
 
     tokio::spawn(tmux_event_loop(inner.clone(), ev_rx));
@@ -1156,6 +1228,20 @@ pub async fn run(cfg: Config, browser: Option<Arc<dyn BrowserBackend>>) -> anyho
             loop {
                 tick.tick().await;
                 me.capture_scrollback(false).await;
+            }
+        });
+    }
+
+    // Ports and pull requests for the cards, on their own slower timer.
+    {
+        let me = inner.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(PROBE_REFRESH);
+            loop {
+                tick.tick().await;
+                if me.refresh_probes().await {
+                    me.tree_changed();
+                }
             }
         });
     }
@@ -1897,6 +1983,8 @@ mod tests {
                 active_surface: Some(surf.clone()),
             }],
             focused_pane: Some(pane_ref),
+            ports: vec![],
+            pr: None,
         });
         let inner = Arc::new(Inner {
             cfg: Config {
@@ -1915,6 +2003,7 @@ mod tests {
             tree_dirty: Notify::new(),
             respawn: std::sync::Mutex::new(RespawnState::default()),
             scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
+            prs: std::sync::Mutex::new(HashMap::new()),
         });
 
         let result = async {
