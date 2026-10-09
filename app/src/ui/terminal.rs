@@ -19,6 +19,7 @@ use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 
 use super::Ctx;
 use crate::term::{cell_colors, is_wide_spacer, viewport_point, SelectionType};
+use crate::termio::{self, MouseAction, MouseButton};
 use crate::theme;
 
 const PAD: f32 = 6.0;
@@ -99,14 +100,22 @@ impl Grid {
 /// or triple click.
 const MULTI_CLICK: f64 = 0.4;
 
-/// Mouse presses, drags and releases over the grid: a local selection, or
-/// (later) mouse reports to the program.
+/// Mouse presses, drags and releases over the grid. When the program asked
+/// for mouse reports they go to it as escape sequences (Shift keeps them
+/// local, as in other terminals); otherwise they drive a local selection.
 fn pointer_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Grid, c: &mut Ctx) {
-    let (events, now) = ui.input(|i| (i.events.clone(), i.time));
+    let (events, now, mods_now) = ui.input(|i| (i.events.clone(), i.time, i.modifiers));
     let over = resp.contains_pointer();
+    let mode = c.state.term_mode(surface);
+    let mut out: Vec<u8> = Vec::new();
+    let mut report = |action, button, (row, col): (usize, usize), mods| {
+        if let Some(b) = termio::mouse_report(mode, action, button, col, row, mods) {
+            out.extend_from_slice(&b);
+        }
+    };
     for ev in events {
         match ev {
-            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. }
+            egui::Event::PointerButton { pos, button, pressed: true, modifiers }
                 if over && grid_contains(grid, pos) =>
             {
                 if let Some(pane) = c.state.pane_of_surface(surface) {
@@ -114,6 +123,18 @@ fn pointer_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Gri
                 }
                 let (row, col, right) = grid.cell_at(pos);
                 let Some(tv) = c.state.terms.get_mut(surface) else { continue };
+                if termio::mouse_reporting(mode) && !modifiers.shift {
+                    let Some(mb) = MouseButton::from_egui(button) else { continue };
+                    report(MouseAction::Press, mb, (row, col), modifiers);
+                    let p = &mut tv.pointer;
+                    p.held = Some(button);
+                    p.reporting = true;
+                    p.last_cell = Some((row, col));
+                    continue;
+                }
+                if button != egui::PointerButton::Primary {
+                    continue;
+                }
                 let p = &mut tv.pointer;
                 p.clicks = if now - p.last_press_time < MULTI_CLICK && p.press_cell == (row, col) {
                     p.clicks % 3 + 1
@@ -122,7 +143,7 @@ fn pointer_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Gri
                 };
                 p.last_press_time = now;
                 p.press_cell = (row, col);
-                p.held = Some(egui::PointerButton::Primary);
+                p.held = Some(button);
                 p.reporting = false;
                 p.dragged = false;
                 let ty = match p.clicks {
@@ -134,28 +155,89 @@ fn pointer_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Gri
             }
             egui::Event::PointerMoved(pos) => {
                 let Some(tv) = c.state.terms.get_mut(surface) else { continue };
-                if tv.pointer.held.is_none() || tv.pointer.reporting {
-                    continue;
-                }
                 let (row, col, right) = grid.cell_at(pos);
-                if (row, col) != tv.pointer.press_cell {
-                    tv.pointer.dragged = true;
+                let p = &mut tv.pointer;
+                match p.held {
+                    Some(button) if p.reporting => {
+                        // Drag reports go out once per cell, not per pixel.
+                        if p.last_cell != Some((row, col)) {
+                            p.last_cell = Some((row, col));
+                            if let Some(mb) = MouseButton::from_egui(button) {
+                                report(MouseAction::Motion, mb, (row, col), mods_now);
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        if (row, col) != p.press_cell {
+                            p.dragged = true;
+                        }
+                        tv.update_selection(row, col, right);
+                    }
+                    None => {
+                        let hover = over && grid_contains(grid, pos);
+                        if hover
+                            && !mods_now.shift
+                            && mode.contains(TermMode::MOUSE_MOTION)
+                            && p.last_cell != Some((row, col))
+                        {
+                            p.last_cell = Some((row, col));
+                            report(MouseAction::Motion, MouseButton::None, (row, col), mods_now);
+                        }
+                    }
                 }
-                tv.update_selection(row, col, right);
             }
-            egui::Event::PointerButton { button, pressed: false, .. } => {
+            egui::Event::PointerButton { pos, button, pressed: false, modifiers } => {
                 let Some(tv) = c.state.terms.get_mut(surface) else { continue };
-                if tv.pointer.held != Some(button) {
+                let p = &mut tv.pointer;
+                if p.held != Some(button) {
                     continue;
                 }
-                tv.pointer.held = None;
-                // A plain click (no drag, not a word or line pick) clears.
-                if !tv.pointer.reporting && tv.pointer.clicks == 1 && !tv.pointer.dragged {
+                p.held = None;
+                if p.reporting {
+                    let (row, col, _) = grid.cell_at(pos);
+                    if let Some(mb) = MouseButton::from_egui(button) {
+                        report(MouseAction::Release, mb, (row, col), modifiers);
+                    }
+                } else if p.clicks == 1 && !p.dragged {
+                    // A plain click (no drag, not a word or line pick) clears.
                     tv.clear_selection();
                 }
             }
             _ => {}
         }
+    }
+    c.state.send_term_input(surface, &out);
+}
+
+/// Wheel input over a terminal, in whole lines (positive = back in history).
+fn wheel_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Grid, lines: i32, c: &mut Ctx) {
+    let mode = c.state.term_mode(surface);
+    let shift = ui.input(|i| i.modifiers.shift);
+    let count = lines.unsigned_abs() as usize;
+    if termio::mouse_reporting(mode) && !shift {
+        // The program scrolls itself (tmux with `mouse on` enters copy mode).
+        let Some(pos) = resp.hover_pos() else { return };
+        let (row, col, _) = grid.cell_at(pos);
+        let button = if lines > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
+        let mods = ui.input(|i| i.modifiers);
+        let mut bytes = Vec::new();
+        for _ in 0..count {
+            if let Some(b) = termio::mouse_report(mode, MouseAction::Press, button, col, row, mods) {
+                bytes.extend_from_slice(&b);
+            }
+        }
+        c.state.send_term_input(surface, &bytes);
+        return;
+    }
+    let pty_attached = c.state.local_ptys.contains_key(surface);
+    if pty_attached && mode.contains(TermMode::ALT_SCREEN) {
+        // tmux drives this PTY through the alternate screen, which keeps no
+        // history, so the local grid has nothing to scroll: arrow keys are
+        // what the pane's application (and tmux's own copy-mode) understands.
+        let seq: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
+        c.state.write_local(surface, &seq.repeat(count));
+    } else if let Some(tv) = c.state.terms.get_mut(surface) {
+        tv.scroll(lines);
     }
 }
 
@@ -262,26 +344,7 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
                 .map(|tv| tv.accumulate_scroll(wheel, metrics.h))
                 .unwrap_or(0);
             if lines != 0 {
-                let pty_attached = c.state.local_ptys.contains_key(surface);
-                let alt = c
-                    .state
-                    .terms
-                    .get(surface)
-                    .is_some_and(|tv| tv.mode().contains(TermMode::ALT_SCREEN));
-                if pty_attached && alt {
-                    // tmux drives this PTY through the alternate screen, which
-                    // keeps no history, so the local grid has nothing to scroll:
-                    // arrow keys are what the pane's application (and tmux's own
-                    // copy-mode) understands.
-                    let seq: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
-                    let mut bytes = Vec::with_capacity(3 * lines.unsigned_abs() as usize);
-                    for _ in 0..lines.unsigned_abs() {
-                        bytes.extend_from_slice(seq);
-                    }
-                    c.state.write_local(surface, &bytes);
-                } else if let Some(tv) = c.state.terms.get_mut(surface) {
-                    tv.scroll(lines);
-                }
+                wheel_input(ui, &resp, surface, &grid, lines, c);
             }
         }
     }

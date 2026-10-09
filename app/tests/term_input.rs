@@ -105,7 +105,7 @@ fn term_inputs(fx: &Fixture) -> Vec<String> {
 
 fn feed(h: &mut Harness<Fixture>, bytes: &[u8]) {
     h.state_mut().state.ensure_term("surface:1").feed(bytes);
-    h.run();
+    h.step();
 }
 
 #[test]
@@ -215,4 +215,81 @@ fn a_plain_click_clears_the_selection() {
     click(&mut h, p, PointerButton::Primary, none());
     assert_eq!(selection(&h), None);
     assert_eq!(copy(&mut h), None, "nothing selected copies nothing");
+}
+
+fn wheel(h: &mut Harness<Fixture>, pos: Pos2, lines: f32) {
+    move_to(h, pos);
+    h.input_mut().events.push(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: Vec2::new(0.0, lines),
+        modifiers: Modifiers::default(),
+        phase: egui::TouchPhase::Move,
+    });
+    h.step();
+}
+
+#[test]
+fn clicks_are_reported_to_a_program_that_asks_for_them() {
+    let mut h = harness(fixture());
+    // Click reporting, SGR encoding.
+    feed(&mut h, b"hello\x1b[?1000h\x1b[?1006h");
+    let p = cell(&h, 2, 4);
+    click(&mut h, p, PointerButton::Primary, none());
+    assert_eq!(term_inputs(h.state()), vec!["\x1b[<0;5;3M".to_owned(), "\x1b[<0;5;3m".to_owned()]);
+    assert_eq!(selection(&h), None);
+
+    h.state_mut().state.pending.clear();
+    click(&mut h, p, PointerButton::Secondary, none());
+    assert_eq!(term_inputs(h.state()), vec!["\x1b[<2;5;3M".to_owned(), "\x1b[<2;5;3m".to_owned()]);
+}
+
+#[test]
+fn x10_is_the_fallback_encoding() {
+    let mut h = harness(fixture());
+    feed(&mut h, b"\x1b[?1000h");
+    let p = cell(&h, 0, 0);
+    click(&mut h, p, PointerButton::Primary, none());
+    assert_eq!(term_inputs(h.state()), vec!["\x1b[M !!".to_owned(), "\x1b[M#!!".to_owned()]);
+}
+
+#[test]
+fn drags_are_reported_once_per_cell() {
+    let mut h = harness(fixture());
+    feed(&mut h, b"\x1b[?1002h\x1b[?1006h");
+    let (from, to) = (cell(&h, 0, 0), cell(&h, 0, 3));
+    drag(&mut h, from, to, none());
+    let sent = term_inputs(h.state()).concat();
+    assert_eq!(sent, "\x1b[<0;1;1M\x1b[<32;3;1M\x1b[<32;4;1M\x1b[<0;4;1m");
+}
+
+#[test]
+fn shift_forces_a_local_selection_while_the_program_reports() {
+    let mut h = harness(fixture());
+    feed(&mut h, b"hello world\x1b[?1000h\x1b[?1006h");
+    let shift = Modifiers { shift: true, ..Default::default() };
+    let (from, to) = (cell_left(&h, 0, 0), cell(&h, 0, 4));
+    drag(&mut h, from, to, shift);
+    assert_eq!(selection(&h).as_deref(), Some("hello"));
+    assert!(term_inputs(h.state()).is_empty(), "a shift-drag must not reach the program");
+}
+
+#[test]
+fn the_wheel_is_reported_when_the_program_asks_and_scrolls_otherwise() {
+    let mut h = harness(fixture());
+    for i in 0..60 {
+        feed(&mut h, format!("line {i}\r\n").as_bytes());
+    }
+    let p = cell(&h, 1, 1);
+    wheel(&mut h, p, 3.0);
+    assert_eq!(h.state().state.terms["surface:1"].display_offset(), 3, "no reporting: scroll back locally");
+    assert!(term_inputs(h.state()).is_empty());
+
+    wheel(&mut h, p, -3.0);
+    feed(&mut h, b"\x1b[?1000h\x1b[?1006h");
+    wheel(&mut h, p, 2.0);
+    assert_eq!(term_inputs(h.state()).concat(), "\x1b[<64;2;2M\x1b[<64;2;2M");
+    h.state_mut().state.pending.clear();
+    wheel(&mut h, p, -1.0);
+    assert_eq!(term_inputs(h.state()).concat(), "\x1b[<65;2;2M");
+    assert_eq!(h.state().state.terms["surface:1"].display_offset(), 0);
 }
