@@ -15,6 +15,7 @@ eframe = { version = "0.36", default-features = false, features = ["wgpu", "defa
 egui = "0.36"
 alacritty_terminal = "0.26"
 ewebsock = "0.8"
+portable-pty = "0.9"
 zune-jpeg = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

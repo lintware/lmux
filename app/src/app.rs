@@ -28,6 +28,8 @@ impl LmuxApp {
         net.set_wake(cc.egui_ctx.clone());
         crate::decode::decoder().set_wake(cc.egui_ctx.clone());
         let mut state = AppState::new();
+        // Local PTY readers wake the UI when their pane produces output.
+        state.set_wake(cc.egui_ctx.clone());
         if let Some(err) = net.take_local_error() {
             eprintln!("[local] {err}");
             state.banner = Some((err, true));
@@ -137,6 +139,7 @@ impl LmuxApp {
         // The tree that arrives belongs to whichever host is connected, which is
         // how a create aimed at another host knows when it can go out.
         self.state.set_current_host(&self.net.host_name());
+        self.state.set_local_mode(self.net.is_local_host());
         for msg in self.net.poll(ctx) {
             match msg {
                 WsMessage::Text(t) => {
@@ -148,6 +151,8 @@ impl LmuxApp {
                 _ => {}
             }
         }
+        // Output from the local PTYs, which never goes through the websocket.
+        self.state.pump_local_ptys();
         self.state.poll_decoded();
         let connected = self.net.state == ConnState::Connected;
         if !connected && self.was_connected {
@@ -413,8 +418,13 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
                 }
             });
             if !bytes.is_empty() {
-                let data = String::from_utf8_lossy(&bytes).into_owned();
-                c.state.pending.push(ClientMsg::TermInput { surface: sid, data });
+                // A local pane is attached by this process: its keys go straight
+                // to the PTY. Remote panes keep the daemon's input path.
+                let wrote = c.state.local_terminal(&sid) && c.state.write_local(&sid, &bytes);
+                if !wrote {
+                    let data = String::from_utf8_lossy(&bytes).into_owned();
+                    c.state.pending.push(ClientMsg::TermInput { surface: sid, data });
+                }
             }
         }
         Some(SurfaceKind::Browser { .. }) => {
