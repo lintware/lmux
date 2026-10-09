@@ -140,3 +140,282 @@ fn wheel_is_sent_at_the_pointer_not_the_centre() {
 
     let _ = ConnState::Connected;
 }
+
+// --- cmux-style browser keys, toolbar and links ------------------------------
+
+/// A harness running the app's real input path: shortcuts, then (unless a text
+/// field owns the keyboard) route_input, then render.
+fn app_harness<'a>(state: AppState, net: Net) -> Harness<'a, Fx> {
+    let fx = Fx { state, net, ready: false };
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(900.0, 600.0))
+        .with_pixels_per_point(1.0)
+        .build_ui_state(
+            |ui, fx: &mut Fx| {
+                if !fx.ready {
+                    lmux_app::fonts::install(ui.ctx());
+                    fx.ready = true;
+                    return;
+                }
+                let mut c = lmux_app::ui::Ctx { state: &mut fx.state, net: &mut fx.net };
+                lmux_app::app::shortcuts(ui.ctx(), &mut c);
+                let text_editing = ui.ctx().memory(|m| m.focused().is_some());
+                if !text_editing {
+                    lmux_app::app::route_input(ui.ctx(), &mut c);
+                }
+                lmux_app::app::render(ui, &mut c);
+            },
+            fx,
+        );
+    h.run();
+    h.run();
+    h
+}
+
+fn browser_harness<'a>() -> Harness<'a, Fx> {
+    let (state, net) = browser_fixture();
+    app_harness(state, net)
+}
+
+fn key(h: &mut Harness<Fx>, mods: egui::Modifiers, key: egui::Key) {
+    h.input_mut().events.push(egui::Event::ModifiersChanged(mods));
+    h.input_mut().events.push(egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: mods,
+    });
+    h.run();
+    h.input_mut().events.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.run();
+}
+
+fn rpcs(h: &Harness<Fx>) -> Vec<(u64, String, serde_json::Value)> {
+    h.state()
+        .state
+        .pending
+        .iter()
+        .filter_map(|m| match m {
+            ClientMsg::Rpc { request } => {
+                Some((request.id, request.method.clone(), request.params.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn browser_inputs(h: &Harness<Fx>) -> Vec<wire::BrowserInputEvent> {
+    h.state()
+        .state
+        .pending
+        .iter()
+        .filter_map(|m| match m {
+            ClientMsg::BrowserInput { event, .. } => Some(event.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn reply(h: &mut Harness<Fx>, id: u64, result: serde_json::Value) {
+    h.state_mut().state.handle_server_msg(wire::ServerMsg::RpcResult {
+        response: wire::RpcResponse { id, result: Some(result), error: None },
+    });
+}
+
+/// Centre of the toolbar's third button (reload / stop).
+fn reload_button(h: &Harness<Fx>) -> Pos2 {
+    let pane = h.state().state.pane_rects["pane:1"];
+    let top = pane.min.y + lmux_app::theme::PANE_STRIP_H;
+    Pos2::new(pane.min.x + 8.0 + 2.0 * 26.0 + 10.0, top + 14.0)
+}
+
+fn address_bar(h: &Harness<Fx>) -> Pos2 {
+    let pane = h.state().state.pane_rects["pane:1"];
+    let top = pane.min.y + lmux_app::theme::PANE_STRIP_H;
+    Pos2::new(pane.center().x, top + 14.0)
+}
+
+fn click(h: &mut Harness<Fx>, p: Pos2, button: egui::PointerButton, mods: egui::Modifiers) {
+    h.input_mut().events.push(egui::Event::PointerMoved(p));
+    h.run();
+    h.input_mut().events.push(egui::Event::ModifiersChanged(mods));
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::PointerButton { pos: p, button, pressed, modifiers: mods });
+        h.run();
+    }
+    h.input_mut().events.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.run();
+}
+
+#[test]
+fn cmd_brackets_r_and_zoom_act_on_a_focused_browser() {
+    let mut h = browser_harness();
+    let font = h.state().state.term_font;
+    key(&mut h, egui::Modifiers::COMMAND, egui::Key::OpenBracket);
+    key(&mut h, egui::Modifiers::COMMAND, egui::Key::CloseBracket);
+    key(&mut h, egui::Modifiers::COMMAND, egui::Key::R);
+    key(&mut h, egui::Modifiers::COMMAND, egui::Key::Equals);
+    key(&mut h, egui::Modifiers::COMMAND, egui::Key::Minus);
+    key(&mut h, egui::Modifiers::COMMAND, egui::Key::Num0);
+    let calls: Vec<(String, serde_json::Value)> =
+        rpcs(&h).into_iter().map(|(_, m, p)| (m, p)).collect();
+    let methods: Vec<&str> = calls.iter().map(|(m, _)| m.as_str()).collect();
+    assert_eq!(
+        methods,
+        ["browser.back", "browser.forward", "browser.reload", "browser.zoom", "browser.zoom", "browser.zoom"]
+    );
+    assert!(calls.iter().all(|(_, p)| p["surface"] == "surface:9"));
+    let steps: Vec<i64> = calls[3..].iter().map(|(_, p)| p["step"].as_i64().unwrap()).collect();
+    assert_eq!(steps, [1, -1, 0]);
+    // Not the terminal's font, not a tab rename, and nothing reached the page.
+    assert_eq!(h.state().state.term_font, font);
+    assert!(h.state().state.renaming.is_none());
+    assert!(browser_inputs(&h).is_empty());
+}
+
+#[test]
+fn cmd_l_focuses_the_address_bar_and_enter_navigates() {
+    let mut h = browser_harness();
+    key(&mut h, egui::Modifiers::COMMAND, egui::Key::L);
+    assert_eq!(
+        h.state().state.browsers["surface:9"].url_draft.as_deref(),
+        Some("https://example.com/")
+    );
+    assert!(h.ctx.memory(|m| m.focused().is_some()), "the address bar must own the keyboard");
+    // The whole address is selected, so typing replaces it.
+    h.input_mut().events.push(egui::Event::Text("localhost:3000".into()));
+    h.run();
+    key(&mut h, egui::Modifiers::NONE, egui::Key::Enter);
+    let goto = rpcs(&h).into_iter().find(|(_, m, _)| m == "browser.goto").expect("browser.goto sent");
+    assert_eq!(goto.2["url"], "http://localhost:3000");
+    assert!(h.state().state.browsers["surface:9"].url_draft.is_none());
+    // Typing went to the address bar, not the page.
+    assert!(browser_inputs(&h).is_empty());
+}
+
+#[test]
+fn words_in_the_address_bar_search_and_escape_restores() {
+    let mut h = browser_harness();
+    let bar = address_bar(&h);
+    click(&mut h, bar, egui::PointerButton::Primary, egui::Modifiers::NONE);
+    h.input_mut().events.push(egui::Event::Text("rust egui".into()));
+    h.run();
+    key(&mut h, egui::Modifiers::NONE, egui::Key::Escape);
+    assert!(h.state().state.browsers["surface:9"].url_draft.is_none(), "Escape ends the edit");
+    assert!(rpcs(&h).iter().all(|(_, m, _)| m != "browser.goto"));
+    assert_eq!(h.state().state.browsers["surface:9"].url, "https://example.com/");
+
+    click(&mut h, bar, egui::PointerButton::Primary, egui::Modifiers::NONE);
+    h.input_mut().events.push(egui::Event::Text("rust egui".into()));
+    h.run();
+    key(&mut h, egui::Modifiers::NONE, egui::Key::Enter);
+    let goto = rpcs(&h).into_iter().find(|(_, m, _)| m == "browser.goto").expect("browser.goto sent");
+    assert_eq!(goto.2["url"], "https://www.google.com/search?q=rust+egui");
+}
+
+#[test]
+fn reload_becomes_stop_while_loading() {
+    let mut h = browser_harness();
+    let button = reload_button(&h);
+    click(&mut h, button, egui::PointerButton::Primary, egui::Modifiers::NONE);
+    h.state_mut().state.browsers.get_mut("surface:9").unwrap().loading = true;
+    h.run();
+    click(&mut h, button, egui::PointerButton::Primary, egui::Modifiers::NONE);
+    let methods: Vec<String> = rpcs(&h).into_iter().map(|(_, m, _)| m).collect();
+    assert_eq!(methods, ["browser.reload", "browser.stop"]);
+}
+
+#[test]
+fn cmd_chords_reach_the_page_with_meta_and_paste_types_local_text() {
+    let mut h = browser_harness();
+    key(&mut h, egui::Modifiers::COMMAND, egui::Key::A);
+    key(&mut h, egui::Modifiers::COMMAND, egui::Key::Z);
+    h.input_mut().events.push(egui::Event::Paste("from the mac".into()));
+    h.run();
+    let inputs = browser_inputs(&h);
+    let keys: Vec<(String, bool)> = inputs
+        .iter()
+        .filter_map(|e| match e {
+            wire::BrowserInputEvent::Key { key, modifiers, .. } => Some((key.clone(), modifiers.meta)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys, [("a".to_string(), true), ("z".to_string(), true)]);
+    assert!(inputs.iter().any(|e| matches!(
+        e,
+        wire::BrowserInputEvent::InsertText { text } if text == "from the mac"
+    )));
+}
+
+#[test]
+fn cmd_c_copies_the_pages_selection_to_this_macs_clipboard() {
+    let mut h = browser_harness();
+    h.input_mut().events.push(egui::Event::Copy);
+    h.run();
+    let (id, _, params) = rpcs(&h)
+        .into_iter()
+        .find(|(_, m, _)| m == "browser.eval")
+        .expect("copy asks the page for its selection");
+    assert_eq!(params["surface"], "surface:9");
+    assert!(params["script"].as_str().unwrap().contains("getSelection"));
+    reply(&mut h, id, serde_json::json!({ "value": "selected words" }));
+    h.step();
+    let copied = h.output().platform_output.commands.iter().any(|c| {
+        matches!(c, egui::OutputCommand::CopyText(t) if t == "selected words")
+    });
+    assert!(copied, "the selection must land on the local clipboard");
+}
+
+#[test]
+fn middle_and_cmd_click_open_the_link_in_a_new_tab() {
+    for (button, mods) in [
+        (egui::PointerButton::Middle, egui::Modifiers::NONE),
+        (egui::PointerButton::Primary, egui::Modifiers::COMMAND),
+    ] {
+        let mut h = browser_harness();
+        let image = h.state().state.browser_image_rects["surface:9"];
+        click(&mut h, image.center(), button, mods);
+        let (id, _, params) = rpcs(&h)
+            .into_iter()
+            .find(|(_, m, _)| m == "browser.link_at")
+            .expect("asks for the link under the pointer");
+        assert!((params["x"].as_f64().unwrap() - 50.0).abs() < 1.0);
+        // The page itself never gets that click.
+        assert!(
+            browser_inputs(&h).iter().all(|e| !matches!(e, wire::BrowserInputEvent::Mouse { .. })),
+            "{button:?}: no click reaches the page"
+        );
+        reply(&mut h, id, serde_json::json!({ "href": "https://example.com/next" }));
+        let open = rpcs(&h)
+            .into_iter()
+            .find(|(_, m, _)| m == "surface.new")
+            .expect("a new tab for the link");
+        assert_eq!(open.2["pane"], "pane:1");
+        assert_eq!(open.2["type"], "browser");
+        assert_eq!(open.2["url"], "https://example.com/next");
+    }
+}
+
+#[test]
+fn a_click_on_no_link_opens_nothing() {
+    let mut h = browser_harness();
+    let image = h.state().state.browser_image_rects["surface:9"];
+    click(&mut h, image.center(), egui::PointerButton::Middle, egui::Modifiers::NONE);
+    let (id, _, _) = rpcs(&h).into_iter().find(|(_, m, _)| m == "browser.link_at").unwrap();
+    reply(&mut h, id, serde_json::json!({ "href": null }));
+    assert!(rpcs(&h).iter().all(|(_, m, _)| m != "surface.new"));
+}
+
+#[test]
+fn a_new_browser_tab_opens_blank_with_the_address_bar_focused() {
+    let mut h = browser_harness();
+    let mods = egui::Modifiers { command: true, shift: true, ..Default::default() };
+    key(&mut h, mods, egui::Key::B);
+    let (id, _, params) = rpcs(&h).into_iter().find(|(_, m, _)| m == "surface.new").unwrap();
+    assert_eq!(params["url"], "about:blank");
+    reply(&mut h, id, serde_json::json!({ "surface": "surface:9" }));
+    assert!(h.state().state.browsers["surface:9"].focus_url);
+    h.run();
+    assert!(h.ctx.memory(|m| m.focused().is_some()), "the address bar takes the keyboard");
+}
