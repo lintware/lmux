@@ -1,63 +1,69 @@
 # lmux — plan
 
-lmux is a leaner cmux. It keeps the parts of cmux that matter day to day (workspaces in folders, split terminals and browsers, notifications, and agent control from a CLI) and adds what cmux lacks. Everything runs on a server and keeps running when the laptop disconnects, browsers included.
+lmux is cmux with persistence and remotes built in. Its goal is one cmux-identical window where local, cloud and remote workspaces sit side by side, and every terminal, browser and agent survives restarts and disconnects and resumes exactly where it left off.
+
+## Vision
+
+1. **cmux frontend, unchanged.** The UI looks and behaves exactly like cmux: sidebar, folders, workspaces, splits, browser panes, notifications and the CLI. Users of cmux should notice no difference.
+2. **herdr-style persistence.** Nothing closes for good. Quitting the app, losing the network or rebooting brings every pane back at the same spot: same directory, same scrollback, and the same agent session (e.g. `claude --resume`).
+3. **Remote work feels local.** Open a folder or workspace that is bound to a remote host (a server or a cloud agent box). Every terminal opened inside it connects to that host automatically and works seamlessly, without manual SSH.
+4. **One view for everything.** Like cmux, a single sidebar shows local, cloud and other remote connections together, each labelled by host, and they can be mixed freely.
 
 ## The user flow this must support
 
-1. Open lmux on the laptop. It connects to `my-server` over Tailscale.
-2. In the sidebar, open a folder (e.g. `webapp`) and a workspace in it. Start Claude Code in a terminal pane. The project files and Claude both live on the server.
-3. Claude opens a browser pane, navigates, clicks and types. You watch it live in the app.
-4. Close the laptop lid. Claude keeps working, and so does its browser.
-5. Reopen the laptop. Every workspace, terminal screen and browser is exactly where the agent left it. Unread notifications say what happened.
-6. A remote terminal or browser costs the laptop almost nothing: hidden panes stream nothing, and visible panes only receive screen updates.
+1. Open lmux on the laptop. The sidebar shows every host at once: **this mac**, `my-server`, and any cloud boxes, each as a labelled group of folders and workspaces. Hosts connect in the background; one being offline never blocks the others.
+2. Open a folder that lives on `my-server` (e.g. `webapp`) and a workspace in it. Every terminal opened in that workspace runs on `my-server`, in that workspace's directory, with no manual SSH. A workspace under **this mac** runs locally.
+3. Start Claude Code in a terminal pane. Claude opens a browser pane on the same host, navigates, clicks and types, and you watch it live.
+4. Quit the app, close the lid, lose the network, or reboot either machine. Remote work keeps running. Nothing is closed for good.
+5. Reopen lmux. Every workspace, pane, directory, scrollback and browser is where it was. Agents that were running are resumed (`claude --resume <id>`) if their process did not survive. Unread notifications say what happened while you were away.
+6. A remote terminal or browser costs the laptop almost nothing: hidden panes stream nothing, and visible panes only receive screen updates. A local terminal is attached through a real PTY, so typing feels native.
 
-## Target machine
+## Hosts
 
-`my-server` (hostname `my-server`, Tailscale `100.x.y.z`, SSH user `me`). Checked on 2026-10-09:
+A host is one machine running `lmux server` (lmuxd). Each host owns its own folders, workspaces, terminals and browsers; a workspace belongs to exactly one host, which is what "bound to a remote" means. The app holds a connection to every configured host at the same time.
 
-| | |
-|---|---|
-| OS | Debian 12 (bookworm), x86_64, kernel 6.1 |
-| CPU / RAM | 8 cores, 31 GB (about 20 GB available) |
-| Disk | 565 GB free |
-| Installed | cargo/rustc 1.88, node 22, bun, tmux 3.3a, docker, claude, Chromium 154 (`apt install chromium`, installed 2026-10-09; headless verified) |
-| systemd | user lingering is on, so `systemctl --user` services survive logout |
+| Host | How the app reaches it | Notes |
+|---|---|---|
+| **this mac** | The app starts or adopts a local lmuxd on `127.0.0.1:7879`. Local panes attach to its tmux through a PTY. | Always first in the sidebar. No browser panes yet (no Chromium). |
+| **`my-server`** | SSH tunnel over Tailscale to the daemon's websocket. | Debian 12, 8 cores, 31 GB, tmux 3.3a, Chromium 154, claude. Hostname `my-server`, Tailscale `100.x.y.z`, SSH user `me`. systemd user lingering is on. |
+| **cloud boxes** (planned) | Same SSH transport. The app can provision a box, install `lmux`, and register it as a host. | Holds cloud agents. Torn down on request, never silently. |
+
+Hosts are listed in `~/Library/Application Support/lmux/hosts.json`; the local host is derived at runtime.
 
 ## Architecture
 
 ```
- Laptop (macOS)                                Server (my-server)
-┌──────────────────────────┐   Tailscale    ┌─────────────────────────────────────────┐
-│ lmux app (Tauri)         │   SSH tunnel   │ lmuxd  (Rust, systemd --user service)   │
-│  sidebar: folders/ws     │◀══════════════▶│  session tree: folder▸workspace▸pane    │
-│  xterm.js per visible    │  websocket:    │  terminals = tmux -L lmux (control mode) │
-│    terminal pane         │  JSON control  │  Chromium (headless) via CDP             │
-│  <canvas> per visible    │  + binary      │  notifications / status / log            │
-│    browser pane          │  frames        │  state snapshot on disk                  │
-└──────────────────────────┘                │         ▲ unix socket (JSON-RPC)         │
-                                            │  `lmux` CLI ── used by you and agents   │
-                                            │  Claude Code hooks ─▶ `lmux hooks`      │
-                                            └─────────────────────────────────────────┘
+ Laptop (macOS)                                         Each host (this mac, my-server, cloud…)
+┌───────────────────────────────────────┐            ┌─────────────────────────────────────────┐
+│ lmux app (Rust, egui + wgpu)          │  one conn  │ lmuxd  (Rust; systemd --user on Linux)   │
+│  sidebar: hosts ▸ folders ▸ workspaces│  per host  │  session tree: folder▸workspace▸pane    │
+│  terminal panes: alacritty_terminal   │◀══════════▶│  terminals = tmux -L lmux (control mode) │
+│    grid; local panes via a real PTY   │  websocket │  Chromium (headless) via CDP             │
+│    running `tmux attach`              │  (SSH tun- │  notifications / status / agent sessions │
+│  browser panes: JPEG screencast       │  nel when  │  state.json on disk                      │
+│  merged tree, RPCs routed by host     │  remote)   │         ▲ unix socket (JSON-RPC)         │
+└───────────────────────────────────────┘            │  `lmux` CLI ── used by you and agents   │
+                                                     │  Claude Code hooks ─▶ `lmux hooks`      │
+                                                     └─────────────────────────────────────────┘
 ```
 
 ### Why this shape
 
-- **The daemon owns all state**, like a tmux server. The client is a viewer that can come and go. This is what makes "close the laptop, keep going" work.
-- **tmux is the terminal backbone.** lmuxd runs a private tmux server (`tmux -L lmux`) and talks to it in control mode (`tmux -C`), which streams structured per-pane output and events. tmux owns the PTYs, scrollback and screen state, so terminals and Claude sessions survive even an lmuxd crash or upgrade. Every terminal surface is its own tmux window with a manual size, because lmux's layout mixes terminals and browsers, which tmux can't. Snapshots on reattach and agents' `read-screen` come from `capture-pane`, and input goes through `send-keys`.
-- **lmuxd owns everything tmux can't:** the folder/workspace/pane layout, browsers, notifications, status and agent state. It stores its own metadata in tmux user options (`@lmux_*`) plus a state file, so after a restart it can rebuild the tree from the tmux sessions that are still running.
-- **Browsers are headless Chromium on the server, driven over CDP** (the `chromiumoxide` crate). The agent's commands and your view use the same page, so what you see is what the agent is doing.
-- **The laptop only pays for what's on screen.** The client subscribes to the panes it's showing. Hidden terminals send nothing. Hidden browsers stop their screencast, which also saves server CPU. Browser frames are paced by CDP's frame acknowledgements, so a slow link drops frames instead of building a backlog.
-- **One Rust binary on the server:** `lmux server` runs the daemon, and every other `lmux …` command is the CLI. Copy one file and install one systemd unit.
+- **Each daemon owns its host's state**, like a tmux server. The app is a viewer that can come and go, which is what makes "quit or close the laptop, keep going" work.
+- **The app merges hosts, the daemons don't know about each other.** The app keeps one connection and one tree per host and shows them side by side. Every ref (`workspace:3`, `surface:12`) is scoped by its host, and every RPC is sent to the host that owns its target. This is how local, remote and cloud work share one view.
+- **tmux is the terminal backbone.** lmuxd runs a private tmux server (`tmux -L lmux`) and talks to it in control mode (`tmux -C`). tmux owns the PTYs, scrollback and screen state, so shells and agents survive an lmuxd crash, upgrade or app quit. Every terminal surface is its own tmux window, because lmux's layout mixes terminals and browsers, which tmux can't. `read-screen` comes from `capture-pane`, and remote input goes through `send-keys`.
+- **Local panes skip the daemon for input and output.** For a pane on this mac, the app spawns `tmux attach` in a real PTY on its own grouped view session, so keystroke-to-echo is ~40 µs instead of a websocket round trip. Remote panes stream through the daemon.
+- **Persistence has three layers.** (1) tmux keeps processes alive across app quits and disconnects. (2) lmuxd's `state.json` records the tree, each pane's directory and its agent session (from Claude's SessionStart hook), so when tmux itself is lost, by a crash or reboot, panes are respawned in their directory and agents resumed with `claude --resume <id>`. (3) Scrollback is saved to disk periodically so a respawned pane shows its old screen too (planned).
+- **Browsers are headless Chromium on the host, driven over CDP.** The agent's commands and your view use the same page, so what you see is what the agent is doing.
+- **The laptop only pays for what's on screen.** The app subscribes only to visible remote panes. Hidden terminals send nothing; hidden browsers stop their screencast. Frames are paced by CDP acknowledgements, so a slow link drops frames instead of building a backlog.
+- **One Rust binary per host:** `lmux server` runs the daemon, and every other `lmux …` command is the CLI.
 
 ### Transport and security
 
-- v1: the app opens an SSH connection to the server (reusing your existing keys and Tailscale) and forwards the daemon's unix socket. lmuxd never listens on a network port.
-- The socket is mode `0600` and owned by your user. Anyone who can reach it can run shell commands as you, so it is never exposed beyond SSH.
+- Remote hosts: the app opens an SSH connection (your existing keys, over Tailscale) and forwards the daemon's websocket port, which listens only on `127.0.0.1`. One SSH master per host is shared by all of its traffic.
+- Local host: the daemon listens on `127.0.0.1:7879` and its unix socket.
+- The unix socket is mode `0600`. Anyone who can reach a daemon can run shell commands as you, so it is never exposed beyond SSH or loopback.
 - Later: a direct Tailscale connection that authenticates with the Tailscale peer identity, to drop the SSH hop.
-
-### Local workspaces
-
-The laptop can run its own `lmuxd` (the same binary builds for macOS). The app then shows both machines in one sidebar, with folders grouped by host. Local work costs local resources, and remote work doesn't.
 
 ## Feature scope
 
@@ -89,13 +95,14 @@ Command names match cmux wherever possible, so Claude's existing cmux habits and
 
 ### Added beyond cmux
 
-- Server-side persistence for terminals and browsers, with reattach.
+- herdr-style persistence: terminals, browsers and agent sessions survive app quits, disconnects and reboots, and resume at the same spot.
 - Browsers that keep running and stay watchable while the laptop is away.
-- A multi-host sidebar.
+- Workspaces bound to a remote or cloud host, with every terminal in them running there.
+- One sidebar showing local, remote and cloud hosts together.
 
 ### Left out to stay lean
 
-cmux has a lot that lmux deliberately skips in v1: cloud VMs, the iOS simulator, vault and checkpoints, the diff viewer, recordings, the markdown viewer, automations, sidebar extensions, team features, and browser import and profiles beyond a default profile. Any of these can be added later if you miss them.
+cmux has a lot that lmux deliberately skips in v1: cmux's own cloud VM service (lmux uses its own hosts instead), the iOS simulator, vault and checkpoints, the diff viewer, recordings, the markdown viewer, automations, sidebar extensions, team features, and browser import and profiles beyond a default profile. Any of these can be added later if you miss them.
 
 ## Repo layout
 
@@ -107,9 +114,14 @@ lmux/
     lmux-core/               session tree, tmux control-mode backend, persistence
     lmux-browser/            Chromium lifecycle, CDP sessions, screencast, agent browser ops
     lmux/                    the binary: `lmux server` + all CLI commands
-  app/                       Tauri client
-    src-tauri/               Rust side: SSH tunnel, websocket client, OS notifications
-    src/                     web UI: sidebar, split layout, xterm.js panes, canvas browser panes
+  app/                       native client (egui + wgpu)
+    src/net.rs               host list, SSH tunnel, websocket client, local daemon startup
+    src/state.rs             app state: tree, layout, subscriptions, local PTYs
+    src/pty.rs               local panes: a real PTY running `tmux attach`
+    src/term.rs              terminal grid (alacritty_terminal)
+    src/ui/                  sidebar, panes, tab strip, terminal, browser, drag and drop
+    mock/                    bun mock daemon for UI tests
+    tests/                   interaction, drag-and-drop and snapshot tests (egui_kittest)
   deploy/
     lmuxd.service            systemd --user unit
   PLAN.md
@@ -121,7 +133,7 @@ The source of truth is `crates/lmux-proto` (`lib.rs` for messages, `methods.rs` 
 
 **CLI ⇄ daemon:** JSON-RPC over the unix socket, one request per connection. For example, `{"method":"surface.send","params":{"surface":"surface:3","text":"npm test\n"}}`.
 
-**App ⇄ daemon:** one websocket carrying JSON control messages and binary frames.
+**App ⇄ daemon:** one websocket per host carrying JSON control messages and binary frames. The app holds one of these for every host at once. Local panes on this mac also bypass the websocket for terminal I/O, through a PTY running `tmux attach`.
 
 | Direction | Message |
 |---|---|
@@ -134,37 +146,47 @@ The browser canvas in the app is sized to its pane. The daemon starts the screen
 
 Each milestone ends with something you can run.
 
-**M1 — Daemon, terminals, CLI (no GUI).**
-lmuxd with the session tree, PTYs, server-side screen state, the unix socket and the core CLI (`new-workspace`, `new-split`, `send`, `send-key`, `read-screen`, `close-surface`, `tree`, `list-*`), installed as a systemd user service.
-*Done when:* over plain SSH, `lmux new-workspace --command claude` starts Claude, you disconnect, reconnect, and `lmux read-screen` shows Claude's current screen.
+**Done so far (branch `dev`, 2026-10-09)**
+- **M1 Daemon, terminals, CLI.** lmuxd with the session tree, tmux control mode, unix socket and the core cmux-named CLI.
+- **M2 App attach.** Native app with sidebar (nested folders, drag and drop, card controls), splits, tabs, terminal panes, subscribe on view, snapshot on attach.
+- **M3 Browser.** Headless Chromium over CDP, screencast to the pane, input forwarding, `lmux browser …` for agents (remote hosts only).
+- **Local host.** The app starts a daemon on this mac; local panes attach through a real PTY (~40 µs keystroke to echo).
+- **Agent resume.** Claude's session ID and each pane's directory are kept in `state.json`; when tmux is lost, panes are respawned and Claude resumed.
 
-**M2 — App attach.**
-The Tauri app with the SSH tunnel, the sidebar with folders and workspaces, split layout, and xterm.js panes, including subscribe and unsubscribe and snapshot on attach.
-*Done when:* you close the laptop with Claude mid-task, reopen it, and the app reconnects to the same screen in under 2 seconds. A hidden pane generates no network traffic.
+**M4 One view for all hosts** — *next*
+The app connects to every host at once, keeps a tree per host, and the sidebar shows them as labelled groups (this mac first). Refs are host-scoped, and every RPC, subscription and input goes to the host that owns its target. Create menus ("New Session Here", "New Folder") act on the host of the row they were opened from. A host that is offline shows as such without blocking the rest.
+*Done when:* a local workspace and a `my-server` workspace are both in the sidebar, you switch between them with one click, and typing in each runs on its own machine.
 
-**M3 — Browser.**
-Chromium on the server, browser panes, screencast to the canvas, your mouse and keyboard input forwarded back, and the `lmux browser …` commands for agents on the same page.
-*Done when:* Claude runs `lmux browser open http://localhost:3000`, then `snapshot -i` and `click`, and you watch it happen live. Closing and reopening the laptop shows the same page and state.
+**M5 Full persistence.**
+Periodic scrollback capture to disk, restored into respawned panes; resume for agents beyond Claude (e.g. Codex); browser tabs restored to their URL after a Chromium restart; the "terminal exited while the daemon was down" case handled.
+*Done when:* rebooting either machine brings every pane back with its directory, its last screen, and its agent resumed.
 
-**M4 — Agent awareness.**
-Notifications (in the app and as macOS notifications), Claude Code hooks, workspace status and summaries in the sidebar, and `set-status`, `set-progress` and `log`.
-*Done when:* Claude finishing a task while the laptop is closed shows up as an unread notification and an "Idle" workspace on reopen.
+**M6 Agent awareness.**
+Notifications in the app and as macOS notifications, workspace status and summaries on sidebar cards, `set-status`, `set-progress` and `log`, across all hosts.
+*Done when:* Claude finishing on `my-server` while the laptop is closed shows as an unread notification and an "Idle" card on reopen.
 
-**M5 — Durability and polish.**
-State snapshot to disk so a daemon restart restores the layout (and offers `claude --resume` in agent panes), memory limits for browsers (suspend tabs hidden for long periods), keybindings, a local lmuxd for laptop workspaces, and the multi-host sidebar.
+**M7 Cloud hosts.**
+Add a cloud box as a host from the app: provision (or adopt) a VM, install `lmux`, start the service, and register it in `hosts.json`. Workspaces created under it run cloud agents.
+*Done when:* "New cloud host" yields a working host in the sidebar whose terminals run on the new box.
+
+**M8 cmux parity pass.**
+Side-by-side comparison with cmux (`~/Documents/cmux`): layout, spacing, colours, keybindings, menus and command names. Every difference is fixed or recorded as intended.
 
 ## Risks to test early
 
-- **Screencast latency and bandwidth over Tailscale.** Prototype this in the first week of M3, before building browser chrome around it. If JPEG frames are too heavy, the fallbacks are a lower frame rate when idle, a lower quality while the page is scrolling, or later a WebRTC video track.
-- **Chromium memory on a 31 GB box that already uses 11 GB.** Cap live browser tabs per workspace and suspend hidden ones, as cmux's memory saver does.
-- **Headless detection.** Some sites behave differently in headless Chrome. If that bites, run headful Chromium against a virtual display (Xvfb) on the server instead. Nothing else in the design changes.
-- **xterm.js speed versus Ghostty.** Fine for typical agent output; enable the WebGL renderer, and revisit if huge outputs lag.
-- **Clipboard and file drops across machines.** The app needs to copy across explicitly, since the clipboard lives on the laptop and the files on the server.
+- **Ref collisions across hosts.** Two daemons both have `workspace:1`. Every place the app stores a ref (selection, drag state, layout, subscriptions, notifications) must carry the host too. Do this as a type (`HostRef`), not by convention.
+- **Several SSH tunnels at once.** Reconnect, backoff and ping per host, and make sure one hung host can't stall the UI thread.
+- **Screencast latency and bandwidth over Tailscale.** If JPEG frames are too heavy: a lower frame rate when idle, lower quality while scrolling, or later a WebRTC video track.
+- **Chromium memory** on `my-server` (31 GB, ~11 GB already used). Cap live tabs per workspace and suspend hidden ones, as cmux's memory saver does.
+- **Headless detection.** If sites misbehave in headless Chrome, run headful Chromium under Xvfb. Nothing else changes.
+- **Clipboard and file drops across machines.** The clipboard is on the laptop and the files on the host, so the app has to copy across explicitly.
 
 ## Decisions taken in this plan (open to change)
 
-- **tmux as the terminal backbone**, with lmuxd layered on top for layout, browsers and agent features.
-- Rust for the daemon and CLI, and **Tauri** for the client (Rust plus a web UI with xterm.js). The alternatives were a native Rust UI (more work) or a Swift client like cmux (Mac only, two languages).
+- **tmux as the terminal backbone**, with lmuxd layered on top for layout, browsers, persistence and agent features.
+- **Rust everywhere**, with a native **egui + wgpu** client and `alacritty_terminal` for the grid. This replaced the original Tauri + xterm.js plan.
+- **One daemon per host; the app merges them.** Daemons don't federate.
+- **Local panes attach through a real PTY**; remote panes stream through the daemon.
 - CLI command names that **match cmux**.
-- **SSH-tunnelled** transport for v1, not a listening port.
+- **SSH-tunnelled** transport for remote hosts, not a listening network port.
 - **Headless Chromium** first, with headful Chromium under Xvfb as the fallback.
