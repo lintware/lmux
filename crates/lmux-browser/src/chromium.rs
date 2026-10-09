@@ -24,11 +24,47 @@ pub struct BrowserConfig {
     pub window_height: u32,
 }
 
+/// A Chromium-family browser on this machine: the usual Linux and macOS
+/// installs, then the newest Playwright download.
+pub fn find_chromium() -> Option<PathBuf> {
+    let fixed = [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ];
+    if let Some(p) = fixed.iter().map(PathBuf::from).find(|p| p.is_file()) {
+        return Some(p);
+    }
+    let home = PathBuf::from(std::env::var("HOME").ok()?);
+    let cache = [home.join("Library/Caches/ms-playwright"), home.join(".cache/ms-playwright")];
+    let mut dirs: Vec<PathBuf> = cache
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|rd| rd.flatten().map(|e| e.path()))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("chromium-")))
+        .collect();
+    // chromium-1243 after chromium-1187: newest first.
+    dirs.sort_by_key(|p| {
+        let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        std::cmp::Reverse(n.trim_start_matches("chromium-").parse::<u32>().unwrap_or(0))
+    });
+    let inside = [
+        "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+        "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+        "chrome-linux/chrome",
+        "chrome-linux64/chrome",
+    ];
+    dirs.iter().flat_map(|d| inside.iter().map(move |i| d.join(i))).find(|p| p.is_file())
+}
+
 impl Default for BrowserConfig {
     fn default() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         Self {
-            chromium_path: PathBuf::from("/usr/bin/chromium"),
+            chromium_path: find_chromium().unwrap_or_else(|| PathBuf::from("/usr/bin/chromium")),
             user_data_dir: PathBuf::from(home).join(".local/state/lmux/chromium"),
             headless: true,
             extra_args: Vec::new(),

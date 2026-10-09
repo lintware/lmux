@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# Install or update lmux on a remote Linux host, so the app can add it as a
-# host ("Add Remote Host…" in the sidebar menu, or hosts.json).
+# Install or update lmux on a remote Linux or macOS host, so the app can add
+# it as a host ("Add Remote Host…" in the sidebar menu, or hosts.json).
 #
 #   deploy/install-remote.sh <ssh-target> [git-ref]
 #
 # Ships the source of <git-ref> (default: HEAD) over SSH, builds a release
 # binary there, installs it to ~/.local/bin/lmux, runs it as the systemd user
-# service `lmuxd` (websocket on 127.0.0.1:7878, reached through the app's SSH
-# tunnel), and adds the Claude Code hooks that let panes resume their Claude
+# service `lmuxd` on Linux or the launchd agent `dev.lmux.lmuxd` on macOS
+# (websocket on 127.0.0.1:7878, reached through the app's SSH tunnel), and adds the Claude Code hooks that let panes resume their Claude
 # session after a reboot. Re-running it updates in place; tmux sessions survive
 # the daemon restart.
 #
-# Needs on the host: tmux, a Rust toolchain (rustup), and systemd user services
-# with lingering (`loginctl enable-linger $USER`) so the daemon outlives logout.
+# Needs on the host: tmux, a Rust toolchain (rustup), and on Linux systemd user
+# services with lingering (`loginctl enable-linger $USER`) so the daemon
+# outlives logout. On macOS a missing tmux is installed with Homebrew.
 set -euo pipefail
+
+# SSH runs a non-login shell: on macOS that PATH has neither Homebrew nor cargo.
+env_path='export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH";'
 
 target=${1:?usage: install-remote.sh <ssh-target> [git-ref]}
 ref=${2:-HEAD}
@@ -24,13 +28,21 @@ if [ -z "${LMUX_SRC_TAR:-}" ]; then
 fi
 
 echo "==> checking $target"
-ssh -o BatchMode=yes "$target" 'set -e
-  command -v tmux >/dev/null || { echo "tmux is missing on this host (apt install tmux)"; exit 1; }
-  [ -x ~/.cargo/bin/cargo ] || command -v cargo >/dev/null || {
-    echo "Rust is missing on this host: curl https://sh.rustup.rs -sSf | sh -s -- -y"; exit 1; }
-  if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != yes ]; then
-    echo "warning: lingering is off, so lmuxd stops at logout (loginctl enable-linger $USER)"
-  fi'
+ssh -o BatchMode=yes "$target" "$env_path"'set -e
+  if [ "$(uname)" = Darwin ]; then
+    if ! command -v tmux >/dev/null; then
+      command -v brew >/dev/null || { echo "tmux is missing on this Mac, and so is Homebrew (https://brew.sh)"; exit 1; }
+      echo "installing tmux with Homebrew"
+      brew install tmux 2>&1 | tail -1
+    fi
+  else
+    command -v tmux >/dev/null || { echo "tmux is missing on this host (apt install tmux)"; exit 1; }
+    if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != yes ]; then
+      echo "warning: lingering is off, so lmuxd stops at logout (loginctl enable-linger $USER)"
+    fi
+  fi
+  command -v cargo >/dev/null || {
+    echo "Rust is missing on this host: curl https://sh.rustup.rs -sSf | sh -s -- -y"; exit 1; }'
 
 if [ -n "${LMUX_SRC_TAR:-}" ]; then
   echo "==> shipping $(basename "$LMUX_SRC_TAR")"
@@ -43,20 +55,40 @@ ship | ssh -o BatchMode=yes "$target" \
   'rm -rf ~/lmux.new && mkdir -p ~/lmux.new && tar -x -C ~/lmux.new'
 
 echo "==> building (first build takes a minute or two)"
-ssh -o BatchMode=yes "$target" 'set -e
-  cargo=$(command -v cargo || echo ~/.cargo/bin/cargo)
+ssh -o BatchMode=yes "$target" "$env_path"'set -e
+  cargo=$(command -v cargo)
   cd ~/lmux.new && "$cargo" build --release -p lmux 2>&1 | tail -1
   rm -rf ~/lmux.old; [ -d ~/lmux ] && mv ~/lmux ~/lmux.old; mv ~/lmux.new ~/lmux
   mkdir -p ~/.local/bin && install -m755 ~/lmux/target/release/lmux ~/.local/bin/lmux'
 
 echo "==> starting lmuxd"
-ssh -o BatchMode=yes "$target" 'set -e
-  install -Dm644 ~/lmux/deploy/lmuxd.service ~/.config/systemd/user/lmuxd.service
-  systemctl --user daemon-reload
-  systemctl --user enable lmuxd >/dev/null 2>&1
-  systemctl --user restart lmuxd
-  sleep 1
-  systemctl --user is-active lmuxd'
+ssh -o BatchMode=yes "$target" "$env_path"'set -e
+  if [ "$(uname)" = Darwin ]; then
+    # A launchd agent: in the GUI session when someone is logged in at the
+    # Mac, else in the background user session SSH has.
+    plist=~/Library/LaunchAgents/dev.lmux.lmuxd.plist
+    mkdir -p ~/Library/LaunchAgents ~/.local/state/lmux
+    sed -e "s|@HOME@|$HOME|g" -e "s|@PATH@|$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin|g" \
+      ~/lmux/deploy/lmuxd.plist > "$plist"
+    uid=$(id -u)
+    domain=gui/$uid
+    launchctl print "$domain" >/dev/null 2>&1 || domain=user/$uid
+    launchctl bootout "$domain/dev.lmux.lmuxd" 2>/dev/null || true
+    # bootout returns before the old daemon has let go of its port.
+    for i in $(seq 1 50); do lsof -nP -iTCP:7878 -sTCP:LISTEN >/dev/null 2>&1 || break; sleep 0.2; done
+    launchctl bootstrap "$domain" "$plist"
+    for i in $(seq 1 50); do lsof -nP -iTCP:7878 -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.2; done
+    lsof -nP -iTCP:7878 -sTCP:LISTEN >/dev/null 2>&1 && echo "active ($domain)" || {
+      echo "lmuxd did not start; see ~/.local/state/lmux/daemon.log"; tail -5 ~/.local/state/lmux/daemon.log; exit 1; }
+  else
+    mkdir -p ~/.config/systemd/user
+    install -m644 ~/lmux/deploy/lmuxd.service ~/.config/systemd/user/lmuxd.service
+    systemctl --user daemon-reload
+    systemctl --user enable lmuxd >/dev/null 2>&1
+    systemctl --user restart lmuxd
+    sleep 1
+    systemctl --user is-active lmuxd
+  fi'
 
 echo "==> Claude Code hooks"
 ssh -o BatchMode=yes "$target" 'python3 - <<"PY"
