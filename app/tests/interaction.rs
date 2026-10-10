@@ -606,14 +606,14 @@ fn a_cards_menu_moves_the_session_to_another_folder() {
 #[test]
 fn the_cards_close_button_closes_that_session() {
     let mut h = harness(fixture());
-    // workspace:3 has no unread badge, so its close button sits at the corner.
+    // workspace:3 has no unread badge, so its close button sits at the right edge, mid-height.
     let card = *h
         .state()
         .state
         .card_rects
         .get("workspace:3")
         .expect("card rect for workspace:3");
-    let close = egui::pos2(card.max.x - 12.0, card.min.y + 11.0);
+    let close = egui::pos2(card.max.x - 12.0, card.center().y);
     click_at(&mut h, close, egui::PointerButton::Primary);
     h.run();
 

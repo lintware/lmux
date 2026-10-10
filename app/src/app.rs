@@ -19,6 +19,7 @@ struct UiPrefs {
     sidebar_w: Option<f32>,
     sidebar_hidden: bool,
     term_font: Option<f32>,
+    sidebar_scale: Option<f32>,
     /// The host on screen, by name.
     active_host: Option<String>,
     /// Hosts whose sidebar group is folded, by name.
@@ -89,6 +90,9 @@ impl LmuxApp {
         // Restore the window's own preferences, then start on the host that
         // was on screen last (this machine the first time).
         let prefs: UiPrefs = cc.storage.and_then(|s| eframe::get_value(s, PREFS_KEY)).unwrap_or_default();
+        if let Some(v) = prefs.sidebar_scale {
+            theme::set_sidebar_scale(v);
+        }
         for h in &mut hosts {
             let name = h.net.host_name();
             if let Some(w) = prefs.sidebar_w {
@@ -339,6 +343,7 @@ impl eframe::App for LmuxApp {
             sidebar_w: Some(on_screen.state.sidebar_w),
             sidebar_hidden: on_screen.state.sidebar_hidden,
             term_font: Some(on_screen.state.term_font),
+            sidebar_scale: Some(theme::sidebar_scale()),
             active_host: Some(on_screen.net.host_name()),
             collapsed_hosts: self
                 .hosts
@@ -1439,6 +1444,9 @@ pub fn run_command(c: &mut ui::Ctx, name: &str) {
                 c.state.cmux_import = Some(crate::cmux_import::CmuxImport::new());
             }
         }
+        "Sidebar Text Larger" => theme::step_sidebar_scale(1),
+        "Sidebar Text Smaller" => theme::step_sidebar_scale(-1),
+        "Reset Sidebar Text" => theme::step_sidebar_scale(0),
         "Zoom In" | "Zoom Out" | "Reset Zoom" => {
             let step = match name {
                 "Zoom In" => 1,

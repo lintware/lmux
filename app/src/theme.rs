@@ -125,3 +125,21 @@ pub const FS_FOLDER: f32 = 13.0;
 pub fn card_gap() -> Vec2 {
     Vec2::new(0.0, 0.0)
 }
+
+/// Sidebar text and row size, a multiple of 1.0 (View > Sidebar Text). Window
+/// wide, so one atomic holds it; stored as thousandths.
+static SIDEBAR_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+
+pub fn sidebar_scale() -> f32 {
+    SIDEBAR_SCALE.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+}
+
+pub fn set_sidebar_scale(v: f32) {
+    let v = v.clamp(0.8, 1.6);
+    SIDEBAR_SCALE.store((v * 1000.0).round() as u32, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One step bigger (`+1`), smaller (`-1`), or back to 1.0 (`0`).
+pub fn step_sidebar_scale(step: i32) {
+    set_sidebar_scale(if step == 0 { 1.0 } else { sidebar_scale() + step as f32 * 0.1 });
+}

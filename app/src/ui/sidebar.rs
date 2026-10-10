@@ -34,10 +34,9 @@ pub fn show_hosts(ui: &mut Ui, rect: Rect, hosts: &mut [Ctx], active: usize) {
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 0.0, theme::SIDEBAR_BG);
 
-    let unread: u32 = hosts.iter().map(|h| h.state.unread_total()).sum();
     let strip = Rect::from_min_size(rect.min, Vec2::new(rect.width(), theme::TOP_STRIP_H));
     if let Some(c) = hosts.get_mut(active) {
-        top_icons(ui, strip, c, unread);
+        top_icons(ui, strip, c);
     }
 
     // OpenUsage's limits sit at the bottom, under the list.
@@ -54,18 +53,17 @@ pub fn show_hosts(ui: &mut Ui, rect: Rect, hosts: &mut [Ctx], active: usize) {
     body(ui, list, hosts, active);
 }
 
-fn top_icons(ui: &mut Ui, rect: Rect, c: &mut Ctx, unread: u32) {
+fn top_icons(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
     let p = ui.painter_at(rect);
     let y = rect.center().y;
     let start = rect.min.x + 16.0 + theme::titlebar_inset();
     let step = 28.0;
 
-    let items: [(&str, f32); 5] = [
+    let items: [(&str, f32); 4] = [
         ("sidebar", start),
-        ("bell", start + step),
-        ("plus", start + step * 2.0),
-        ("back", start + step * 3.0),
-        ("forward", start + step * 4.0),
+        ("plus", start + step),
+        ("back", start + step * 2.0),
+        ("forward", start + step * 3.0),
     ];
 
     for (name, x) in items {
@@ -78,7 +76,6 @@ fn top_icons(ui: &mut Ui, rect: Rect, c: &mut Ctx, unread: u32) {
         let icon = Rect::from_center_size(hit.center(), Vec2::splat(theme::STRIP_ICON));
         match name {
             "sidebar" => icons::sidebar_toggle(&p, icon, color),
-            "bell" => icons::bell(&p, icon, color),
             "plus" => icons::plus(&p, icon, color),
             "back" => {
                 let col = if c.state.can_go_back() { color } else { theme::DIM_2 };
@@ -93,7 +90,6 @@ fn top_icons(ui: &mut Ui, rect: Rect, c: &mut Ctx, unread: u32) {
         if resp.clicked() {
             match name {
                 "sidebar" => c.state.sidebar_hidden = true,
-                "bell" => c.state.notif_open = !c.state.notif_open,
                 "plus" => {
                     let folder = c.state.default_new_folder();
                     c.state.new_session(folder);
@@ -106,9 +102,6 @@ fn top_icons(ui: &mut Ui, rect: Rect, c: &mut Ctx, unread: u32) {
         if name == "plus" {
             // Right click on `+` asks where the new session or folder goes.
             new_item_menu(&resp, c);
-        }
-        if name == "bell" && unread > 0 {
-            icons::badge(&p, egui::pos2(x + 9.0, y - 8.0), unread);
         }
     }
 }
@@ -181,7 +174,7 @@ fn host_list(ui: &mut Ui, c: &mut Ctx, is_active: bool, multi: bool) {
             ui.horizontal(|ui| {
                 ui.add_space(if multi { theme::SIDEBAR_PAD + 6.0 } else { 0.0 });
                 ui.label(
-                    egui::RichText::new(text).font(theme::ui(theme::FS_SMALL)).color(theme::DIM_2),
+                    egui::RichText::new(text).font(theme::ui(theme::FS_SMALL * theme::sidebar_scale())).color(theme::DIM_2),
                 );
             });
             ui.add_space(if multi { 6.0 } else { 0.0 });
@@ -203,7 +196,7 @@ fn host_list(ui: &mut Ui, c: &mut Ctx, is_active: bool, multi: bool) {
 fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
     use crate::net::ConnState;
     let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, ROW_H), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, ROW_H * theme::sidebar_scale()), Sense::click());
     let painter = ui.painter_at(rect);
     let inner = rect.shrink2(Vec2::new(theme::SIDEBAR_PAD, 0.0));
     let cy = rect.center().y;
@@ -240,7 +233,7 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
         _ => {}
     }
     icons::dot(&painter, egui::pos2(inner.min.x + 18.0, cy), 3.0, dot);
-    let font = theme::pixel(theme::FS_TINY);
+    let font = theme::pixel(theme::FS_TINY * theme::sidebar_scale());
     let name = c.net.host_name().to_uppercase();
     let color = if is_active || resp.hovered() { theme::TEXT_SOFT } else { theme::DIM };
     let name_w = crate::util::measure(ui.ctx(), &name, &font);
@@ -257,8 +250,8 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
         painter.text(
             egui::pos2(sx, cy),
             Align2::LEFT_CENTER,
-            ellipsize(ui.ctx(), &status, &theme::ui(theme::FS_TINY), (inner.max.x - sx).max(10.0), false),
-            theme::ui(theme::FS_TINY),
+            ellipsize(ui.ctx(), &status, &theme::ui(theme::FS_TINY * theme::sidebar_scale()), (inner.max.x - sx).max(10.0), false),
+            theme::ui(theme::FS_TINY * theme::sidebar_scale()),
             status_color,
         );
     }
@@ -382,7 +375,7 @@ fn folder_row(
     c: &mut Ctx,
 ) -> bool {
     let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, ROW_H), Sense::click_and_drag());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, ROW_H * theme::sidebar_scale()), Sense::click_and_drag());
     c.state.folder_rects.insert(folder.id.clone(), rect);
     c.state.sidebar_rows.push(SidebarRow {
         id: folder.id.clone(),
@@ -407,7 +400,7 @@ fn folder_row(
     }
     icons::folder(
         &painter,
-        Rect::from_center_size(egui::pos2(lead + 23.0, cy), Vec2::splat(17.0)),
+        Rect::from_center_size(egui::pos2(lead + 23.0, cy), Vec2::splat(17.0 * theme::sidebar_scale())),
         if collapsed { theme::DIM } else { theme::FLAME },
     );
     let text_x = lead + FOLDER_TEXT_X;
@@ -417,7 +410,7 @@ fn folder_row(
     if editing {
         folder_rename_editor(ui, rect, text_x, avail, folder, c);
     } else {
-        let font = theme::ui_semibold(theme::FS_FOLDER);
+        let font = theme::ui_semibold(theme::FS_FOLDER * theme::sidebar_scale());
         let label = ellipsize(ui.ctx(), &folder.name, &font, avail, false);
         painter.text(egui::pos2(text_x, cy), Align2::LEFT_CENTER, label, font, color);
     }
@@ -443,7 +436,7 @@ fn folder_row(
     if unread > 0 && !(c.state.tab_drag.is_none() && plus_hover_zone) {
         let badge = egui::pos2(inner.max.x - 12.0, cy);
         painter.circle_filled(badge, 8.0, theme::BADGE);
-        painter.text(badge, Align2::CENTER_CENTER, unread.to_string(), theme::ui(theme::FS_TINY), Color32::WHITE);
+        painter.text(badge, Align2::CENTER_CENTER, unread.to_string(), theme::ui(theme::FS_TINY * theme::sidebar_scale()), Color32::WHITE);
     }
 
     // The row's own `+`: a session in this folder, without leaving the row.
@@ -660,7 +653,7 @@ fn folder_rename_editor(
         let out = ui.add(
             egui::TextEdit::singleline(&mut text)
                 .id(edit_id)
-                .font(theme::ui_semibold(theme::FS_BODY))
+                .font(theme::ui_semibold(theme::FS_BODY * theme::sidebar_scale()))
                 .text_color(theme::TEXT)
                 .desired_width(edit_rect.width().max(24.0)),
         );
@@ -729,7 +722,7 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ct
 
     let x = rect.min.x + PAD_X;
     let max_w = rect.width() - 2.0 * PAD_X;
-    let mut y = rect.min.y + PAD_Y;
+    let mut y = rect.min.y + PAD_Y * theme::sidebar_scale();
 
     // Title, or its inline editor.
     if c.state.ws_rename.as_ref().is_some_and(|r| r.folder == ws.id) {
@@ -739,8 +732,8 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ct
         p.text(
             egui::pos2(x, y),
             Align2::LEFT_TOP,
-            ellipsize(ui.ctx(), &ws.title, &theme::ui_semibold(theme::FS_TITLE), max_w - 18.0, false),
-            theme::ui_semibold(theme::FS_TITLE),
+            ellipsize(ui.ctx(), &ws.title, &theme::ui_semibold(theme::FS_TITLE * theme::sidebar_scale()), max_w - 18.0, false),
+            theme::ui_semibold(theme::FS_TITLE * theme::sidebar_scale()),
             title_color,
         );
     }
@@ -764,7 +757,7 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ct
             egui::pos2(x + 12.0, y),
             Align2::LEFT_TOP,
             agent_label(ws.agent),
-            theme::ui(theme::FS_SMALL),
+            theme::ui(theme::FS_SMALL * theme::sidebar_scale()),
             if selected { title_color } else { theme::TEXT_SOFT },
         );
     }
@@ -780,7 +773,7 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ct
         };
         if let Some(d) = digit {
             let text = format!("⌘{d}");
-            let font = theme::ui_semibold(theme::FS_TINY);
+            let font = theme::ui_semibold(theme::FS_TINY * theme::sidebar_scale());
             let w = crate::util::measure(ui.ctx(), &text, &font) + 10.0;
             let right = rect.max.x - if ws.unread_notifications > 0 { 26.0 } else { 6.0 };
             let pill = Rect::from_min_size(egui::pos2(right - w, rect.min.y + 4.0), Vec2::new(w, 15.0));
@@ -804,7 +797,7 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ct
             badge,
             Align2::CENTER_CENTER,
             ws.unread_notifications.to_string(),
-            theme::ui(theme::FS_TINY),
+            theme::ui(theme::FS_TINY * theme::sidebar_scale()),
             fg,
         );
     }
@@ -966,7 +959,7 @@ fn ws_rename_editor(ui: &mut Ui, rect: Rect, ws: &Workspace, c: &mut Ctx) {
         let out = ui.add(
             egui::TextEdit::singleline(&mut text)
                 .id(edit_id)
-                .font(theme::ui_semibold(theme::FS_TITLE))
+                .font(theme::ui_semibold(theme::FS_TITLE * theme::sidebar_scale()))
                 .text_color(theme::TEXT)
                 .desired_width(rect.width().max(24.0)),
         );
@@ -1002,11 +995,11 @@ fn ws_rename_editor(ui: &mut Ui, rect: Rect, ws: &Workspace, c: &mut Ctx) {
 }
 
 fn card_height(ws: &Workspace) -> f32 {
-    let mut h = PAD_Y + 17.0; // title
+    let mut h = PAD_Y * theme::sidebar_scale() + 17.0 * theme::sidebar_scale(); // title
     if agent_color(ws.agent).is_some() {
-        h += LINE;
+        h += LINE * theme::sidebar_scale();
     }
-    h += PAD_Y + 3.0;
+    h += PAD_Y * theme::sidebar_scale() + 3.0;
     h.max(30.0)
 }
 

@@ -116,6 +116,10 @@ pub fn install(ctx: &egui::Context) -> Option<MenuBar> {
             &item("Zoom Out", Some("Cmd+-")),
             &item("Reset Zoom", Some("Cmd+0")),
             &P::separator(),
+            &item("Sidebar Text Larger", None),
+            &item("Sidebar Text Smaller", None),
+            &item("Reset Sidebar Text", None),
+            &P::separator(),
             &P::fullscreen(None),
         ],
     )
