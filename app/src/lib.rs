@@ -8,6 +8,7 @@ pub mod fonts;
 pub mod gfx;
 pub mod keys;
 pub mod layout;
+pub mod menu;
 pub mod net;
 pub mod pty;
 pub mod state;

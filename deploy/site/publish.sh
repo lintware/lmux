@@ -47,7 +47,8 @@ s = open(p).read()
 open(p, "w").write(re.sub(r'\s*<div class="note" id="gatekeeper">.*?</div>', "", s, flags=re.S))
 PY
 fi
-cp "$repo/deploy/site/lintlabs-logo.svg" "$repo/deploy/site/demo.html" "$out/public/"
+cp "$repo/deploy/site/lintlabs-logo.svg" "$repo/deploy/site/lmux-mark.svg" "$repo/deploy/site/demo.html" "$out/public/"
+cp -R "$repo/deploy/site/vendor" "$out/public/"
 sips -z 256 256 -s format png "$app/Contents/Resources/lmux.icns" --out "$out/public/icon.png" >/dev/null
 cat > "$out/public/_headers" <<'H'
 /lmux.dmg

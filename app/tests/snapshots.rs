@@ -378,6 +378,16 @@ fn snapshot_disconnected_banner() {
     h.snapshot("disconnected");
 }
 
+/// No workspace on screen while the daemon connects: the pixel flame.
+#[test]
+fn snapshot_connecting_screen() {
+    let mut fx = fixture("workspace:1", false);
+    fx.state.selected = None;
+    fx.net.state = ConnState::Connecting;
+    let mut h = harness(fx, Vec2::new(900.0, 460.0));
+    h.snapshot("connecting");
+}
+
 #[test]
 fn snapshot_notifications_panel() {
     let mut fx = fixture("workspace:1", true);

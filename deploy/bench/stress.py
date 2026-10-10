@@ -3,6 +3,7 @@
 
     deploy/bench/stress.py lmux 5 10 20 40     # steps: workspaces open at once
     deploy/bench/stress.py cmux 5 10 20
+    deploy/bench/stress.py herdr 5 10 20 40    # needs `herdr --session bench` running in a tmux
 
 Each workspace gets a terminal printing ~20 lines/s and an idle split. At
 every step the script samples the app's own processes (shells and agents are
@@ -20,6 +21,7 @@ os.makedirs(CWD, exist_ok=True)
 CHATTY = "i=0; while :; do i=$((i+1)); echo \"tick $i $(date +%S)\"; sleep 0.05; done"
 LMUX = "/Applications/lmux.app/Contents/MacOS/lmux"
 CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
+HERDR = ["herdr", "--session", "bench"]
 ENV = dict(os.environ, CMUX_QUIET="1")
 for k in ("LMUX_WORKSPACE_ID", "LMUX_SURFACE_ID"):
     ENV.pop(k, None)
@@ -97,7 +99,47 @@ class Cmux:
         sh(CMUX, "close-workspace", "--workspace", ws, "--force", check=False)
 
 
-app = Lmux() if APP == "lmux" else Cmux()
+class Herdr:
+    """herdr's server plus its TUI client (run in a tmux, so it renders)."""
+    def __init__(self):
+        self.split = {}
+
+    def procs(self, rows):
+        return [r for r in rows if re.search(r"(^|/)herdr( --session bench| server)$", r[3])]
+
+    def j(self, *argv):
+        return json.loads(sh(*HERDR, *argv))["result"]
+
+    def new(self, i):
+        r = self.j("workspace", "create", "--cwd", CWD, "--label", f"bench-{i}", "--no-focus")
+        ws, root = r["workspace"]["workspace_id"], r["root_pane"]["pane_id"]
+        sh(*HERDR, "pane", "run", root, f"sh -c '{CHATTY}'")
+        idle = self.j("pane", "split", root, "--direction", "right", "--cwd", CWD, "--no-focus")["pane"]["pane_id"]
+        self.split[ws] = idle
+        return ws, root
+
+    def idle_tab(self, ws):
+        return self.split[ws]
+
+    def send(self, ws, s, text):
+        sh(*HERDR, "pane", "run", s, text.rstrip("\n"))
+
+    def screen(self, ws, s):
+        return sh(*HERDR, "pane", "read", s, "--source", "visible")
+
+    def select(self, ws):
+        sh(*HERDR, "workspace", "focus", ws, check=False)
+
+    def selected(self):
+        for w in self.j("workspace", "list")["workspaces"]:
+            if w.get("focused"):
+                return w["workspace_id"]
+
+    def close(self, ws):
+        sh(*HERDR, "workspace", "close", ws, check=False)
+
+
+app = {"lmux": Lmux, "cmux": Cmux, "herdr": Herdr}[APP]()
 
 
 # --- measurements ------------------------------------------------------------
@@ -154,6 +196,8 @@ def proc_name(cmd):
     exe = cmd.split()[0].rsplit("/", 1)[-1]
     if exe == "lmux" and " server" in cmd:
         return "daemon"
+    if exe == "herdr":
+        return "server" if cmd.rstrip().endswith("server") else "client"
     return {"lmux-app": "app", "cmux": "cmux"}.get(exe, exe)
 
 

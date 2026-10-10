@@ -1,6 +1,6 @@
 //! Split layout: pane rectangles, focus ring, inline tabs and draggable dividers.
 
-use egui::{Align2, CornerRadius, Id, Rect, Sense, Stroke, Ui, Vec2};
+use egui::{CornerRadius, Id, Rect, Sense, Stroke, Ui, Vec2};
 use lmux_proto::methods as m;
 use lmux_proto::{SplitDirection, SurfaceKind, Workspace};
 
@@ -15,13 +15,17 @@ pub fn show(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
     let Some(ws) = c.state.selected_workspace().cloned() else {
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, theme::MAIN_BG);
-        p.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "no workspace selected",
-            theme::ui(13.0),
-            theme::DIM_2,
-        );
+        let connecting = c.net.state != crate::net::ConnState::Connected;
+        let (caption, detail) = if connecting {
+            ("Lighting up", format!("connecting to {}", c.net.host_name()))
+        } else {
+            ("Pilot light on", "Press ⌘N for a new workspace, or pick one in the sidebar".to_owned())
+        };
+        let time = ui.input(|i| i.time);
+        super::icons::flame_screen(&p, rect, caption, &detail, if c.state.animate { time } else { 0.0 });
+        if connecting && c.state.animate {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(330));
+        }
         c.state.cancel_tab_drag();
         return;
     };

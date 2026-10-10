@@ -46,6 +46,8 @@ pub struct LmuxApp {
     /// Browser panes drawn as native WebKit views.
     #[cfg(target_os = "macos")]
     webviews: crate::webview::Webviews,
+    /// The macOS menu bar; kept so its items stay installed.
+    _menu: Option<crate::menu::MenuBar>,
 }
 
 impl LmuxApp {
@@ -118,6 +120,7 @@ impl LmuxApp {
             dock_badge: 0,
             #[cfg(target_os = "macos")]
             webviews: Default::default(),
+            _menu: crate::menu::install(&cc.egui_ctx),
         }
     }
 
@@ -174,6 +177,10 @@ impl eframe::App for LmuxApp {
         self.pump(&ctx);
 
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        // Full screen hides the traffic lights, so the sidebar's icons move
+        // into the space they leave.
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        theme::set_traffic_lights(cfg!(target_os = "macos") && !fullscreen);
 
         // --- input --------------------------------------------------------
         if !minimized {
@@ -183,6 +190,9 @@ impl eframe::App for LmuxApp {
                 let h = &mut self.hosts[active];
                 let mut c = ui::Ctx { state: &mut h.state, net: &mut h.net };
                 shortcuts(&ctx, &mut c);
+                for pick in crate::menu::take_picks() {
+                    menu_pick(&ctx, &mut c, &pick);
+                }
                 let text_editing = ctx.memory(|mem| mem.focused().is_some());
                 // A dialog or the palette owns the keyboard while it is open.
                 let modal = c.state.confirm_close.is_some()
@@ -656,6 +666,7 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
     if sb_w > 0.0 {
         sidebar::show_hosts(ui, sidebar_rect, hosts, active);
     }
+    let unread: u32 = hosts.iter().map(|h| h.state.unread_total()).sum();
     let (left, right) = hosts.split_at_mut(active);
     let Some((c, right)) = right.split_first_mut() else { return };
 
@@ -691,19 +702,41 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
 
     if c.state.sidebar_hidden {
         let hit = Rect::from_min_size(
-            egui::pos2(header_rect.min.x + theme::titlebar_inset() + 4.0, header_rect.min.y + 4.0),
-            Vec2::splat(22.0),
+            egui::pos2(header_rect.min.x + theme::titlebar_inset() + 4.0, header_rect.min.y + 2.0),
+            Vec2::splat(26.0),
         );
         let resp = ui.interact(hit, Id::new("show-sidebar"), Sense::click());
+        if resp.hovered() {
+            ui.painter().rect_filled(hit, egui::CornerRadius::same(6), theme::chip_hover_bg());
+        }
         let color = if resp.hovered() { theme::TEXT } else { theme::DIM };
         icons::sidebar_toggle(
             &ui.painter(),
-            Rect::from_center_size(hit.center(), Vec2::splat(13.0)),
+            Rect::from_center_size(hit.center(), Vec2::splat(theme::STRIP_ICON)),
             color,
         );
         if resp.clicked() {
             c.state.sidebar_hidden = false;
         }
+    }
+
+    // The notifications bell, in the window's top-right corner.
+    {
+        let hit = Rect::from_center_size(egui::pos2(header_rect.max.x - 22.0, header_rect.center().y), Vec2::splat(26.0));
+        let resp = ui.interact(hit, Id::new("header-bell"), Sense::click());
+        let p = ui.painter();
+        if resp.hovered() || c.state.notif_open {
+            p.rect_filled(hit, egui::CornerRadius::same(6), theme::chip_active_bg());
+        }
+        let color = if resp.hovered() || c.state.notif_open { theme::TEXT } else { theme::DIM };
+        icons::bell(p, Rect::from_center_size(hit.center(), Vec2::splat(theme::STRIP_ICON)), color);
+        if unread > 0 {
+            icons::badge(p, hit.center() + Vec2::new(8.0, -7.0), unread);
+        }
+        if resp.clicked() {
+            c.state.notif_open = !c.state.notif_open;
+        }
+        resp.on_hover_text("Notifications (⌘I)");
     }
 
     let mut content = Rect::from_min_max(egui::pos2(main_rect.min.x, header_rect.max.y), main_rect.max);
@@ -713,13 +746,13 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
         let banner = Rect::from_min_size(content.min, Vec2::new(content.width(), h));
         let (bg, fg, text) = match c.net.state {
             ConnState::Connecting => (
-                Color32::from_rgb(0x3A, 0x2E, 0x10),
+                Color32::from_rgb(0x2E, 0x1C, 0x10),
                 theme::AMBER,
                 format!("connecting to {}…", c.net.host_name()),
             ),
             _ => (
-                Color32::from_rgb(0x3A, 0x16, 0x16),
-                Color32::from_rgb(0xFF, 0xB4, 0xB4),
+                Color32::from_rgb(0x3A, 0x16, 0x0E),
+                Color32::from_rgb(0xFF, 0xB8, 0x9A),
                 match c.net.last_error.as_deref() {
                     Some(err) => format!("disconnected · {err}"),
                     None => "disconnected — reconnecting…".to_owned(),
@@ -1335,6 +1368,17 @@ fn confirm_cloud_delete_dialog(ctx: &egui::Context, c: &mut ui::Ctx) {
     }
 }
 
+/// A pick from the menu bar: a palette command, or one of the menu's own ids.
+fn menu_pick(ctx: &egui::Context, c: &mut ui::Ctx, id: &str) {
+    let palette = |mode| crate::state::Palette { mode, query: String::new(), index: 0 };
+    match id {
+        crate::menu::OPEN_PALETTE => c.state.palette = Some(palette(crate::state::PaletteMode::Commands)),
+        crate::menu::GO_TO_WORKSPACE => c.state.palette = Some(palette(crate::state::PaletteMode::Workspaces)),
+        crate::menu::WEBSITE => ctx.open_url(egui::OpenUrl::new_tab("https://lmux.lintlabs.org")),
+        name => run_command(c, name),
+    }
+}
+
 /// Run a palette command on the host on screen. Names are those in
 /// `ui::palette::COMMANDS`.
 pub fn run_command(c: &mut ui::Ctx, name: &str) {
@@ -1379,7 +1423,7 @@ pub fn run_command(c: &mut ui::Ctx, name: &str) {
         "Split Down" => split(c, &focused_pane, &active_surface, "down"),
         "Toggle Pane Zoom" => c.state.toggle_zoom(),
         "Toggle Sidebar" => c.state.sidebar_hidden = !c.state.sidebar_hidden,
-        "Show Notifications" => c.state.notif_open = true,
+        "Show Notifications" => c.state.notif_open = !c.state.notif_open,
         "Jump to Latest Unread" => {
             c.state.jump_to_unread();
         }

@@ -26,7 +26,10 @@ fn main() -> eframe::Result<()> {
             .with_title_shown(false)
             // Transparent titlebar: otherwise macOS draws a vibrancy material
             // over the top strip and blurs our crisp glyphs away.
-            .with_titlebar_shown(false),
+            .with_titlebar_shown(false)
+            // An empty icon tells eframe to leave the Dock icon alone, so the
+            // bundle's lmux.icns shows; without one eframe swaps in egui's logo.
+            .with_icon(egui::IconData::default()),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };

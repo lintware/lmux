@@ -16,16 +16,18 @@ lmux is a workspace app for running coding agents across your own machines. Term
 
 ## Why it's lean
 
-The same workload in both apps on one MacBook Air: each workspace has a terminal printing about 20 lines a second plus an idle split. The figures are what each app added on top of its idle state ([`deploy/bench/stress.py`](deploy/bench/stress.py)).
+The same workload in each app on one MacBook Air: each workspace has a terminal printing about 20 lines a second plus an idle split. The figures are what each app added on top of its idle state ([`deploy/bench/stress.py`](deploy/bench/stress.py)).
 
-| | cmux | lmux |
-|---|---|---|
-| App on disk | 744 MB | 29 MB |
-| Memory, 40 workspaces | +698 MB | about +100 MB |
-| CPU, 40 workspaces | 15.5% | 10% (the app itself 1.7%) |
-| Each command an agent runs | ~170 ms | ~3 ms |
-| Creating 40 workspaces | 11.5 s | 0.3 s |
-| Most tested | 40 workspaces | 200 workspaces, 400 live terminals |
+| | cmux | herdr | lmux |
+|---|---|---|---|
+| App on disk | 744 MB | 20 MB | 29 MB |
+| Memory, 40 workspaces | +698 MB | +208 MB | about +100 MB |
+| CPU, 40 workspaces | 15.5% | 5.5% | 10% (the app itself 1.7%) |
+| Each command an agent runs | ~170 ms | ~25 ms | ~3 ms |
+| Creating 40 workspaces | 11.5 s | 1.8 s | 0.3 s |
+| Most tested | 40 workspaces | 40 workspaces | 200 workspaces, 400 live terminals |
+
+herdr is terminals only (no browser panes) and was measured with its TUI client attached, in its own session, with the same script (`deploy/bench/stress.py herdr 5 10 20 40`).
 
 The app draws only the pane on screen. With 400 terminals open and 200 of them printing, its own CPU stayed at 1.9%, the same as idle. macOS's limit of 511 terminals (shared by every app) is reached before lmux's.
 
