@@ -641,33 +641,35 @@ fn folder_rename_editor(
         egui::pos2(text_x - 2.0 + width, row.max.y - 3.0),
     );
     let edit_id = Id::new(("folder-rename", &c.state.host_salt, &folder.id));
-    ui.scope_builder(
+    // A child, not `scope_builder`, so the editor does not move the list's cursor.
+    let mut edit_ui = ui.new_child(
         UiBuilder::new().max_rect(edit_rect).layout(egui::Layout::left_to_right(egui::Align::Center)),
-        |ui| {
-            ui.style_mut().visuals.extreme_bg_color = Color32::from_rgb(0x2A, 0x2A, 0x2A);
-            ui.style_mut().visuals.selection.bg_fill = theme::ACCENT;
-            let out = ui.add(
-                egui::TextEdit::singleline(&mut text)
-                    .id(edit_id)
-                    .font(theme::ui_semibold(theme::FS_BODY))
-                    .text_color(theme::TEXT)
-                    .desired_width(edit_rect.width().max(24.0)),
-            );
-            if !ren.focus_requested {
-                out.request_focus();
-            }
-            if out.lost_focus() {
-                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    commit = true;
-                } else {
-                    cancel = true;
-                }
-            }
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+    );
+    {
+        let ui = &mut edit_ui;
+        ui.style_mut().visuals.extreme_bg_color = Color32::from_rgb(0x2A, 0x2A, 0x2A);
+        ui.style_mut().visuals.selection.bg_fill = theme::ACCENT;
+        let out = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .id(edit_id)
+                .font(theme::ui_semibold(theme::FS_BODY))
+                .text_color(theme::TEXT)
+                .desired_width(edit_rect.width().max(24.0)),
+        );
+        if !ren.focus_requested {
+            out.request_focus();
+        }
+        if out.lost_focus() {
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                commit = true;
+            } else {
                 cancel = true;
             }
-        },
-    );
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+    }
 
     if commit {
         let name = text.trim().to_owned();
@@ -1083,33 +1085,37 @@ fn ws_rename_editor(ui: &mut Ui, rect: Rect, ws: &Workspace, c: &mut Ctx) {
     let mut commit = false;
     let mut cancel = false;
     let edit_id = Id::new(("ws-rename", &c.state.host_salt, &ws.id));
-    ui.scope_builder(
+    // A child, not `scope_builder`: that would move the list's cursor to the
+    // editor's bottom edge, which is inside the card, and draw the rows below
+    // (the next host's header too) over it.
+    let mut edit_ui = ui.new_child(
         UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)),
-        |ui| {
-            ui.style_mut().visuals.extreme_bg_color = Color32::from_rgb(0x2A, 0x2A, 0x2A);
-            ui.style_mut().visuals.selection.bg_fill = theme::ACCENT;
-            let out = ui.add(
-                egui::TextEdit::singleline(&mut text)
-                    .id(edit_id)
-                    .font(theme::ui_semibold(theme::FS_TITLE))
-                    .text_color(theme::TEXT)
-                    .desired_width(rect.width().max(24.0)),
-            );
-            if !ren.focus_requested {
-                out.request_focus();
-            }
-            if out.lost_focus() {
-                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    commit = true;
-                } else {
-                    cancel = true;
-                }
-            }
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+    );
+    {
+        let ui = &mut edit_ui;
+        ui.style_mut().visuals.extreme_bg_color = Color32::from_rgb(0x2A, 0x2A, 0x2A);
+        ui.style_mut().visuals.selection.bg_fill = theme::ACCENT;
+        let out = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .id(edit_id)
+                .font(theme::ui_semibold(theme::FS_TITLE))
+                .text_color(theme::TEXT)
+                .desired_width(rect.width().max(24.0)),
+        );
+        if !ren.focus_requested {
+            out.request_focus();
+        }
+        if out.lost_focus() {
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                commit = true;
+            } else {
                 cancel = true;
             }
-        },
-    );
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+    }
     if commit {
         let title = text.trim().to_owned();
         if !title.is_empty() && title != ws.title {
