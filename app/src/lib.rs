@@ -16,6 +16,7 @@ pub mod term;
 pub mod termio;
 pub mod theme;
 pub mod ui;
+pub mod usage;
 pub mod util;
 pub mod wire;
 #[cfg(target_os = "macos")]

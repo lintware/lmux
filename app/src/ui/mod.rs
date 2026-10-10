@@ -10,6 +10,7 @@ pub mod pane;
 pub mod sidebar;
 pub mod tabstrip;
 pub mod terminal;
+pub mod usage;
 
 use crate::net::Net;
 use crate::state::AppState;

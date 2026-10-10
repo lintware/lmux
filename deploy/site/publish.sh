@@ -57,5 +57,10 @@ cat > "$out/public/_headers" <<'H'
 H
 
 echo "==> deploying"
+# wrangler's own login expires; the `cf` CLI's OAuth token works as its API token.
+if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+  CLOUDFLARE_API_TOKEN=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/Library/Preferences/cloudflare/config/default.json')))['oauth_token'])" 2>/dev/null || true)
+  export CLOUDFLARE_API_TOKEN
+fi
 (cd "$repo/deploy/site" && wrangler deploy --assets "$out/public")
 echo "==> done: https://lmux.lintlabs.org"
