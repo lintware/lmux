@@ -37,7 +37,7 @@ if gh release view "$tag" >/dev/null 2>&1; then echo "release $tag already exist
 
 notes=$(awk -v v="$version" '
   /^## / { if (on) exit; if ($2 == v || $2 == "[" v "]") { on = 1; next } }
-  on { print }' CHANGELOG.md)
+  on && !/^\[[^]]+\]: / { print }' CHANGELOG.md)
 [ -n "$(printf '%s' "$notes" | tr -d '[:space:]')" ] || { echo "CHANGELOG.md has no section for $version"; exit 1; }
 
 echo "==> building lmux.app"
