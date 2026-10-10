@@ -4,143 +4,264 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>lmux · lean mux</title>
-<meta name="description" content="lmux, the lean mux: cmux's workspace window and herdr's persistence in one small app. Terminals, browsers and agents keep running on your Mac and your servers.">
+<meta name="description" content="lmux, the lean mux: cmux's workspace window and herdr's persistence in one 29 MB app. Terminals, browsers and agents keep running on your Mac and your servers.">
+<meta name="theme-color" content="#07070a">
+<meta property="og:title" content="lmux · close the laptop, nothing stops">
+<meta property="og:description" content="cmux's window, herdr's persistence, tmux inside. 29 MB, MIT licensed, and every terminal, browser and agent survives quit, reboot and lost network.">
 <link rel="icon" href="icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
-  /* Matches lintlabs.org: neutral greys, Inter, black headlines, pill buttons. */
   :root {
-    --n50: #fafafa; --n100: #f5f5f5; --n200: #e5e5e5; --n300: #d4d4d4; --n400: #a3a3a3;
-    --n500: #737373; --n600: #525252; --n700: #404040; --n800: #262626; --n900: #171717; --n950: #0a0a0a;
-    --accent: #0a84ff;
+    --bg: #07070a; --bg2: #0c0c11; --panel: #111117; --line: #ffffff17; --line2: #ffffff2b;
+    --text: #f5f5f7; --dim: #a1a1aa; --mute: #6b6b76;
+    --blue: #0a84ff; --cyan: #64d2ff; --violet: #8b5cf6; --green: #30d158; --orange: #ff9f0a;
+    --grad: linear-gradient(100deg, #64d2ff 0%, #0a84ff 40%, #8b5cf6 100%);
     --font: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
-    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   * { box-sizing: border-box; }
-  html { color-scheme: light; }
-  body { margin: 0; background: #fff; color: var(--n900); font: 16px/1.6 var(--font); -webkit-font-smoothing: antialiased; }
+  html { color-scheme: dark; scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.6 var(--font); -webkit-font-smoothing: antialiased; overflow-x: hidden; }
   a { color: inherit; }
+  ::selection { background: #0a84ff66; }
 
-  nav.liquid {
-    position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 50;
-    width: min(96%, 900px); display: flex; align-items: center; justify-content: space-between;
-    padding: 6px; border-radius: 999px;
-    background: #ffffffd1; backdrop-filter: blur(24px) saturate(180%); -webkit-backdrop-filter: blur(24px) saturate(180%);
-    border: 1px solid rgba(0,0,0,.08); box-shadow: 0 12px 36px -12px #0000001f, 0 0 0 1px #00000008;
-  }
-  nav.liquid .brand { display: flex; align-items: center; gap: 10px; padding-left: 8px; text-decoration: none; }
-  nav.liquid .brand img { height: 26px; opacity: .9; }
-  nav.liquid .brand span { font-size: 12px; font-weight: 700; color: #0000008c; border-left: 1px solid var(--n200); padding-left: 10px; }
-  .pill-sm {
-    display: inline-flex; align-items: center; height: 36px; padding: 0 16px; border-radius: 999px;
-    background: var(--n900); color: #fff; font-size: 12px; font-weight: 700; text-decoration: none;
-    transition: transform .3s; box-shadow: 0 1px 2px #0000000d;
-  }
-  .pill-sm:hover { transform: scale(1.05); }
+  /* ambient light behind everything */
+  .glow { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
+  .glow i { position: absolute; border-radius: 50%; filter: blur(110px); opacity: .5; will-change: transform; }
+  .glow i:nth-child(1) { width: 640px; height: 640px; background: #0a84ff; top: -260px; left: -140px; opacity: .34; animation: drift 22s ease-in-out infinite alternate; }
+  .glow i:nth-child(2) { width: 560px; height: 560px; background: #8b5cf6; top: 80px; right: -200px; opacity: .3; animation: drift 28s ease-in-out infinite alternate-reverse; }
+  .glow i:nth-child(3) { width: 480px; height: 480px; background: #64d2ff; top: 520px; left: 38%; opacity: .14; animation: drift 34s ease-in-out infinite alternate; }
+  @keyframes drift { to { transform: translate(90px, 70px) scale(1.15); } }
+  .grain { position: fixed; inset: 0; z-index: 0; pointer-events: none;
+    background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 64px 64px; opacity: .22;
+    mask-image: radial-gradient(ellipse 70% 55% at 50% 0%, #000, transparent 75%); -webkit-mask-image: radial-gradient(ellipse 70% 55% at 50% 0%, #000, transparent 75%); }
+  main, footer, nav { position: relative; z-index: 1; }
 
-  .hero {
-    background: var(--n200); padding: 136px 24px 64px; text-align: center; overflow: hidden;
-    background-image: radial-gradient(ellipse at top, #ffffff99, transparent 60%);
+  nav.top {
+    position: fixed; top: 18px; left: 50%; transform: translateX(-50%); z-index: 50;
+    width: min(94%, 920px); display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 6px 6px 16px; border-radius: 999px;
+    background: #0c0c11b3; backdrop-filter: blur(22px) saturate(160%); -webkit-backdrop-filter: blur(22px) saturate(160%);
+    border: 1px solid var(--line2); box-shadow: 0 16px 40px -16px #000c;
   }
-  .eyebrow { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .28em; color: var(--n500); margin: 0 0 12px; }
-  h1 { font-size: clamp(40px, 8vw, 72px); font-weight: 900; letter-spacing: -0.035em; line-height: 1.05; margin: 0 auto 14px; max-width: 760px; }
-  .lede { font-size: clamp(16px, 2.2vw, 18px); color: var(--n600); max-width: 560px; margin: 0 auto 32px; }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; font-weight: 800; letter-spacing: -.02em; }
+  .brand img { height: 22px; filter: invert(1) brightness(1.6); opacity: .9; }
+  .brand span { font-size: 13px; color: var(--dim); font-weight: 600; border-left: 1px solid var(--line2); padding-left: 10px; }
+  .links { display: flex; align-items: center; gap: 4px; }
+  .links a { font-size: 13px; font-weight: 500; color: var(--dim); text-decoration: none; padding: 8px 12px; border-radius: 999px; transition: color .2s, background .2s; }
+  .links a:hover { color: var(--text); background: #ffffff0f; }
+  .links a.go { background: #fff; color: #000; font-weight: 700; padding: 9px 18px; margin-left: 6px; }
+  .links a.go:hover { background: #e4e4e7; transform: scale(1.04); }
+
+  /* hero */
+  .hero { padding: 150px 24px 0; text-align: center; }
+  .pill { display: inline-flex; align-items: center; gap: 10px; padding: 6px 14px 6px 8px; border-radius: 999px; border: 1px solid var(--line2); background: #ffffff09; font-size: 13px; color: var(--dim); text-decoration: none; margin-bottom: 28px; transition: border-color .2s; }
+  .pill:hover { border-color: #ffffff55; }
+  .pill b { background: var(--grad); color: #000; font-size: 11px; font-weight: 800; letter-spacing: .06em; padding: 3px 9px; border-radius: 999px; }
+  h1 { font-size: clamp(44px, 9vw, 96px); font-weight: 900; letter-spacing: -0.05em; line-height: .98; margin: 0 auto 22px; max-width: 980px; }
+  h1 .g { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; background-size: 200% 100%; animation: shine 7s linear infinite; }
+  @keyframes shine { to { background-position: -200% 0; } }
+  .lede { font-size: clamp(17px, 2.2vw, 20px); color: var(--dim); max-width: 640px; margin: 0 auto 34px; }
+  .lede b { color: var(--text); font-weight: 600; }
   .actions { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
-  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 14px 32px; border-radius: 999px; font-weight: 600; text-decoration: none; transition: background .2s, border-color .2s; }
-  .btn-dark { background: var(--n900); color: #fff; box-shadow: 0 10px 15px -3px #0000001a, 0 4px 6px -4px #0000001a; }
-  .btn-dark:hover { background: var(--n800); }
-  .btn-ghost { border: 1px solid var(--n400); background: #ffffff99; color: var(--n700); font-weight: 500; }
-  .btn-ghost:hover { border-color: var(--n900); }
-  .meta { font-size: 13px; color: var(--n500); margin: 14px 0 0; }
+  .btn { display: inline-flex; align-items: center; gap: 10px; padding: 15px 30px; border-radius: 999px; font-weight: 700; font-size: 16px; text-decoration: none; transition: transform .25s, background .2s, border-color .2s, box-shadow .3s; }
+  .btn-primary { background: #fff; color: #000; box-shadow: 0 0 0 0 #0a84ff00, 0 14px 40px -10px #0a84ff80; }
+  .btn-primary:hover { transform: translateY(-2px) scale(1.02); box-shadow: 0 0 0 6px #0a84ff22, 0 20px 50px -10px #0a84ffb0; }
+  .btn-ghost { border: 1px solid var(--line2); background: #ffffff08; color: var(--text); font-weight: 600; }
+  .btn-ghost:hover { border-color: #ffffff66; background: #ffffff10; }
+  .btn svg { width: 18px; height: 18px; }
+  .meta { font-size: 13px; color: var(--mute); margin: 16px 0 0; }
 
-  /* The animated demo (demo.html): Claude drives a browser, the laptop closes, everything comes back. */
-  .demo { max-width: 920px; margin: 48px auto 0; aspect-ratio: 960 / 560; }
-  .demo iframe { display: block; width: 100%; height: 100%; border: 0; border-radius: 14px; box-shadow: 0 30px 60px -20px #00000059; background: #1c1c1e; }
+  .stage { max-width: 1000px; margin: 64px auto 0; position: relative; }
+  .stage::before { content: ""; position: absolute; inset: -2px; border-radius: 22px; background: var(--grad); opacity: .45; filter: blur(34px); z-index: -1; }
+  .demo { aspect-ratio: 960 / 560; border-radius: 16px; overflow: hidden; border: 1px solid var(--line2); background: #1c1c1e; box-shadow: 0 40px 90px -30px #000; }
+  .demo iframe { display: block; width: 100%; height: 100%; border: 0; }
 
-  section { padding: 72px 24px; }
+  /* numbers strip */
+  .numbers { max-width: 1000px; margin: 56px auto 0; display: grid; grid-template-columns: repeat(4, 1fr); border: 1px solid var(--line); border-radius: 20px; background: #ffffff05; overflow: hidden; }
+  .numbers div { padding: 26px 22px; border-right: 1px solid var(--line); text-align: left; }
+  .numbers div:last-child { border-right: 0; }
+  .numbers .v { display: block; font-size: clamp(30px, 4.4vw, 46px); font-weight: 900; letter-spacing: -.04em; line-height: 1.05; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .numbers .l { display: block; margin-top: 6px; font-size: 13px; color: var(--dim); }
+
+  section { padding: 120px 24px 0; }
   .wrap { max-width: 1000px; margin: 0 auto; }
-  .alt { background: var(--n50); border-top: 1px solid var(--n200); border-bottom: 1px solid var(--n200); }
-  h2 { font-size: clamp(28px, 4vw, 36px); font-weight: 700; letter-spacing: -0.025em; margin: 0 0 12px; }
-  .sub { color: var(--n600); margin: 0 0 36px; max-width: 620px; }
-  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-  .card { border: 1px solid var(--n200); background: #fff; border-radius: 16px; padding: 24px; transition: border-color .2s, box-shadow .2s; }
-  .card:hover { border-color: var(--n900); box-shadow: 0 4px 6px -1px #0000001a; }
-  .card .n { font-size: 11px; font-weight: 700; color: var(--n400); letter-spacing: .2em; }
-  h3 { font-size: 18px; font-weight: 900; letter-spacing: -0.02em; margin: 8px 0 8px; color: var(--n950); }
-  .card p { margin: 0; color: var(--n600); font-size: 15px; }
-  code { font: 13px var(--mono); background: var(--n100); border: 1px solid var(--n200); padding: 1px 6px; border-radius: 6px; }
-  .note { margin-top: 20px; border: 1px solid var(--n200); background: #fff; border-radius: 16px; padding: 18px 22px; font-size: 15px; color: var(--n700); }
+  .kicker { font-size: 12px; font-weight: 700; letter-spacing: .24em; text-transform: uppercase; color: var(--cyan); margin: 0 0 14px; }
+  h2 { font-size: clamp(32px, 5.2vw, 54px); font-weight: 900; letter-spacing: -.04em; line-height: 1.04; margin: 0 0 16px; max-width: 760px; }
+  .sub { color: var(--dim); font-size: 18px; max-width: 640px; margin: 0 0 44px; }
+  code { font: 13px var(--mono); background: #ffffff10; border: 1px solid var(--line); padding: 2px 7px; border-radius: 7px; color: var(--text); }
 
-  .wordmark { font-size: 15px; font-weight: 600; color: var(--n600); margin: 0 0 10px; letter-spacing: -0.01em; }
-  .wordmark b { color: var(--n950); font-weight: 900; }
-  .mix { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 0 0 28px; }
-  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 999px; background: #ffffffb3; border: 1px solid var(--n300); font-size: 13px; font-weight: 600; color: var(--n800); }
-  .chip.plus { background: none; border: 0; padding: 6px 2px; color: var(--n400); }
-  .chip.eq { background: var(--n900); border-color: var(--n900); color: #fff; }
-  .card .from { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; color: var(--n500); }
-  .card ul { margin: 12px 0 0; padding-left: 18px; color: var(--n600); font-size: 14.5px; }
-  .card ul li { margin-bottom: 4px; }
-  .card .drop { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--n200); font-size: 13.5px; color: var(--n500); }
-  .card .drop b { color: var(--n700); }
-  .stats { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid var(--n200); border-radius: 16px; overflow: hidden; font-size: 15px; }
-  .stats th, .stats td { text-align: left; padding: 12px 18px; border-bottom: 1px solid var(--n200); }
-  .stats tr:last-child td { border-bottom: 0; }
-  .stats th { font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--n500); background: var(--n50); }
-  .stats td:nth-child(2) { color: var(--n500); }
-  .stats td:nth-child(3) { font-weight: 700; color: var(--n950); }
-  .fine { font-size: 13px; color: var(--n500); margin: 12px 0 0; }
+  /* terminal showing the persistence story */
+  .split { display: grid; grid-template-columns: 1.05fr 1fr; gap: 28px; align-items: center; }
+  .term { border-radius: 16px; border: 1px solid var(--line2); background: #0a0a0e; overflow: hidden; box-shadow: 0 30px 70px -30px #000; }
+  .term .bar { display: flex; gap: 7px; padding: 12px 14px; border-bottom: 1px solid var(--line); background: #ffffff05; align-items: center; }
+  .term .bar i { width: 11px; height: 11px; border-radius: 50%; background: #ff5f57; }
+  .term .bar i:nth-child(2) { background: #febc2e; } .term .bar i:nth-child(3) { background: #28c840; }
+  .term .bar span { margin-left: 10px; font: 12px var(--mono); color: var(--mute); }
+  .term pre { margin: 0; padding: 18px 18px 22px; font: 13px/1.75 var(--mono); color: #d4d4d8; min-height: 330px; white-space: pre-wrap; }
+  .term .p { color: var(--green); } .term .d { color: var(--mute); } .term .b { color: var(--cyan); } .term .o { color: var(--orange); }
+  .term .cur { display: inline-block; width: 8px; height: 15px; background: #d4d4d8; vertical-align: -2px; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
+  .steps li { display: grid; grid-template-columns: 38px 1fr; gap: 14px; align-items: start; }
+  .steps .n { width: 38px; height: 38px; border-radius: 12px; border: 1px solid var(--line2); display: grid; place-items: center; font: 600 13px var(--mono); color: var(--cyan); background: #ffffff06; }
+  .steps b { display: block; font-size: 17px; letter-spacing: -.01em; }
+  .steps span { color: var(--dim); font-size: 15px; }
 
-  footer { background: var(--n50); border-top: 1px solid var(--n200); padding: 40px 24px; }
-  footer .wrap { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; font-size: 14px; color: var(--n500); }
-  footer a { text-decoration: none; }
-  footer a:hover { color: var(--n950); }
+  /* bento */
+  .bento { display: grid; grid-template-columns: repeat(6, 1fr); gap: 14px; }
+  .tile { position: relative; border: 1px solid var(--line); border-radius: 22px; padding: 28px; background: linear-gradient(180deg, #ffffff0a, #ffffff03); overflow: hidden; transition: border-color .3s, transform .3s; }
+  .tile::after { content: ""; position: absolute; inset: 0; background: radial-gradient(420px circle at var(--mx, 50%) var(--my, 0%), #0a84ff1f, transparent 60%); opacity: 0; transition: opacity .3s; pointer-events: none; }
+  .tile:hover { border-color: var(--line2); transform: translateY(-3px); }
+  .tile:hover::after { opacity: 1; }
+  .tile.w3 { grid-column: span 3; } .tile.w2 { grid-column: span 2; } .tile.w4 { grid-column: span 4; }
+  .tile .tag { font-size: 11px; font-weight: 700; letter-spacing: .18em; text-transform: uppercase; color: var(--mute); }
+  .tile h3 { font-size: 24px; font-weight: 800; letter-spacing: -.03em; margin: 10px 0 8px; line-height: 1.15; }
+  .tile p { margin: 0; color: var(--dim); font-size: 15.5px; }
+  .tile ul { margin: 14px 0 0; padding: 0; list-style: none; display: grid; gap: 7px; font-size: 15px; color: #d4d4d8; }
+  .tile li::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--blue); margin-right: 10px; vertical-align: 2px; }
+  .tile .drop { margin-top: 18px; padding-top: 14px; border-top: 1px dashed var(--line2); font-size: 13.5px; color: var(--mute); }
+  .tile .drop b { color: var(--dim); }
+  .hosts { display: grid; gap: 8px; margin-top: 20px; }
+  .hostrow { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 12px; background: #ffffff08; border: 1px solid var(--line); font: 13px var(--mono); color: #d4d4d8; }
+  .hostrow i { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px var(--green); }
+  .hostrow span { margin-left: auto; color: var(--mute); font-size: 12px; }
+  .engine { margin-top: 20px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 13px; font-weight: 600; }
+  .engine .c { padding: 6px 14px; border-radius: 999px; border: 1px solid var(--line2); background: #ffffff08; }
+  .engine .x { color: var(--mute); }
+  .engine .eq { background: #fff; color: #000; border-color: #fff; }
 
-  @media (max-width: 760px) {
-    .grid { grid-template-columns: 1fr; }
-    .stats th, .stats td { padding: 10px 12px; font-size: 14px; }
-    nav.liquid .brand span { display: none; }
+  /* lean bars */
+  .bars { display: grid; gap: 14px; }
+  .row { border: 1px solid var(--line); border-radius: 18px; padding: 20px 24px; background: #ffffff05; }
+  .row h4 { margin: 0 0 14px; font-size: 14px; font-weight: 600; color: var(--dim); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .row h4 em { font-style: normal; color: var(--green); font-weight: 700; }
+  .meter { display: grid; grid-template-columns: 56px 1fr 130px; align-items: center; gap: 14px; margin-top: 8px; font-size: 13px; }
+  .meter label { color: var(--mute); font-weight: 600; }
+  .track { height: 12px; border-radius: 99px; background: #ffffff0a; overflow: hidden; }
+  .fill { height: 100%; width: 0; border-radius: 99px; transition: width 1.4s cubic-bezier(.2,.8,.2,1); min-width: 6px; }
+  .fill.old { background: #52525b; }
+  .fill.new { background: var(--grad); box-shadow: 0 0 18px #0a84ff80; }
+  .meter b { font-family: var(--mono); font-size: 13px; font-weight: 600; text-align: right; }
+  .meter b.hi { color: var(--text); }
+  .meter b.lo { color: var(--dim); }
+  .fine { font-size: 14px; color: var(--mute); margin: 18px 0 0; max-width: 700px; }
+
+  /* install */
+  .install { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .install .tile .num { font: 600 13px var(--mono); color: var(--cyan); }
+  .note { margin-top: 14px; border: 1px solid #ff9f0a40; background: #ff9f0a0f; border-radius: 16px; padding: 16px 20px; font-size: 15px; color: #fcd9a0; }
+  .note b { color: #ffe3b3; }
+  .server { margin-top: 14px; display: grid; grid-template-columns: 1.1fr 1fr; gap: 14px; }
+  .cmdbox { position: relative; border-radius: 14px; border: 1px solid var(--line2); background: #0a0a0e; padding: 16px 18px; font: 13.5px/1.7 var(--mono); color: #d4d4d8; overflow-x: auto; white-space: pre; }
+  .cmdbox .d { color: var(--mute); }
+
+  .cta { margin: 140px auto 0; max-width: 1000px; text-align: center; border: 1px solid var(--line2); border-radius: 30px; padding: 72px 24px; position: relative; overflow: hidden;
+    background: radial-gradient(ellipse at 50% 0%, #0a84ff33, transparent 65%), radial-gradient(ellipse at 90% 100%, #8b5cf633, transparent 55%), #ffffff04; }
+  .cta h2 { margin: 0 auto 14px; }
+  .cta p { color: var(--dim); max-width: 520px; margin: 0 auto 30px; font-size: 18px; }
+
+  footer { margin-top: 110px; border-top: 1px solid var(--line); padding: 36px 24px 48px; }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 24px; justify-content: space-between; align-items: center; font-size: 14px; color: var(--mute); }
+  footer a { text-decoration: none; transition: color .2s; } footer a:hover { color: var(--text); }
+  footer nav { all: unset; display: flex; gap: 20px; }
+
+  .rv { opacity: 0; transform: translateY(26px); transition: opacity .8s cubic-bezier(.2,.7,.2,1), transform .8s cubic-bezier(.2,.7,.2,1); }
+  .rv.in { opacity: 1; transform: none; }
+
+  @media (max-width: 860px) {
+    .split, .server { grid-template-columns: 1fr; }
+    .bento { grid-template-columns: 1fr; }
+    .tile.w2, .tile.w3, .tile.w4 { grid-column: auto; }
+    .install { grid-template-columns: 1fr; }
+    .numbers { grid-template-columns: 1fr 1fr; }
+    .numbers div:nth-child(2) { border-right: 0; }
+    .numbers div:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+    .links a:not(.go) { display: none; }
+    .brand span { display: none; }
+    .meter { grid-template-columns: 48px 1fr 96px; }
+    section { padding-top: 88px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    .rv { opacity: 1; transform: none; }
+    .fill { width: var(--w) !important; }
   }
 </style>
 </head>
 <body>
-<nav class="liquid">
-  <a class="brand" href="https://lintlabs.org"><img src="lintlabs-logo.svg" alt="LintLabs"><span>lmux · lean mux</span></a>
-  <a class="pill-sm" href="lmux.dmg">Download</a>
+<div class="glow" aria-hidden="true"><i></i><i></i><i></i></div>
+<div class="grain" aria-hidden="true"></div>
+
+<nav class="top">
+  <a class="brand" href="https://lintlabs.org"><img src="lintlabs-logo.svg" alt="LintLabs"><span>lmux</span></a>
+  <div class="links">
+    <a href="#persistence">Persistence</a>
+    <a href="#built-in">Built in</a>
+    <a href="#lean">Lean</a>
+    <a href="#install">Install</a>
+    <a class="go" href="lmux.dmg">Download</a>
+  </div>
 </nav>
 
 <main>
   <div class="hero">
-    <p class="eyebrow">LintLabs · Open beta</p>
-    <p class="wordmark"><b>lmux</b> is the lean mux</p>
-    <h1>cmux and herdr, in one lean app.</h1>
-    <p class="lede">The cmux window you know, with herdr's persistence built in. Terminals, browsers and agents keep running on your Mac and your servers. Quit, reboot or lose the network, and everything is where you left it.</p>
-    <div class="mix" aria-label="cmux plus herdr plus tmux equals lmux">
-      <span class="chip">cmux window</span><span class="chip plus">+</span>
-      <span class="chip">herdr persistence</span><span class="chip plus">+</span>
-      <span class="chip">tmux inside</span><span class="chip plus">=</span>
-      <span class="chip eq">lmux</span>
-    </div>
+    <a class="pill" href="#lean"><b>29 MB</b><span>The whole app. cmux is 744 MB.</span></a>
+    <h1>Close the laptop.<br><span class="g">Nothing stops.</span></h1>
+    <p class="lede">lmux is <b>cmux's window</b> with <b>herdr's persistence</b> built in. Terminals, browsers and Claude sessions live on the machine they run on, so quitting, rebooting or losing the network changes nothing.</p>
     <div class="actions">
-      <a class="btn btn-dark" href="lmux.dmg">Download for Mac</a>
+      <a class="btn btn-primary" href="lmux.dmg">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-5-5m5 5l5-5M5 21h14"/></svg>
+        Download for Mac</a>
       <a class="btn btn-ghost" href="#install">How to install</a>
     </div>
-    <p class="meta">Version @VERSION@ · macOS 12 or later · Apple silicon</p>
+    <p class="meta">Version @VERSION@ · macOS 12 or later · Apple silicon · MIT licensed</p>
 
-    <div class="demo">
-      <iframe src="demo.html" title="lmux demo: Claude on a server drives a browser pane, the laptop closes, and every pane comes back where it was"></iframe>
+    <div class="stage rv">
+      <div class="demo">
+        <iframe src="demo.html" title="lmux demo: Claude on a server drives a browser pane, the laptop closes, and every pane comes back where it was"></iframe>
+      </div>
+    </div>
+
+    <div class="numbers rv">
+      <div><span class="v">29 MB</span><span class="l">app on disk, down from 744 MB</span></div>
+      <div><span class="v">3 ms</span><span class="l">per agent command, down from ~170 ms</span></div>
+      <div><span class="v">0.3 s</span><span class="l">to create 40 workspaces, down from 11.5 s</span></div>
+      <div><span class="v">400</span><span class="l">terminals tested across 200 workspaces</span></div>
     </div>
   </div>
 
+  <section id="persistence">
+    <div class="wrap">
+      <p class="kicker">Persistence</p>
+      <h2>Everything comes back exactly where you left it.</h2>
+      <p class="sub">Each computer runs a small lmux service that owns its terminals. The app on your Mac is only a view, so closing it stops nothing.</p>
+      <div class="split">
+        <div class="term rv" aria-label="A terminal session showing lmux resuming work after a reboot">
+          <div class="bar"><i></i><i></i><i></i><span>my-server · webapp</span></div>
+          <pre id="tty" data-fallback></pre>
+        </div>
+        <ol class="steps rv">
+          <li><div class="n">01</div><div><b>Work anywhere</b><span>Open a workspace on a server and every terminal in it runs there. No manual SSH.</span></div></li>
+          <li><div class="n">02</div><div><b>Walk away</b><span>Quit the app, close the lid, lose the network or reboot. Remote work keeps running.</span></div></li>
+          <li><div class="n">03</div><div><b>Come back</b><span>Same folder, same scrollback, same Claude session via <code>claude --resume</code>. Unread notifications say what happened.</span></div></li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
   <section id="built-in">
     <div class="wrap">
-      <h2>Built in together.</h2>
-      <p class="sub">lmux takes the parts of cmux and herdr people actually use and puts them in one app, with tmux underneath. You don't install or run any of them separately.</p>
-      <div class="grid">
-        <div class="card">
-          <span class="from">From cmux</span>
-          <h3>The window</h3>
+      <p class="kicker">Built in together</p>
+      <h2>The best parts of three tools. None of the setup.</h2>
+      <p class="sub">lmux takes what people actually use from cmux and herdr, and puts tmux underneath. You don't install or run any of them separately.</p>
+      <div class="bento">
+        <div class="tile w4 rv">
+          <span class="tag">From cmux</span>
+          <h3>The window you already know</h3>
           <ul>
             <li>Folders and workspaces in a sidebar</li>
             <li>Splits, tabs and browser panes</li>
@@ -150,85 +271,106 @@
           </ul>
           <div class="drop"><b>Left out:</b> the cloud VM service, team features, vault, recordings, the iOS simulator and ~25 background helpers.</div>
         </div>
-        <div class="card">
-          <span class="from">From herdr</span>
-          <h3>Persistence</h3>
-          <ul>
-            <li>Nothing closes for good</li>
-            <li>Quit, close the lid, lose the network or reboot</li>
-            <li>Every pane returns to the same folder and scrollback</li>
-            <li>Each Claude session resumes with <code>claude --resume</code></li>
-            <li>Browsers keep running while you're away</li>
-          </ul>
+        <div class="tile w2 rv">
+          <span class="tag">From herdr</span>
+          <h3>Nothing closes for good</h3>
+          <p>Every pane returns to the same folder and scrollback. Browsers keep running while you're away.</p>
           <div class="drop"><b>Left out:</b> nothing.</div>
         </div>
-        <div class="card">
-          <span class="from">From tmux</span>
-          <h3>The engine</h3>
-          <ul>
-            <li>Every terminal lives in tmux on its own machine</li>
-            <li>Keeps running with no window attached</li>
-            <li>tmux ships inside the app</li>
-          </ul>
-          <div class="drop"><b>Left out:</b> having to install it, configure it or remember its keys.</div>
+        <div class="tile w3 rv">
+          <span class="tag">Agents</span>
+          <h3>Claude gets a browser, you get a front-row seat</h3>
+          <p>Claude Code opens a browser pane on the same host, clicks, types, and works inside iframes and popups. You watch it live from your Mac.</p>
+        </div>
+        <div class="tile w3 rv">
+          <span class="tag">Hosts</span>
+          <h3>One sidebar, every machine</h3>
+          <div class="hosts">
+            <div class="hostrow"><i></i>this mac<span>local</span></div>
+            <div class="hostrow"><i></i>my-server<span>ssh · tailscale</span></div>
+            <div class="hostrow"><i></i>cloud box<span>planned</span></div>
+          </div>
+        </div>
+        <div class="tile w3 rv">
+          <span class="tag">From tmux</span>
+          <h3>The engine, hidden</h3>
+          <p>Every terminal lives in tmux on its own machine and keeps running with no window attached. tmux ships inside the app.</p>
+          <div class="drop"><b>Left out:</b> installing it, configuring it, remembering its keys.</div>
+        </div>
+        <div class="tile w3 rv">
+          <span class="tag">Equation</span>
+          <h3>It adds up</h3>
+          <div class="engine">
+            <span class="c">cmux window</span><span class="x">+</span>
+            <span class="c">herdr persistence</span><span class="x">+</span>
+            <span class="c">tmux inside</span><span class="x">=</span>
+            <span class="c eq">lmux</span>
+          </div>
         </div>
       </div>
     </div>
   </section>
 
-  <section class="alt" id="lean">
+  <section id="lean">
     <div class="wrap">
-      <h2>Why it's lean.</h2>
+      <p class="kicker">Lean, measured</p>
+      <h2>Same workload. A fraction of the weight.</h2>
       <p class="sub">The same workload in cmux and lmux on one MacBook Air: each workspace has a terminal printing about 20 lines a second, plus an idle split. Figures are what each app added on top of idle.</p>
-      <table class="stats">
-        <thead><tr><th></th><th>cmux</th><th>lmux</th></tr></thead>
-        <tbody>
-          <tr><td>App on disk</td><td>744 MB</td><td>29 MB</td></tr>
-          <tr><td>Memory, 40 workspaces</td><td>+698 MB</td><td>about +100 MB</td></tr>
-          <tr><td>CPU, 40 workspaces</td><td>15.5%</td><td>10%</td></tr>
-          <tr><td>Each agent command</td><td>~170 ms</td><td>~3 ms</td></tr>
-          <tr><td>Creating 40 workspaces</td><td>11.5 s</td><td>0.3 s</td></tr>
-          <tr><td>Most tested</td><td>40 workspaces</td><td>200 workspaces, 400 terminals</td></tr>
-        </tbody>
-      </table>
-      <p class="fine">The app draws only the pane on screen. Remote terminals and browsers run on the server, so the laptop receives only what you're looking at.</p>
-    </div>
-  </section>
-
-  <section>
-    <div class="wrap">
-      <h2>One window for every machine.</h2>
-      <p class="sub">Each computer runs a small lmux service that owns its terminals. The app on your Mac is just a view, so closing it stops nothing.</p>
-      <div class="grid">
-        <div class="card"><div class="n">01</div><h3>Nothing closes</h3><p>Quit the app or restart your Mac. Every pane comes back with the same folder, history and Claude session.</p></div>
-        <div class="card"><div class="n">02</div><h3>Servers feel local</h3><p>Open a workspace on a server and every terminal in it runs there. No manual SSH.</p></div>
-        <div class="card"><div class="n">03</div><h3>Agents with a browser</h3><p>Claude Code can open a browser pane, click and type, and you watch it happen live.</p></div>
+      <div class="bars" id="bars">
+        <div class="row rv"><h4>App on disk <em>26× smaller</em></h4>
+          <div class="meter"><label>cmux</label><div class="track"><div class="fill old" style="--w:100%"></div></div><b class="hi">744 MB</b></div>
+          <div class="meter"><label>lmux</label><div class="track"><div class="fill new" style="--w:3.9%"></div></div><b class="hi">29 MB</b></div></div>
+        <div class="row rv"><h4>Memory, 40 workspaces <em>~7× less</em></h4>
+          <div class="meter"><label>cmux</label><div class="track"><div class="fill old" style="--w:100%"></div></div><b class="hi">+698 MB</b></div>
+          <div class="meter"><label>lmux</label><div class="track"><div class="fill new" style="--w:14.3%"></div></div><b class="hi">about +100 MB</b></div></div>
+        <div class="row rv"><h4>Each agent command <em>~57× faster</em></h4>
+          <div class="meter"><label>cmux</label><div class="track"><div class="fill old" style="--w:100%"></div></div><b class="hi">~170 ms</b></div>
+          <div class="meter"><label>lmux</label><div class="track"><div class="fill new" style="--w:1.8%"></div></div><b class="hi">~3 ms</b></div></div>
+        <div class="row rv"><h4>Creating 40 workspaces <em>~38× faster</em></h4>
+          <div class="meter"><label>cmux</label><div class="track"><div class="fill old" style="--w:100%"></div></div><b class="hi">11.5 s</b></div>
+          <div class="meter"><label>lmux</label><div class="track"><div class="fill new" style="--w:2.6%"></div></div><b class="hi">0.3 s</b></div></div>
+        <div class="row rv"><h4>CPU, 40 workspaces <em>about a third less</em></h4>
+          <div class="meter"><label>cmux</label><div class="track"><div class="fill old" style="--w:100%"></div></div><b class="hi">15.5%</b></div>
+          <div class="meter"><label>lmux</label><div class="track"><div class="fill new" style="--w:64.5%"></div></div><b class="hi">10%</b></div></div>
       </div>
+      <p class="fine">Most tested: 40 workspaces in cmux, 200 workspaces and 400 terminals in lmux. The app draws only the pane on screen. Remote terminals and browsers run on the server, so your laptop receives only what you're looking at.</p>
     </div>
   </section>
 
-  <section class="alt" id="install">
+  <section id="install">
     <div class="wrap">
-      <h2>Install in a minute.</h2>
+      <p class="kicker">Install</p>
+      <h2>Up and running in a minute.</h2>
       <p class="sub">Everything lmux needs is inside the app. There's nothing else to set up.</p>
-      <div class="grid">
-        <div class="card"><div class="n">01</div><h3>Download</h3><p>Get <a href="lmux.dmg"><code>lmux.dmg</code></a> and open it.</p></div>
-        <div class="card"><div class="n">02</div><h3>Drag to Applications</h3><p>Drag lmux onto the Applications folder, then open it from there.</p></div>
-        <div class="card"><div class="n">03</div><h3>Allow folder access</h3><p>If macOS asks whether lmux may use a folder like Documents, click Allow. It asks once.</p></div>
+      <div class="install">
+        <div class="tile rv"><span class="num">01</span><h3>Download</h3><p>Get <a href="lmux.dmg"><code>lmux.dmg</code></a> and open it.</p></div>
+        <div class="tile rv"><span class="num">02</span><h3>Drag to Applications</h3><p>Drag lmux onto the Applications folder, then open it from there.</p></div>
+        <div class="tile rv"><span class="num">03</span><h3>Allow folder access</h3><p>If macOS asks whether lmux may use a folder like Documents, click Allow. It asks once.</p></div>
       </div>
       <div class="note" id="gatekeeper">
         If macOS says it can't check lmux for malicious software, open <b>System Settings › Privacy &amp; Security</b>,
         scroll down and click <b>Open Anyway</b>. This step goes away once the build is notarized by Apple.
       </div>
-    </div>
-  </section>
 
-  <section>
-    <div class="wrap">
-      <h2>Add a server.</h2>
-      <p class="sub" style="margin-bottom:0">Right-click the sidebar, choose <b>Add Remote Host…</b> and enter an SSH address like <code>me@my-server</code>.
-      lmux installs itself there over SSH. The server needs tmux and Rust
-      (<code>curl https://sh.rustup.rs -sSf | sh</code>), and on Linux <code>loginctl enable-linger $USER</code> so terminals outlive logout.</p>
+      <div class="server">
+        <div class="tile rv">
+          <span class="tag">Add a server</span>
+          <h3>Right-click the sidebar.</h3>
+          <p>Choose <b>Add Remote Host…</b> and enter an SSH address like <code>me@my-server</code>. lmux installs itself there over SSH.</p>
+        </div>
+        <div class="cmdbox rv"><span class="d"># on the server, once</span>
+curl https://sh.rustup.rs -sSf | sh
+<span class="d"># Linux only: terminals outlive logout</span>
+loginctl enable-linger $USER</div>
+      </div>
+    </div>
+
+    <div class="cta rv">
+      <h2>Stop babysitting terminals.</h2>
+      <p>Open source, MIT licensed, 29 MB. Your agents keep working when you don't.</p>
+      <div class="actions">
+        <a class="btn btn-primary" href="lmux.dmg">Download for Mac</a>
+      </div>
     </div>
   </section>
 </main>
@@ -236,8 +378,76 @@
 <footer>
   <div class="wrap">
     <span>© 2026 LintLabs · Singapore</span>
-    <a href="https://lintlabs.org">lintlabs.org</a>
+    <nav><a href="#persistence">Persistence</a><a href="#lean">Lean</a><a href="#install">Install</a><a href="https://lintlabs.org">lintlabs.org</a></nav>
   </div>
 </footer>
+
+<script>
+(function () {
+  var reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // Scroll reveals, and the lean bars grow when they scroll into view.
+  var io = 'IntersectionObserver' in window ? new IntersectionObserver(function (es) {
+    es.forEach(function (e) {
+      if (!e.isIntersecting) return;
+      e.target.classList.add('in');
+      e.target.querySelectorAll('.fill').forEach(function (f) { f.style.width = f.style.getPropertyValue('--w'); });
+      io.unobserve(e.target);
+    });
+  }, { threshold: .15 }) : null;
+  document.querySelectorAll('.rv').forEach(function (el) {
+    if (io) io.observe(el); else { el.classList.add('in'); el.querySelectorAll('.fill').forEach(function (f) { f.style.width = f.style.getPropertyValue('--w'); }); }
+  });
+
+  // Cursor-follow glow on tiles.
+  document.querySelectorAll('.tile').forEach(function (t) {
+    t.addEventListener('pointermove', function (e) {
+      var r = t.getBoundingClientRect();
+      t.style.setProperty('--mx', (e.clientX - r.left) + 'px');
+      t.style.setProperty('--my', (e.clientY - r.top) + 'px');
+    });
+  });
+
+  // The terminal scene: a reboot, then everything resumes.
+  var tty = document.getElementById('tty');
+  var S = [
+    ['p', '$ ', 'claude --resume'],
+    ['d', '', 'Resuming session 4f2a… "migrate webapp to postgres 16"'],
+    ['b', '', '● browser pane opened on my-server'],
+    ['', '', 'Running migrations (14/14)...'],
+    ['o', '', '— laptop lid closed · network lost · mac rebooted —'],
+    ['d', '', '...nothing on my-server noticed'],
+    ['p', '$ ', 'lmux'],
+    ['b', '', '✓ my-server connected'],
+    ['b', '', '✓ 6 workspaces, 14 panes restored'],
+    ['b', '', '✓ claude resumed · 3 unread notifications']
+  ];
+  function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+  function full() {
+    tty.innerHTML = S.map(function (l) { return '<span class="' + l[0] + '">' + esc(l[1]) + '</span>' + esc(l[2]); }).join('\n') + '\n<span class="p">$ </span><span class="cur"></span>';
+  }
+  if (reduce) { full(); return; }
+  var started = false;
+  new IntersectionObserver(function (es, o) {
+    if (started || !es[0].isIntersecting) return;
+    started = true; o.disconnect(); play();
+  }, { threshold: .4 }).observe(tty);
+  function play() {
+    var html = '', li = 0;
+    (function line() {
+      if (li >= S.length) { tty.innerHTML = html + '<span class="p">$ </span><span class="cur"></span>'; return; }
+      var l = S[li], typed = l[0] === 'p', n = 0;
+      (function ch() {
+        var txt = typed ? l[2].slice(0, n) : l[2];
+        tty.innerHTML = html + '<span class="' + l[0] + '">' + esc(l[1]) + '</span>' + esc(txt) + '<span class="cur"></span>';
+        if (typed && n < l[2].length) { n++; setTimeout(ch, 55); return; }
+        html += '<span class="' + l[0] + '">' + esc(l[1]) + '</span>' + esc(l[2]) + '\n';
+        li++;
+        setTimeout(line, l[0] === 'o' ? 1100 : typed ? 450 : 650);
+      })();
+    })();
+  }
+})();
+</script>
 </body>
 </html>
