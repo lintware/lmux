@@ -433,3 +433,14 @@ fn the_wheel_is_reported_when_the_program_asks_and_scrolls_otherwise() {
     assert_eq!(term_inputs(h.state()).concat(), "\x1b[<65;2;2M");
     assert_eq!(h.state().state.terms["surface:1"].display_offset(), 0);
 }
+
+#[test]
+fn tab_and_enter_go_to_the_terminal_not_the_sidebar_buttons() {
+    let mut h = harness(fixture());
+    for key in [egui::Key::Tab, egui::Key::Enter, egui::Key::Tab, egui::Key::Tab, egui::Key::Enter] {
+        press_key(&mut h, key);
+        h.run();
+    }
+    assert!(!h.state().state.sidebar_hidden, "Enter must not press a focused sidebar button");
+    assert_eq!(term_inputs(h.state()).concat(), "\t\r\t\t\r");
+}

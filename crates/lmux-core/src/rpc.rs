@@ -403,6 +403,24 @@ fn surface_is_browser(state: &crate::tree::SessionState, surface: &str) -> bool 
     )
 }
 
+/// Where the terminal shown in `pane` is now (tmux `pane_current_path`), so a
+/// new tab or split opens beside it rather than back at the workspace's start.
+async fn live_cwd(inner: &Arc<Inner>, pane: &str) -> Option<String> {
+    let tmux_pane = {
+        let state = inner.state.lock().await;
+        let (wi, pi) = state.locate_pane(pane)?;
+        let p = &state.workspaces[wi].panes[pi];
+        p.active_surface
+            .iter()
+            .chain(p.surfaces.iter().map(|s| &s.id))
+            .find_map(|s| state.term_cloned(s))?
+            .pane
+    };
+    let cwd = inner.tmux.display(&tmux_pane, "#{pane_current_path}").await.ok()?;
+    let cwd = cwd.trim();
+    (!cwd.is_empty()).then(|| cwd.to_owned())
+}
+
 fn default_cwd(params: &Value, state: &crate::tree::SessionState, ws: Option<&str>) -> String {
     if let Some(c) = s(params, "cwd") {
         return c;
@@ -2095,6 +2113,7 @@ async fn split_impl(
     kind: &str,
     params: &Value,
 ) -> RpcResponse {
+    let live = if s(params, "cwd").is_none() { live_cwd(inner, target_pane).await } else { None };
     let (cols, rows, cwd) = {
         let state = inner.state.lock().await;
         let (cols, rows) = state
@@ -2106,7 +2125,7 @@ async fn split_impl(
                 SurfaceKind::Browser { .. } => (120, 30),
             })
             .unwrap_or((120, 30));
-        (cols, rows, default_cwd(params, &state, Some(ws)))
+        (cols, rows, live.unwrap_or_else(|| default_cwd(params, &state, Some(ws))))
     };
 
     if kind == "browser" {
@@ -2225,6 +2244,7 @@ async fn add_surface_impl(
         return ok(id, json!({"surface": surface_ref}));
     }
 
+    let live = if s(params, "cwd").is_none() { live_cwd(inner, pane).await } else { None };
     let (surface_ref, ws, title, cwd, command, cols, rows) = {
         let mut state = inner.state.lock().await;
         let (ws, cols, rows) = match state.locate_pane(pane) {
@@ -2247,7 +2267,7 @@ async fn add_surface_impl(
         let surface = terminal_surface(surface_ref.clone(), title.clone(), cols, rows);
         state.add_surface(pane, surface);
         place_after(&mut state, &surface_ref, pane, params);
-        let cwd = default_cwd(params, &state, Some(&ws));
+        let cwd = live.unwrap_or_else(|| default_cwd(params, &state, Some(&ws)));
         (
             surface_ref,
             ws,

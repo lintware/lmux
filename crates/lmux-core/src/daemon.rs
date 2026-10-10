@@ -2662,6 +2662,140 @@ mod tests {
         }
     }
 
+    /// A new tab or split opens where the terminal beside it is now, not back
+    /// where the workspace started: no `cd` again after Cmd+T.
+    #[tokio::test]
+    async fn new_tabs_and_splits_open_in_the_current_terminals_directory() {
+        if !tmux_cmd("lmux-test-probe-unused", &["-V"]).await {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        let socket = format!("lmux-test-cwd-{}", std::process::id());
+        let _scratch = crate::tmux::ScratchServer(socket.clone());
+        let state_dir = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(work.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let tmux = match Tmux::spawn(
+            TmuxConfig {
+                socket: socket.clone(),
+                session: "lmux".into(),
+            },
+            ev_tx,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping: could not start tmux ({e})");
+                return;
+            }
+        };
+        // A plain shell keeps the test independent of the user's rc files.
+        tmux_cmd(&socket, &["set-option", "-g", "default-shell", "/bin/sh"]).await;
+
+        let mut state = SessionState::new("t");
+        let ws = state.next_workspace();
+        let pane_ref = state.next_pane();
+        let surf = state.next_surface();
+        state.add_workspace(Workspace {
+            id: ws.clone(),
+            title: "w".into(),
+            folder: None,
+            cwd: cwd.clone(),
+            git_branch: None,
+            agent: AgentState::None,
+            summary: None,
+            unread_notifications: 0,
+            status_pills: vec![],
+            progress: None,
+            layout: Layout::Pane {
+                pane: pane_ref.clone(),
+            },
+            panes: vec![Pane {
+                id: pane_ref.clone(),
+                surfaces: vec![terminal_surface(surf.clone(), "t", 80, 24)],
+                active_surface: Some(surf.clone()),
+            }],
+            focused_pane: Some(pane_ref),
+            ports: vec![],
+            pr: None,
+        });
+        let inner = Arc::new(Inner {
+            cfg: Config {
+                state_dir: state_dir.path().to_path_buf(),
+                socket: None,
+                tmux_socket: socket.clone(),
+                ws_addr: "127.0.0.1:1".into(),
+                host: "t".into(),
+                app_browser: false,
+            },
+            state: Mutex::new(state),
+            tmux,
+            browser: None,
+            browser_streaming: Mutex::new(HashSet::new()),
+            browser_sizes: Default::default(),
+            clients: Mutex::new(Clients::default()),
+            dirty: Notify::new(),
+            tree_dirty: Notify::new(),
+            respawn: std::sync::Mutex::new(RespawnState::default()),
+            scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
+            pane_activity: Default::default(),
+            paused_output: Default::default(),
+            prs: std::sync::Mutex::new(HashMap::new()),
+            app_calls: Default::default(),
+        });
+
+        let result = async {
+            let (_w, pane) =
+                crate::rpc::spawn_terminal(&inner, &ws, &surf, "t", &cwd, None, 80, 24)
+                    .await
+                    .map_err(|e| format!("spawn: {e}"))?;
+            let sub = std::path::Path::new(&cwd).join("deeper");
+            std::fs::create_dir(&sub).map_err(|e| format!("mkdir: {e}"))?;
+            let sub = sub.to_string_lossy().into_owned();
+            inner
+                .tmux
+                .send_bytes(&pane, format!("cd '{sub}'\r").as_bytes())
+                .await
+                .map_err(|e| format!("send: {e}"))?;
+            let moved = wait_for(10, || async {
+                inner.tmux.display(&pane, "#{pane_current_path}").await.is_ok_and(|p| p.trim() == sub)
+            })
+            .await;
+            if !moved {
+                return Err("the shell never changed directory".to_string());
+            }
+
+            let pane_ref = inner.state.lock().await.workspaces[0].panes[0].id.clone();
+            let call = |method: &str, params: serde_json::Value| RpcRequest { id: 1, method: method.into(), params };
+            for (method, params) in [
+                (methods::SURFACE_NEW, json!({"pane": pane_ref, "type": "terminal"})),
+                (methods::SPLIT_NEW, json!({"pane": pane_ref, "side": "right"})),
+            ] {
+                let r = crate::rpc::dispatch(&inner, &call(method, params)).await;
+                if let Some(e) = r.error {
+                    return Err(format!("{method}: {e:?}"));
+                }
+                let new = r.result.unwrap()["surface"].as_str().unwrap_or_default().to_owned();
+                let term = inner.surface_term(&new).await.ok_or(format!("{method}: no terminal"))?;
+                let at = inner.tmux.display(&term.pane, "#{pane_current_path}").await.map_err(|e| e.to_string())?;
+                if at.trim() != sub {
+                    return Err(format!("{method} opened in {at:?}, expected {sub:?}"));
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            panic!("{e}");
+        }
+    }
+
     /// End to end: output in a terminal is saved to its scrollback file; after
     /// the tmux server is killed, reconcile respawns the terminal in its old
     /// directory and the new pane shows the saved output above a fresh shell.

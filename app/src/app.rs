@@ -52,6 +52,7 @@ impl LmuxApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (ui_font, mono_font) = fonts::install(&cc.egui_ctx);
         configure(&cc.egui_ctx);
+        crate::clip::watch_cmd_v();
         theme::set_traffic_lights(cfg!(target_os = "macos"));
         eprintln!("[fonts] ui={ui_font} mono={mono_font}");
 
@@ -1014,6 +1015,10 @@ if(t)document.execCommand('delete');return t;})()";
 
 /// Route keyboard events to the focused surface. Public for tests.
 pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
+    // Tab and the arrows belong to the pane: without this, egui walks keyboard
+    // focus onto the sidebar's buttons, the terminal stops getting keys and
+    // Enter presses whichever button (the sidebar toggle) took the focus.
+    ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
     let Some(pane_id) = c.state.focused_pane() else { return };
     let Some(pane) = c.state.pane(&pane_id).cloned() else { return };
     let Some(sid) = c.state.active_surface(&pane) else { return };
@@ -1033,18 +1038,13 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
             let app_cursor = mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR);
             let mut bytes: Vec<u8> = Vec::new();
             let mut copy = false;
-            let mut maybe_image = false;
+            // Cmd+V with an image (no text) on the clipboard: egui reports
+            // nothing, so the press comes from AppKit. Look for an image to
+            // paste as a file path.
+            let mut maybe_image = crate::clip::take_cmd_v();
             ctx.input(|i| {
                 for ev in &i.events {
                     match ev {
-                        // Cmd+V with an image (no text) on the clipboard: egui
-                        // reports nothing on the press, only this release. Look
-                        // for an image to paste as a file path.
-                        egui::Event::Key { key: Key::V, pressed: false, modifiers, .. }
-                            if modifiers.command && !modifiers.shift =>
-                        {
-                            maybe_image = true;
-                        }
                         egui::Event::Text(t) => {
                             // Control characters arrive as text too; the key handler owns them.
                             if t.chars().all(|ch| ch >= ' ') {
