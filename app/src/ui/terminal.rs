@@ -441,19 +441,10 @@ fn for_each_bg_run(row: &[CellInfo], bg_default: Color32, mut f: impl FnMut(usiz
     }
 }
 
-pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &mut Ctx) {
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, theme::TERM_BG);
-
-    let metrics = metrics_for(ui.ctx(), c.state.term_font);
-    let ppp = ui.ctx().pixels_per_point();
-    let usable = Vec2::new((rect.width() - 2.0 * PAD).max(1.0), (rect.height() - 2.0 * PAD).max(1.0));
-    let cols = (usable.x / metrics.w).floor().max(2.0) as u16;
-    let rows = (usable.y / metrics.h).floor().max(1.0) as u16;
-    c.state.desired_sizes.insert(surface.to_owned(), (cols, rows));
-    c.state.visible.insert(surface.to_owned());
-    c.state.ensure_term(surface);
-
+/// Pointer, wheel, context menu and file drops over a terminal laid out as
+/// `grid`. Returns the response and the link under the pointer (Cmd held).
+fn interact(ui: &mut egui::Ui, rect: Rect, surface: &str, grid: &Grid, c: &mut Ctx) -> (egui::Response, Option<(usize, termio::UrlSpan)>) {
+    let rows = grid.rows as u16;
     // Click focuses this pane; the wheel scrolls scrollback when hovering.
     let resp = ui.interact(rect, Id::new(("term", surface)), Sense::click_and_drag());
     if resp.clicked() {
@@ -461,13 +452,11 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
             c.state.focus_pane(&pane);
         }
     }
-    let origin = Pos2::new(rect.min.x + PAD, rect.min.y + PAD);
-    let grid = Grid { origin, w: metrics.w, h: metrics.h, cols: cols as usize, rows: rows as usize };
     if let Some(tv) = c.state.terms.get_mut(surface) {
-        tv.grid_origin = origin;
-        tv.cell_size = Vec2::new(metrics.w, metrics.h);
+        tv.grid_origin = grid.origin;
+        tv.cell_size = Vec2::new(grid.w, grid.h);
     }
-    pointer_input(ui, &resp, surface, &grid, c);
+    pointer_input(ui, &resp, surface, grid, c);
     context_menu(ui, &resp, surface, c);
 
     // Files dropped on the terminal paste their paths, shell-quoted and
@@ -487,7 +476,7 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
 
     // Cmd held over a link: underline it and show a hand.
     let hover_link = match resp.hover_pos() {
-        Some(pos) if ui.input(|i| i.modifiers.command) && grid_contains(&grid, pos) => {
+        Some(pos) if ui.input(|i| i.modifiers.command) && grid_contains(grid, pos) => {
             let (row, col, _) = grid.cell_at(pos);
             c.state.terms.get(surface).and_then(|tv| tv.link_at(row, col)).map(|l| (row, l))
         }
@@ -507,8 +496,8 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
                 .filter_map(|ev| match ev {
                     egui::Event::MouseWheel { unit, delta, .. } => Some(match unit {
                         egui::MouseWheelUnit::Point => delta.y,
-                        egui::MouseWheelUnit::Line => delta.y * metrics.h,
-                        egui::MouseWheelUnit::Page => delta.y * metrics.h * rows as f32,
+                        egui::MouseWheelUnit::Line => delta.y * grid.h,
+                        egui::MouseWheelUnit::Page => delta.y * grid.h * rows as f32,
                     }),
                     _ => None,
                 })
@@ -519,14 +508,62 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
                 .state
                 .terms
                 .get_mut(surface)
-                .map(|tv| tv.accumulate_scroll(wheel, metrics.h))
+                .map(|tv| tv.accumulate_scroll(wheel, grid.h))
                 .unwrap_or(0);
             if lines != 0 {
-                wheel_input(ui, &resp, surface, &grid, lines, c);
+                wheel_input(ui, &resp, surface, grid, lines, c);
             }
         }
     }
 
+    (resp, hover_link)
+}
+
+/// A thin scrollbar while there is history: where the view sits in it,
+/// brighter while scrolled back or hovered, as in cmux.
+fn scrollbar(painter: &egui::Painter, rect: Rect, surface: &str, rows: u16, resp: &egui::Response, c: &Ctx) {
+    if let Some(tv) = c.state.terms.get(surface) {
+        use alacritty_terminal::grid::Dimensions;
+        let history = tv.term().grid().history_size();
+        if history > 0 {
+            let offset = tv.display_offset();
+            let total = (history + rows as usize) as f32;
+            let track = Rect::from_min_max(
+                Pos2::new(rect.max.x - 6.0, rect.min.y + 2.0),
+                Pos2::new(rect.max.x - 2.0, rect.max.y - 2.0),
+            );
+            // The view's first line is `history - offset` lines into the
+            // `history + rows` the terminal holds.
+            let h = (track.height() * rows as f32 / total).max(18.0);
+            let top = (history - offset.min(history)) as f32 / total;
+            let y = (track.min.y + track.height() * top).min(track.max.y - h);
+            let thumb = Rect::from_min_size(Pos2::new(track.min.x, y), Vec2::new(track.width(), h));
+            let alpha = if offset > 0 || resp.hovered() { 90 } else { 35 };
+            painter.rect_filled(thumb, egui::CornerRadius::same(2), egui::Color32::from_white_alpha(alpha));
+        }
+    }
+}
+
+pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, focused: bool, c: &mut Ctx) {
+    #[cfg(target_os = "macos")]
+    if crate::gfx::enabled() {
+        return paint_gpu(ui, rect, surface, focused, c);
+    }
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, theme::TERM_BG);
+
+    let metrics = metrics_for(ui.ctx(), c.state.term_font);
+    let ppp = ui.ctx().pixels_per_point();
+    let usable = Vec2::new((rect.width() - 2.0 * PAD).max(1.0), (rect.height() - 2.0 * PAD).max(1.0));
+    let cols = (usable.x / metrics.w).floor().max(2.0) as u16;
+    let rows = (usable.y / metrics.h).floor().max(1.0) as u16;
+    c.state.desired_sizes.insert(surface.to_owned(), (cols, rows));
+    c.state.visible.insert(surface.to_owned());
+    c.state.ensure_term(surface);
+
+    let origin = Pos2::new(rect.min.x + PAD, rect.min.y + PAD);
+    let grid = Grid { origin, w: metrics.w, h: metrics.h, cols: cols as usize, rows: rows as usize };
+    let (resp, hover_link) = interact(ui, rect, surface, &grid, c);
     let default_fg = Rgb { r: theme::TERM_FG.r(), g: theme::TERM_FG.g(), b: theme::TERM_FG.b() };
     let default_bg = Rgb { r: theme::TERM_BG.r(), g: theme::TERM_BG.g(), b: theme::TERM_BG.b() };
     let bg_default = color32(default_bg);
@@ -754,28 +791,7 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
 
     SCRATCH.with(|s| s.borrow_mut().cells = cells);
 
-    // A thin scrollbar while there is history: where the view sits in it,
-    // brighter while scrolled back or hovered, as in cmux.
-    if let Some(tv) = c.state.terms.get(surface) {
-        use alacritty_terminal::grid::Dimensions;
-        let history = tv.term().grid().history_size();
-        if history > 0 {
-            let offset = tv.display_offset();
-            let total = (history + rows as usize) as f32;
-            let track = Rect::from_min_max(
-                Pos2::new(rect.max.x - 6.0, rect.min.y + 2.0),
-                Pos2::new(rect.max.x - 2.0, rect.max.y - 2.0),
-            );
-            // The view's first line is `history - offset` lines into the
-            // `history + rows` the terminal holds.
-            let h = (track.height() * rows as f32 / total).max(18.0);
-            let top = (history - offset.min(history)) as f32 / total;
-            let y = (track.min.y + track.height() * top).min(track.max.y - h);
-            let thumb = Rect::from_min_size(Pos2::new(track.min.x, y), Vec2::new(track.width(), h));
-            let alpha = if offset > 0 || resp.hovered() { 90 } else { 35 };
-            painter.rect_filled(thumb, egui::CornerRadius::same(2), egui::Color32::from_white_alpha(alpha));
-        }
-    }
+    scrollbar(&painter, rect, surface, rows, &resp, c);
 }
 
 #[cfg(test)]
@@ -835,4 +851,88 @@ mod drop_tests {
         assert_eq!(shell_quote("/tmp/my file.png"), "'/tmp/my file.png'");
         assert_eq!(shell_quote("/tmp/it's"), "'/tmp/it'\\''s'");
     }
+}
+
+/// Paint a terminal with the GPU renderer (`crate::gfx`): Ghostty's fonts,
+/// metrics, sprites and shaders. Everything is laid out in whole device
+/// pixels, so cells, padding and glyphs land exactly on the pixel grid.
+#[cfg(target_os = "macos")]
+fn paint_gpu(ui: &mut egui::Ui, rect: Rect, surface: &str, focused: bool, c: &mut Ctx) {
+    use std::sync::Arc;
+
+    use crate::gfx::{frame, pipeline::TermPaint, with_session};
+
+    let ctx = ui.ctx().clone();
+    let ppp = ctx.pixels_per_point();
+    let zoom = c.state.term_font - theme::FS_TERM;
+    let (metrics, pad_pt) = with_session(zoom, ppp, |s| {
+        (s.fonts.metrics, (s.config.window_padding_x, s.config.window_padding_y))
+    });
+
+    // The pane in device pixels, kept inside the window.
+    let screen = ctx.content_rect();
+    let (sw, sh) = ((screen.max.x * ppp).round().max(0.0), (screen.max.y * ppp).round().max(0.0));
+    let x0 = (rect.min.x * ppp).round().clamp(0.0, sw);
+    let y0 = (rect.min.y * ppp).round().clamp(0.0, sh);
+    let x1 = (rect.max.x * ppp).round().clamp(x0, sw);
+    let y1 = (rect.max.y * ppp).round().clamp(y0, sh);
+    let (w, h) = (x1 - x0, y1 - y0);
+
+    // Ghostty's padding: points to whole pixels (floor), the grid at the
+    // top-left, leftover pixels to the right and bottom.
+    let dpi = (ppp * 72.0).round();
+    let px = |pt: u32| (pt as f32 * dpi / 72.0).floor();
+    let (pad_l, pad_r, pad_t, pad_b) = (px(pad_pt.0 .0), px(pad_pt.0 .1), px(pad_pt.1 .0), px(pad_pt.1 .1));
+    let (cw, ch) = (metrics.cell_width as f32, metrics.cell_height as f32);
+    let cols = ((w - pad_l - pad_r) / cw).floor().max(2.0) as u16;
+    let rows = ((h - pad_t - pad_b) / ch).floor().max(1.0) as u16;
+    c.state.desired_sizes.insert(surface.to_owned(), (cols, rows));
+    c.state.visible.insert(surface.to_owned());
+    c.state.ensure_term(surface);
+
+    let grid = Grid {
+        origin: Pos2::new((x0 + pad_l) / ppp, (y0 + pad_t) / ppp),
+        w: cw / ppp,
+        h: ch / ppp,
+        cols: cols as usize,
+        rows: rows as usize,
+    };
+    let (resp, hover_link) = interact(ui, rect, surface, &grid, c);
+
+    let window_focused = ctx.input(|i| i.focused);
+    let built = c.state.terms.get(surface).map(|tv| {
+        with_session(zoom, ppp, |s| {
+            let view = frame::View {
+                cols,
+                rows,
+                focused: focused && window_focused,
+                hover_link: hover_link.as_ref().map(|(r, l)| (*r, l.start, l.end)),
+            };
+            let f = frame::build(tv, &mut s.fonts, &s.theme, &view);
+            (f, s.fonts.atlases.clone(), s.theme.background)
+        })
+    });
+    let painter = ui.painter_at(rect);
+    let Some((f, atlases, bg)) = built else {
+        painter.rect_filled(rect, 0.0, Color32::from_rgb(theme::TERM_BG.r(), theme::TERM_BG.g(), theme::TERM_BG.b()));
+        return;
+    };
+    // Under the GPU draw, so a skipped frame (window mid-resize) still
+    // shows the background rather than stale pixels.
+    painter.rect_filled(rect, 0.0, Color32::from_rgb(bg[0], bg[1], bg[2]));
+    if w >= 1.0 && h >= 1.0 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (c.state as *const _ as usize, surface).hash(&mut hasher);
+        let paint = TermPaint {
+            key: hasher.finish(),
+            frame: Arc::new(f),
+            atlases,
+            viewport: [x0 as u32, y0 as u32, w as u32, h as u32],
+            cell: [cw, ch],
+            pad: [pad_l, pad_t],
+        };
+        painter.add(eframe::egui_wgpu::Callback::new_paint_callback(rect, paint));
+    }
+    scrollbar(&painter, rect, surface, rows, &resp, c);
 }

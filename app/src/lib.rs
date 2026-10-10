@@ -5,6 +5,7 @@ pub mod clip;
 pub mod cmux_import;
 pub mod decode;
 pub mod fonts;
+pub mod gfx;
 pub mod keys;
 pub mod layout;
 pub mod net;

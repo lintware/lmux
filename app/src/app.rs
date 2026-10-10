@@ -52,6 +52,11 @@ impl LmuxApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (ui_font, mono_font) = fonts::install(&cc.egui_ctx);
         configure(&cc.egui_ctx);
+        #[cfg(target_os = "macos")]
+        if let Some(rs) = cc.wgpu_render_state.as_ref() {
+            crate::gfx::pipeline::install(rs);
+            crate::gfx::enable();
+        }
         crate::clip::watch_cmd_v();
         theme::set_traffic_lights(cfg!(target_os = "macos"));
         eprintln!("[fonts] ui={ui_font} mono={mono_font}");
