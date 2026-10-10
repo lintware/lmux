@@ -339,6 +339,86 @@ fn metrics_for(ctx: &egui::Context, size: f32) -> Metrics {
     m
 }
 
+/// Block elements (U+2580–U+259F) are drawn as rectangles snapped to the cell
+/// instead of font glyphs: a glyph's box never matches the cell exactly, so
+/// pixel art such as Claude Code's mascot showed seams between columns and bands
+/// between rows. A raw mesh skips egui's anti-aliasing feather, so neighbouring
+/// cells meet without a seam. Returns false for any other character.
+fn paint_block(painter: &egui::Painter, cell: Rect, ch: char, fg: Color32, ppp: f32) -> bool {
+    let code = ch as u32;
+    if !(0x2580..=0x259F).contains(&code) {
+        return false;
+    }
+    // Snap to physical pixels so a cell's right edge is its neighbour's left.
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let (x0, x1, y0, y1) = (snap(cell.min.x), snap(cell.max.x), snap(cell.min.y), snap(cell.max.y));
+    let mut mesh = egui::Mesh::default();
+    // A sub-rectangle given as fractions of the cell.
+    let mut part = |fx0: f32, fy0: f32, fx1: f32, fy1: f32, color: Color32| {
+        let r = Rect::from_min_max(
+            Pos2::new(snap(x0 + (x1 - x0) * fx0), snap(y0 + (y1 - y0) * fy0)),
+            Pos2::new(snap(x0 + (x1 - x0) * fx1), snap(y0 + (y1 - y0) * fy1)),
+        );
+        mesh.add_colored_rect(r, color);
+    };
+    let eighth = |n: u32| n as f32 / 8.0;
+    // Quadrants: upper-left, upper-right, lower-left, lower-right.
+    let quads = |ul: bool, ur: bool, ll: bool, lr: bool| [ul, ur, ll, lr];
+    let quadrants = match code {
+        0x2580 => {
+            part(0.0, 0.0, 1.0, 0.5, fg);
+            None
+        }
+        0x2581..=0x2587 => {
+            part(0.0, 1.0 - eighth(code - 0x2580), 1.0, 1.0, fg);
+            None
+        }
+        0x2588 => {
+            part(0.0, 0.0, 1.0, 1.0, fg);
+            None
+        }
+        0x2589..=0x258F => {
+            part(0.0, 0.0, eighth(0x2590 - code), 1.0, fg);
+            None
+        }
+        0x2590 => {
+            part(0.5, 0.0, 1.0, 1.0, fg);
+            None
+        }
+        0x2591..=0x2593 => {
+            part(0.0, 0.0, 1.0, 1.0, fg.gamma_multiply((code - 0x2590) as f32 / 4.0));
+            None
+        }
+        0x2594 => {
+            part(0.0, 0.0, 1.0, eighth(1), fg);
+            None
+        }
+        0x2595 => {
+            part(1.0 - eighth(1), 0.0, 1.0, 1.0, fg);
+            None
+        }
+        0x2596 => Some(quads(false, false, true, false)),
+        0x2597 => Some(quads(false, false, false, true)),
+        0x2598 => Some(quads(true, false, false, false)),
+        0x2599 => Some(quads(true, false, true, true)),
+        0x259A => Some(quads(true, false, false, true)),
+        0x259B => Some(quads(true, true, true, false)),
+        0x259C => Some(quads(true, true, false, true)),
+        0x259D => Some(quads(false, true, false, false)),
+        0x259E => Some(quads(false, true, true, false)),
+        _ => Some(quads(false, true, true, true)), // 0x259F
+    };
+    if let Some([ul, ur, ll, lr]) = quadrants {
+        for (on, fx, fy) in [(ul, 0.0, 0.0), (ur, 0.5, 0.0), (ll, 0.0, 0.5), (lr, 0.5, 0.5)] {
+            if on {
+                part(fx, fy, fx + 0.5, fy + 0.5, fg);
+            }
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+    true
+}
+
 fn color32(rgb: Rgb) -> Color32 {
     Color32::from_rgb(rgb.r, rgb.g, rgb.b)
 }
@@ -366,6 +446,7 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
     painter.rect_filled(rect, 0.0, theme::TERM_BG);
 
     let metrics = metrics_for(ui.ctx(), c.state.term_font);
+    let ppp = ui.ctx().pixels_per_point();
     let usable = Vec2::new((rect.width() - 2.0 * PAD).max(1.0), (rect.height() - 2.0 * PAD).max(1.0));
     let cols = (usable.x / metrics.w).floor().max(2.0) as u16;
     let rows = (usable.y / metrics.h).floor().max(1.0) as u16;
@@ -593,7 +674,10 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
                 draw_run(&mut run, run_col, y, run_fg, run_underline, run_len);
                 run_len = 0;
                 let x = origin.x + col as f32 * metrics.w;
-                if info.ch != ' ' {
+                let cell = Rect::from_min_size(Pos2::new(x, y), Vec2::new(metrics.w, metrics.h));
+                if paint_block(&painter, cell, info.ch, info.fg, ppp) {
+                    // Drawn as rectangles; no glyph.
+                } else if info.ch != ' ' {
                     scratch_text.clear();
                     scratch_text.push(info.ch);
                     scratch_text.extend(info.zw.iter());
@@ -653,7 +737,9 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, _focused: bool, c: &m
                     .get(r * cols_usize + col)
                     .map(|c| c.ch)
                     .unwrap_or(' ');
-                if ch != ' ' {
+                if paint_block(&painter, cell_rect, ch, theme::TERM_BG, ppp) {
+                    // Drawn as rectangles; no glyph.
+                } else if ch != ' ' {
                     painter.text(
                         Pos2::new(cell_rect.min.x, cell_rect.min.y),
                         Align2::LEFT_TOP,

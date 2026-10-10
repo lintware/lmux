@@ -588,7 +588,8 @@ fn new_item_menu(resp: &egui::Response, c: &mut Ctx) {
     c.state.create_in(target, pick.0, pick.1 .1.clone());
 }
 
-/// `New Session on <host> ▸ Top Level / <folder trail>…`. Returns true when one
+/// `New Session on <host> ▸ Top Level / <folder trail>…`, or a plain entry when
+/// the host has no folders. Returns true when one
 /// of its entries was clicked, so the caller can close the outer menu too.
 fn host_submenu(
     ui: &mut Ui,
@@ -598,6 +599,14 @@ fn host_submenu(
     picked: &mut Option<(usize, Option<String>)>,
 ) -> bool {
     let index = target.index;
+    // No folders to choose between: the entry itself makes it at the top level.
+    if target.folders.is_empty() {
+        if ui.button(label).clicked() {
+            *picked = Some((index, None));
+            return true;
+        }
+        return false;
+    }
     let folders = target.folders.clone();
     let prefix = item_prefix.to_owned();
     let mut choice: Option<Option<String>> = None;
