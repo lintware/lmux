@@ -281,6 +281,10 @@ final class Page: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func key(_ name: String, text: String?, mods: NSEvent.ModifierFlags) {
+        // The app sends a character as this key and again as insert_text, which
+        // types it. Pressing it here too typed every letter twice. Cmd and Ctrl
+        // chords have no text to follow, so they stay.
+        if name.count == 1, text?.isEmpty != false, !mods.contains(.command), !mods.contains(.control) { return }
         let special: [String: (UInt16, String)] = [
             "Enter": (36, "\r"), "Tab": (48, "\t"), "Backspace": (51, "\u{7f}"), "Escape": (53, "\u{1b}"),
             "ArrowLeft": (123, "\u{F702}"), "ArrowRight": (124, "\u{F703}"),

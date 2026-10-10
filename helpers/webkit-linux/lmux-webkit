@@ -273,6 +273,11 @@ class Page:
         elif t == "key" and e.get("action") == "down":
             name = e.get("key", "")
             text = e.get("text")
+            # The app sends a character as this key and again as insert_text,
+            # which types it. Pressing it here too typed every letter twice.
+            # Ctrl and Cmd chords have no text to follow, so they stay.
+            if len(name) == 1 and not text and not (mods.get("ctrl") or mods.get("meta")):
+                return
             if name in SPECIAL_KEYS:
                 keyval = Gdk.keyval_from_name(SPECIAL_KEYS[name])
             elif text:
