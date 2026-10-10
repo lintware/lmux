@@ -9,6 +9,7 @@
 # `lmux` is also installed to ~/.local/bin, where the Claude hooks and your
 # shell find it. Re-running updates both in place; a running local daemon
 # keeps running until it is restarted (its tmux sessions survive that).
+# LMUX_SKIP_INSTALL=1 stops after assembling and signing target/bundle/lmux.app.
 set -euo pipefail
 
 dest=${1:-/Applications}
@@ -96,6 +97,13 @@ else
   codesign --force --sign - "$app"
 fi
 codesign --verify --strict "$app"
+
+# Release builds and trial builds want the bundle without replacing the lmux
+# that's installed and running.
+if [ -n "${LMUX_SKIP_INSTALL:-}" ]; then
+  echo "==> built $app (LMUX_SKIP_INSTALL: not installed)"
+  exit 0
+fi
 
 echo "==> installing to $dest and ~/.local/bin/lmux"
 rm -rf "$dest/lmux.app"

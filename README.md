@@ -43,7 +43,7 @@ The app draws only the pane on screen. With 400 terminals open and 200 of them p
 
 ## Install
 
-**On your Mac:** download `lmux.dmg` from [lmux.lintlabs.org](https://lmux.lintlabs.org) and drag lmux to Applications. tmux is inside the app.
+**On your Mac:** download `lmux.dmg` from [lmux.lintlabs.org](https://lmux.lintlabs.org) or the [latest release](https://github.com/lintware/lmux/releases/latest) and drag lmux to Applications. tmux is inside the app. Each release also has a tarball with just the `lmux` CLI and daemon, and checksums.
 
 **From source:**
 
@@ -131,7 +131,9 @@ Work happens on `dev`, and `main` follows it once it's stable.
 
 ## Contributing
 
-Issues and pull requests are welcome. Branch from `dev`, run both test suites above, and keep the app lean: a feature should cost the laptop nothing when it isn't on screen.
+Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers how to set up, run a build beside your real lmux, test, and send a change. The short version: branch from `dev`, run both test suites above, and keep the app lean, so a feature costs the laptop nothing when it isn't on screen.
+
+Releases are listed on the [releases page](https://github.com/lintware/lmux/releases), with notes in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
