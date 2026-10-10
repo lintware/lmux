@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>lmux by LintLabs</title>
-<meta name="description" content="Terminal and browser workspaces that keep running on your Mac and your servers.">
+<title>lmux · lean mux</title>
+<meta name="description" content="lmux, the lean mux: cmux's workspace window and herdr's persistence in one small app. Terminals, browsers and agents keep running on your Mac and your servers.">
 <link rel="icon" href="icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -41,7 +41,7 @@
   .pill-sm:hover { transform: scale(1.05); }
 
   .hero {
-    background: var(--n200); padding: 136px 24px 0; text-align: center; overflow: hidden;
+    background: var(--n200); padding: 136px 24px 64px; text-align: center; overflow: hidden;
     background-image: radial-gradient(ellipse at top, #ffffff99, transparent 60%);
   }
   .eyebrow { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .28em; color: var(--n500); margin: 0 0 12px; }
@@ -55,29 +55,9 @@
   .btn-ghost:hover { border-color: var(--n900); }
   .meta { font-size: 13px; color: var(--n500); margin: 14px 0 0; }
 
-  /* A drawing of the app window, not a screenshot. */
-  .window {
-    max-width: 920px; margin: 56px auto 0; border-radius: 16px 16px 0 0; overflow: hidden; text-align: left;
-    background: #1c1c1e; border: 1px solid #00000026; border-bottom: 0; box-shadow: 0 30px 60px -20px #00000059;
-    display: grid; grid-template-columns: 200px 1fr 1fr; height: 340px; font-size: 12px;
-  }
-  .side { background: #161618; border-right: 1px solid #2a2a2d; padding: 14px 10px; color: #d4d4d8; }
-  .host { display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 600; letter-spacing: .06em; color: #8e8e93; margin: 10px 4px 6px; }
-  .host i { width: 6px; height: 6px; border-radius: 50%; background: #30d158; }
-  .ws { padding: 7px 10px; border-radius: 8px; margin-bottom: 4px; font-weight: 600; color: #f2f2f7; }
-  .ws small { display: block; font-weight: 400; color: #8e8e93; font-size: 10.5px; }
-  .ws.on { background: var(--accent); }
-  .ws.on small { color: #ffffffcc; }
-  .pane { padding: 14px 16px; font: 11.5px/1.7 var(--mono); color: #d1d1d6; border-right: 1px solid #2a2a2d; overflow: hidden; }
-  .pane .p { color: #30d158; }
-  .pane .d { color: #8e8e93; }
-  .browser { background: #f5f5f7; display: flex; flex-direction: column; }
-  .bar { background: #e5e5ea; padding: 8px 10px; }
-  .bar div { background: #fff; border-radius: 6px; padding: 4px 10px; color: var(--n500); font-size: 11px; }
-  .page { flex: 1; padding: 22px; }
-  .page b { display: block; height: 14px; width: 60%; background: var(--n300); border-radius: 4px; margin-bottom: 10px; }
-  .page b:nth-child(2) { width: 85%; background: var(--n200); }
-  .page b:nth-child(3) { width: 72%; background: var(--n200); }
+  /* The animated demo (demo.html): Claude drives a browser, the laptop closes, everything comes back. */
+  .demo { max-width: 920px; margin: 48px auto 0; aspect-ratio: 960 / 560; }
+  .demo iframe { display: block; width: 100%; height: 100%; border: 0; border-radius: 14px; box-shadow: 0 30px 60px -20px #00000059; background: #1c1c1e; }
 
   section { padding: 72px 24px; }
   .wrap { max-width: 1000px; margin: 0 auto; }
@@ -93,6 +73,25 @@
   code { font: 13px var(--mono); background: var(--n100); border: 1px solid var(--n200); padding: 1px 6px; border-radius: 6px; }
   .note { margin-top: 20px; border: 1px solid var(--n200); background: #fff; border-radius: 16px; padding: 18px 22px; font-size: 15px; color: var(--n700); }
 
+  .wordmark { font-size: 15px; font-weight: 600; color: var(--n600); margin: 0 0 10px; letter-spacing: -0.01em; }
+  .wordmark b { color: var(--n950); font-weight: 900; }
+  .mix { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 0 0 28px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 999px; background: #ffffffb3; border: 1px solid var(--n300); font-size: 13px; font-weight: 600; color: var(--n800); }
+  .chip.plus { background: none; border: 0; padding: 6px 2px; color: var(--n400); }
+  .chip.eq { background: var(--n900); border-color: var(--n900); color: #fff; }
+  .card .from { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; color: var(--n500); }
+  .card ul { margin: 12px 0 0; padding-left: 18px; color: var(--n600); font-size: 14.5px; }
+  .card ul li { margin-bottom: 4px; }
+  .card .drop { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--n200); font-size: 13.5px; color: var(--n500); }
+  .card .drop b { color: var(--n700); }
+  .stats { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid var(--n200); border-radius: 16px; overflow: hidden; font-size: 15px; }
+  .stats th, .stats td { text-align: left; padding: 12px 18px; border-bottom: 1px solid var(--n200); }
+  .stats tr:last-child td { border-bottom: 0; }
+  .stats th { font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--n500); background: var(--n50); }
+  .stats td:nth-child(2) { color: var(--n500); }
+  .stats td:nth-child(3) { font-weight: 700; color: var(--n950); }
+  .fine { font-size: 13px; color: var(--n500); margin: 12px 0 0; }
+
   footer { background: var(--n50); border-top: 1px solid var(--n200); padding: 40px 24px; }
   footer .wrap { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; font-size: 14px; color: var(--n500); }
   footer a { text-decoration: none; }
@@ -100,54 +99,101 @@
 
   @media (max-width: 760px) {
     .grid { grid-template-columns: 1fr; }
-    .window { grid-template-columns: 130px 1fr; height: 280px; }
-    .browser { display: none; }
-    .pane { border-right: 0; }
+    .stats th, .stats td { padding: 10px 12px; font-size: 14px; }
     nav.liquid .brand span { display: none; }
   }
 </style>
 </head>
 <body>
 <nav class="liquid">
-  <a class="brand" href="https://lintlabs.org"><img src="lintlabs-logo.svg" alt="LintLabs"><span>lmux</span></a>
+  <a class="brand" href="https://lintlabs.org"><img src="lintlabs-logo.svg" alt="LintLabs"><span>lmux · lean mux</span></a>
   <a class="pill-sm" href="lmux.dmg">Download</a>
 </nav>
 
 <main>
   <div class="hero">
     <p class="eyebrow">LintLabs · Open beta</p>
-    <h1>Terminals that never close.</h1>
-    <p class="lede">lmux keeps your terminals, browsers and agents running on your Mac and your servers, side by side in one window. Quit, reboot or lose the network. Everything is where you left it.</p>
+    <p class="wordmark"><b>lmux</b> is the lean mux</p>
+    <h1>cmux and herdr, in one lean app.</h1>
+    <p class="lede">The cmux window you know, with herdr's persistence built in. Terminals, browsers and agents keep running on your Mac and your servers. Quit, reboot or lose the network, and everything is where you left it.</p>
+    <div class="mix" aria-label="cmux plus herdr plus tmux equals lmux">
+      <span class="chip">cmux window</span><span class="chip plus">+</span>
+      <span class="chip">herdr persistence</span><span class="chip plus">+</span>
+      <span class="chip">tmux inside</span><span class="chip plus">=</span>
+      <span class="chip eq">lmux</span>
+    </div>
     <div class="actions">
       <a class="btn btn-dark" href="lmux.dmg">Download for Mac</a>
       <a class="btn btn-ghost" href="#install">How to install</a>
     </div>
     <p class="meta">Version @VERSION@ · macOS 12 or later · Apple silicon</p>
 
-    <div class="window" aria-hidden="true">
-      <div class="side">
-        <div class="host"><i></i>THIS MAC</div>
-        <div class="ws">website<small>~/code/site</small></div>
-        <div class="host"><i></i>MY-SERVER</div>
-        <div class="ws on">api<small>claude · working</small></div>
-        <div class="ws">deploy<small>Idle</small></div>
-      </div>
-      <div class="pane">
-        <div><span class="p">me@my-server</span> <span class="d">~/api</span></div>
-        <div>$ claude</div>
-        <div class="d">● Reading src/routes.ts</div>
-        <div class="d">● Running the tests</div>
-        <div>&nbsp;&nbsp;42 passed</div>
-        <div class="d">● Opening the preview</div>
-        <div>&nbsp;</div>
-        <div><span class="p">›</span> ▍</div>
-      </div>
-      <div class="browser">
-        <div class="bar"><div>localhost:3000</div></div>
-        <div class="page"><b></b><b></b><b></b></div>
-      </div>
+    <div class="demo">
+      <iframe src="demo.html" title="lmux demo: Claude on a server drives a browser pane, the laptop closes, and every pane comes back where it was"></iframe>
     </div>
   </div>
+
+  <section id="built-in">
+    <div class="wrap">
+      <h2>Built in together.</h2>
+      <p class="sub">lmux takes the parts of cmux and herdr people actually use and puts them in one app, with tmux underneath. You don't install or run any of them separately.</p>
+      <div class="grid">
+        <div class="card">
+          <span class="from">From cmux</span>
+          <h3>The window</h3>
+          <ul>
+            <li>Folders and workspaces in a sidebar</li>
+            <li>Splits, tabs and browser panes</li>
+            <li>Notifications and agent status cards</li>
+            <li>The agent CLI, with the same command names</li>
+            <li>Import your cmux workspaces in one step</li>
+          </ul>
+          <div class="drop"><b>Left out:</b> the cloud VM service, team features, vault, recordings, the iOS simulator and ~25 background helpers.</div>
+        </div>
+        <div class="card">
+          <span class="from">From herdr</span>
+          <h3>Persistence</h3>
+          <ul>
+            <li>Nothing closes for good</li>
+            <li>Quit, close the lid, lose the network or reboot</li>
+            <li>Every pane returns to the same folder and scrollback</li>
+            <li>Each Claude session resumes with <code>claude --resume</code></li>
+            <li>Browsers keep running while you're away</li>
+          </ul>
+          <div class="drop"><b>Left out:</b> nothing.</div>
+        </div>
+        <div class="card">
+          <span class="from">From tmux</span>
+          <h3>The engine</h3>
+          <ul>
+            <li>Every terminal lives in tmux on its own machine</li>
+            <li>Keeps running with no window attached</li>
+            <li>tmux ships inside the app</li>
+          </ul>
+          <div class="drop"><b>Left out:</b> having to install it, configure it or remember its keys.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="alt" id="lean">
+    <div class="wrap">
+      <h2>Why it's lean.</h2>
+      <p class="sub">The same workload in cmux and lmux on one MacBook Air: each workspace has a terminal printing about 20 lines a second, plus an idle split. Figures are what each app added on top of idle.</p>
+      <table class="stats">
+        <thead><tr><th></th><th>cmux</th><th>lmux</th></tr></thead>
+        <tbody>
+          <tr><td>App on disk</td><td>744 MB</td><td>29 MB</td></tr>
+          <tr><td>Memory, 40 workspaces</td><td>+698 MB</td><td>about +100 MB</td></tr>
+          <tr><td>CPU, 40 workspaces</td><td>15.5%</td><td>10%</td></tr>
+          <tr><td>Each agent command</td><td>~170 ms</td><td>~3 ms</td></tr>
+          <tr><td>Creating 40 workspaces</td><td>11.5 s</td><td>0.3 s</td></tr>
+          <tr><td>Most tested</td><td>40 workspaces</td><td>200 workspaces, 400 terminals</td></tr>
+        </tbody>
+      </table>
+      <p class="fine">The app draws only the pane on screen. Remote terminals and browsers run on the server, so the laptop receives only what you're looking at.</p>
+    </div>
+  </section>
 
   <section>
     <div class="wrap">

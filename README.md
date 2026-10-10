@@ -4,7 +4,9 @@
 
 lmux is a workspace app for running coding agents across your own machines. Terminals, browsers and Claude sessions live on the host they run on and keep running when your laptop sleeps. The window on your laptop shows them all in one sidebar.
 
-![lmux: an agent on a remote host driving a browser pane, with three hosts in the sidebar](docs/img/lmux.png)
+![lmux: Claude on a server drives a browser pane, the laptop closes, and every pane comes back where it was](docs/img/lmux-demo.gif)
+
+**[Download for Mac](https://lmux.lintlabs.org)** · macOS 12 or later · Apple silicon · MIT licensed
 
 | From | lmux keeps | lmux drops |
 |---|---|---|
@@ -41,7 +43,9 @@ The app draws only the pane on screen. With 400 terminals open and 200 of them p
 
 ## Install
 
-**On your Mac:**
+**On your Mac:** download `lmux.dmg` from [lmux.lintlabs.org](https://lmux.lintlabs.org) and drag lmux to Applications. tmux is inside the app.
+
+**From source:**
 
 ```sh
 deploy/macos/bundle.sh      # builds and installs /Applications/lmux.app and ~/.local/bin/lmux
@@ -124,3 +128,11 @@ Work happens on `dev`, and `main` follows it once it's stable.
 - stop tmux sending output for panes nobody is watching.
 
 **Later:** a mobile app for the same hosts, to watch and steer agents from your phone.
+
+## Contributing
+
+Issues and pull requests are welcome. Branch from `dev`, run both test suites above, and keep the app lean: a feature should cost the laptop nothing when it isn't on screen.
+
+## License
+
+[MIT](LICENSE) © 2026 Lint Technologies Pte. Ltd. (LintLabs)

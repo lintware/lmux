@@ -65,29 +65,10 @@ fn default_remote_port() -> u16 {
     DEFAULT_REMOTE_PORT
 }
 
+/// Hosts a first run starts with. "this mac" is added by
+/// [`load_hosts_with_local`]; remote hosts come from Add Remote Host….
 pub fn default_hosts() -> Vec<HostConfig> {
-    vec![
-        HostConfig {
-            name: "my-server".into(),
-            label: "my-server".into(),
-            kind: "ssh".into(),
-            url: None,
-            ssh_target: Some("my-server".into()),
-            remote_port: DEFAULT_REMOTE_PORT,
-            browser_scale: None,
-            cloud: None,
-        },
-        HostConfig {
-            name: "mock".into(),
-            label: "mock (local)".into(),
-            kind: "direct".into(),
-            url: Some(MOCK_URL.into()),
-            ssh_target: None,
-            remote_port: DEFAULT_REMOTE_PORT,
-            browser_scale: None,
-            cloud: None,
-        },
-    ]
+    Vec::new()
 }
 
 pub fn config_path() -> Option<PathBuf> {

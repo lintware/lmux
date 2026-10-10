@@ -5,3 +5,6 @@
 /scratchpad
 .DS_Store
 .claude/worktrees/
+/app/tests/snapshots/*.old.png
+/app/tests/snapshots/*.new.png
+/app/tests/snapshots/*.diff.png
