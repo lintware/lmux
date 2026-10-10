@@ -107,4 +107,6 @@ pub const BROWSER_GET: &str = "browser.get"; // {surface?, what: "url"|"title"|"
 pub const BROWSER_CONSOLE: &str = "browser.console"; // {surface?, clear?: bool} -> {entries}
 pub const BROWSER_ERRORS: &str = "browser.errors"; // {surface?, clear?: bool} -> {entries}
 pub const BROWSER_REPORT: &str = "browser.report"; // {surface, url?, title?, loading?, can_go_back?, can_go_forward?} (the app reports an in-app browser's page)
+pub const BROWSER_MOUSE: &str = "browser.mouse"; // {surface?, action: "click"|"dblclick"|"down"|"up"|"move"|"wheel", x, y, button?: "left"|"right"|"middle", dx?, dy?, modifiers?} (viewport CSS px; real pointer events, which reach cross-origin iframes)
+pub const BROWSER_KEYBOARD: &str = "browser.keyboard"; // {surface?, text?, key?: "ctrl+a"|"Enter"|..., modifiers?} (real key events to the focused element, inside cross-origin iframes too)
 pub const BROWSER_TABS: &str = "browser.tabs"; // {surface?, action: "list"|"new"|"switch"|"close", index?, url?}

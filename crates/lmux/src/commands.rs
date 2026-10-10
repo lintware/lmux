@@ -758,6 +758,25 @@ fn build_browser(cmd: BrowserCmd) -> anyhow::Result<Req> {
             json!({"key": pick(key, key_arg, "key")?, "surface": target.surface, "workspace": target.workspace}),
             ok_box(),
         ),
+        BrowserCmd::Mouse { action, x, y, button, dx, dy, shift, ctrl, alt, meta, target } => req(
+            methods::BROWSER_MOUSE,
+            compact(json!({
+                "action": action, "x": x, "y": y, "button": button, "dx": dx, "dy": dy,
+                "modifiers": {"shift": shift, "ctrl": ctrl, "alt": alt, "meta": meta},
+                "surface": target.surface, "workspace": target.workspace,
+            })),
+            ok_box(),
+        ),
+        BrowserCmd::Keyboard { text, key, target } => {
+            if text.is_none() && key.is_none() {
+                bail!("keyboard needs --text to type or --key to press");
+            }
+            req(
+                methods::BROWSER_KEYBOARD,
+                compact(json!({"text": text, "key": key, "surface": target.surface, "workspace": target.workspace})),
+                ok_box(),
+            )
+        }
         BrowserCmd::Select { args, selector, value, target } => {
             let (sel, value) = selector_and_text(args, selector, value, "value")?;
             req(methods::BROWSER_SELECT, json!({"target": sel, "value": value, "surface": target.surface, "workspace": target.workspace}), ok_box())

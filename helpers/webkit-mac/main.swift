@@ -48,7 +48,9 @@ let safariUserAgentSuffix: String = {
 let frameInterval = 1.0 / 15.0
 
 final class Page: NSObject, WKNavigationDelegate, WKUIDelegate {
-    let surface: String
+    /// The daemon's name for this page. A popup is `popup:N` until the daemon
+    /// gives it a surface (`adopt`).
+    var surface: String
     let window: NSWindow
     let webView: WKWebView
     var observers: [NSKeyValueObservation] = []
@@ -66,14 +68,24 @@ final class Page: NSObject, WKNavigationDelegate, WKUIDelegate {
     /// Chromium's navigate answers.
     var onCommit: [Any] = []
 
-    init(surface: String, url: String, id: Any?) {
+    /// A page for `url`, or, given the `configuration` WebKit passed to
+    /// `createWebViewWith`, the window a page opened: that web view must be
+    /// built from it, which is what keeps `window.opener`, `postMessage` and
+    /// the session shared with the page that opened it. WebKit loads a
+    /// popup's content itself.
+    init(surface: String, url: String?, id: Any?, configuration: WKWebViewConfiguration? = nil) {
         self.surface = surface
-        let config = WKWebViewConfiguration()
-        // As Safari introduces itself, so sites treat the page as Safari's.
-        config.applicationNameForUserAgent = safariUserAgentSuffix
-        for js in initScripts {
-            config.userContentController.addUserScript(
-                WKUserScript(source: js, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        let config: WKWebViewConfiguration
+        if let given = configuration {
+            config = given
+        } else {
+            config = WKWebViewConfiguration()
+            // As Safari introduces itself, so sites treat the page as Safari's.
+            config.applicationNameForUserAgent = safariUserAgentSuffix
+            for js in initScripts {
+                config.userContentController.addUserScript(
+                    WKUserScript(source: js, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+            }
         }
         let frame = NSRect(x: 0, y: 0, width: 1280, height: 800)
         webView = WKWebView(frame: frame, configuration: config)
@@ -102,7 +114,7 @@ final class Page: NSObject, WKNavigationDelegate, WKUIDelegate {
             webView.observe(\.canGoBack) { [weak self] _, _ in self?.meta() },
             webView.observe(\.canGoForward) { [weak self] _, _ in self?.meta() },
         ]
-        load(url, id: id)
+        if let url = url { load(url, id: id) }
     }
 
     /// Load `url`; `id` is answered when it commits or fails.
@@ -156,11 +168,28 @@ final class Page: NSObject, WKNavigationDelegate, WKUIDelegate {
         window.close()
     }
 
-    // `target=_blank` and `window.open`: the same page goes there.
+    // `target=_blank` and `window.open`: a window of its own, related to this
+    // page. Loading the URL here instead (as this once did) left the new page
+    // with no opener, which breaks every sign-in that finishes by messaging
+    // the page that opened it.
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        webView.load(navigationAction.request)
-        return nil
+        popupCount += 1
+        let name = "popup:\(popupCount)"
+        let popup = Page(surface: name, url: nil, id: nil, configuration: configuration)
+        pages[name] = popup
+        send([
+            "event": "popup", "opener": surface, "page": name,
+            "url": navigationAction.request.url?.absoluteString ?? "",
+        ])
+        return popup.webView
+    }
+
+    /// `window.close()`, as a sign-in popup does when it is done.
+    func webViewDidClose(_ webView: WKWebView) {
+        send(["event": "closed", "surface": surface])
+        pages.removeValue(forKey: surface)
+        close()
     }
 
     // MARK: Screencast
@@ -285,6 +314,12 @@ final class Page: NSObject, WKNavigationDelegate, WKUIDelegate {
         // types it. Pressing it here too typed every letter twice. Cmd and Ctrl
         // chords have no text to follow, so they stay.
         if name.count == 1, text?.isEmpty != false, !mods.contains(.command), !mods.contains(.control) { return }
+        // Cmd and Option chords that edit text. A page with no menu bar has
+        // nothing to turn the key equivalent into its command, so ask the web
+        // view for the command directly (as the Chromium backend does).
+        if let command = editingCommand(name, mods), webView.tryToPerform(NSSelectorFromString(command), with: nil) {
+            return
+        }
         let special: [String: (UInt16, String)] = [
             "Enter": (36, "\r"), "Tab": (48, "\t"), "Backspace": (51, "\u{7f}"), "Escape": (53, "\u{1b}"),
             "ArrowLeft": (123, "\u{F702}"), "ArrowRight": (124, "\u{F703}"),
@@ -317,6 +352,36 @@ final class Page: NSObject, WKNavigationDelegate, WKUIDelegate {
             }
         }
     }
+}
+
+/// The AppKit editing command for a Cmd or Option chord, as macOS text fields
+/// take it, or nil when the chord is not an editing one.
+func editingCommand(_ key: String, _ mods: NSEvent.ModifierFlags) -> String? {
+    let extend = mods.contains(.shift)
+    func pick(_ plain: String, _ selecting: String) -> String { extend ? selecting : plain }
+    if mods.contains(.command), !mods.contains(.control), !mods.contains(.option) {
+        switch key.lowercased() {
+        case "a": return "selectAll:"
+        case "z": return extend ? "redo:" : "undo:"
+        case "arrowleft": return pick("moveToBeginningOfLine:", "moveToBeginningOfLineAndModifySelection:")
+        case "arrowright": return pick("moveToEndOfLine:", "moveToEndOfLineAndModifySelection:")
+        case "arrowup": return pick("moveToBeginningOfDocument:", "moveToBeginningOfDocumentAndModifySelection:")
+        case "arrowdown": return pick("moveToEndOfDocument:", "moveToEndOfDocumentAndModifySelection:")
+        case "backspace": return "deleteToBeginningOfLine:"
+        case "delete": return "deleteToEndOfLine:"
+        default: return nil
+        }
+    }
+    if mods.contains(.option), !mods.contains(.command), !mods.contains(.control) {
+        switch key {
+        case "ArrowLeft": return pick("moveWordLeft:", "moveWordLeftAndModifySelection:")
+        case "ArrowRight": return pick("moveWordRight:", "moveWordRightAndModifySelection:")
+        case "Backspace": return "deleteWordBackward:"
+        case "Delete": return "deleteWordForward:"
+        default: return nil
+        }
+    }
+    return nil
 }
 
 func modifierFlags(_ m: [String: Any]?) -> NSEvent.ModifierFlags {
@@ -353,6 +418,8 @@ func png(_ image: NSImage) -> Data? {
 // MARK: - Commands
 
 var pages: [String: Page] = [:]
+/// Popups opened so far; `popup:N` names one until the daemon adopts it.
+var popupCount = 0
 
 func handle(_ msg: [String: Any]) {
     let id = msg["id"]
@@ -366,6 +433,14 @@ func handle(_ msg: [String: Any]) {
         pages[surface] = Page(surface: surface, url: msg["url"] as? String ?? "about:blank", id: id)
     case "close":
         pages.removeValue(forKey: surface)?.close()
+        answer(id)
+    case "adopt":
+        // A popup announced as `page` now has a surface of its own.
+        let name = msg["page"] as? String ?? ""
+        guard let popup = pages.removeValue(forKey: name) else { return fail(id, "no popup \(name)") }
+        popup.surface = surface
+        pages[surface] = popup
+        popup.meta()
         answer(id)
     case "screencast":
         guard let p = pages[surface] else { return fail(id, "no page \(surface)") }

@@ -886,6 +886,47 @@ pub enum BrowserCmd {
         #[command(flatten)]
         target: BrowserTarget,
     },
+    /// Real mouse input at page coordinates (CSS pixels from the top left),
+    /// which reaches cross-origin iframes: mouse click 120 340
+    Mouse {
+        /// click, dblclick, down, up, move or wheel
+        #[arg(value_name = "ACTION")]
+        action: String,
+        #[arg(value_name = "X", allow_hyphen_values = true)]
+        x: f64,
+        #[arg(value_name = "Y", allow_hyphen_values = true)]
+        y: f64,
+        /// left, right or middle
+        #[arg(long)]
+        button: Option<String>,
+        /// Wheel distance, for `wheel`.
+        #[arg(long, allow_hyphen_values = true)]
+        dx: Option<f64>,
+        #[arg(long, allow_hyphen_values = true)]
+        dy: Option<f64>,
+        #[arg(long)]
+        shift: bool,
+        #[arg(long)]
+        ctrl: bool,
+        #[arg(long)]
+        alt: bool,
+        #[arg(long)]
+        meta: bool,
+        #[command(flatten)]
+        target: BrowserTarget,
+    },
+    /// Real key events for whatever has focus, inside cross-origin iframes
+    /// too: keyboard --text "hello", keyboard --key ctrl+a
+    Keyboard {
+        /// Text to type.
+        #[arg(long)]
+        text: Option<String>,
+        /// A key or combination to press: Enter, Tab, ctrl+a.
+        #[arg(long)]
+        key: Option<String>,
+        #[command(flatten)]
+        target: BrowserTarget,
+    },
     /// Choose an option: select <target> <value>
     Select {
         #[arg(num_args = 0..)]

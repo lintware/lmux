@@ -54,6 +54,8 @@ Gtk.init([])
 FRAME_MS = 66  # at most ~15 frames a second while watched
 init_scripts = []
 pages = {}
+# Popups opened so far; `popup:N` names one until the daemon adopts it.
+popup_count = 0
 
 
 def send(obj):
@@ -90,14 +92,22 @@ SPECIAL_KEYS = {
 
 
 class Page:
-    def __init__(self, surface, url, mid):
+    def __init__(self, surface, url, mid, related=None):
+        # `surface` is the daemon's name for the page. A popup is `popup:N`
+        # until the daemon gives it a surface (the `adopt` command).
         self.surface = surface
-        manager = WebKit2.UserContentManager()
-        for js in init_scripts:
-            manager.add_script(WebKit2.UserScript.new(
-                js, WebKit2.UserContentInjectedFrames.ALL_FRAMES,
-                WebKit2.UserScriptInjectionTime.START, None, None))
-        self.view = WebKit2.WebView.new_with_user_content_manager(manager)
+        if related is not None:
+            # A window a page opened: built from that page's own view, so
+            # `window.opener`, `postMessage` and the session are shared.
+            # WebKit loads its content itself.
+            self.view = WebKit2.WebView.new_with_related_view(related.view)
+        else:
+            manager = WebKit2.UserContentManager()
+            for js in init_scripts:
+                manager.add_script(WebKit2.UserScript.new(
+                    js, WebKit2.UserContentInjectedFrames.ALL_FRAMES,
+                    WebKit2.UserScriptInjectionTime.START, None, None))
+            self.view = WebKit2.WebView.new_with_user_content_manager(manager)
         self.window = Gtk.OffscreenWindow()
         self.window.set_default_size(1280, 800)
         self.window.add(self.view)
@@ -113,9 +123,11 @@ class Page:
         self.view.connect("load-changed", self.load_changed)
         self.view.connect("load-failed", self.load_failed)
         self.view.connect("create", self.create_view)
+        self.view.connect("close", self.window_closed)
         for prop in ("uri", "title", "is-loading"):
             self.view.connect("notify::" + prop, lambda *_: self.meta())
-        self.load(url, mid)
+        if related is None:
+            self.load(url, mid)
 
     def load(self, url, mid=None):
         if mid is not None:
@@ -148,9 +160,26 @@ class Page:
         return False
 
     def create_view(self, _view, action):
-        # `target=_blank` and `window.open`: the same page goes there.
-        self.view.load_request(action.get_request())
-        return None
+        # `target=_blank` and `window.open`: a window of its own, related to
+        # this page. Loading the URL here instead left the new page with no
+        # opener, which breaks every sign-in that finishes by messaging the
+        # page that opened it.
+        global popup_count
+        popup_count += 1
+        name = "popup:%d" % popup_count
+        popup = Page(name, None, None, related=self)
+        pages[name] = popup
+        request = action.get_request()
+        send({"event": "popup", "opener": self.surface, "page": name,
+              "url": (request.get_uri() if request else "") or ""})
+        return popup.view
+
+    def window_closed(self, _view):
+        # `window.close()`, as a sign-in popup does when it is done.
+        send({"event": "closed", "surface": self.surface})
+        if pages.get(self.surface) is self:
+            pages.pop(self.surface)
+        self.close()
 
     def meta(self):
         v = self.view
@@ -361,6 +390,16 @@ def handle(msg):
         if page:
             pages.pop(surface).close()
         answer(mid)
+    elif cmd == "adopt":
+        # A popup announced as `page` now has a surface of its own.
+        popup = pages.pop(msg.get("page", ""), None)
+        if popup is None:
+            fail(mid, "no popup " + str(msg.get("page")))
+        else:
+            popup.surface = surface
+            pages[surface] = popup
+            popup.meta()
+            answer(mid)
     elif page is None:
         fail(mid, "no page " + surface)
     elif cmd == "screencast":

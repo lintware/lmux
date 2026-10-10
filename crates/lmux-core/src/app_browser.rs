@@ -145,7 +145,7 @@ fn found(v: &Value, sel: &str) -> Result<(), RpcError> {
 }
 
 /// `ctrl+shift+a` / `Enter`: modifiers, and the DOM `key` for the rest.
-fn parse_key(combo: &str) -> (String, bool, bool, bool, bool) {
+pub(crate) fn parse_key(combo: &str) -> (String, bool, bool, bool, bool) {
     let (mut ctrl, mut alt, mut shift, mut meta) = (false, false, false, false);
     let mut key = String::new();
     let parts: Vec<&str> = combo.split('+').collect();

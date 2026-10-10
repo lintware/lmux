@@ -46,6 +46,12 @@ pub trait BrowserBackend: Send + Sync {
 
     /// A receiver for backend-pushed events. Each call yields a fresh receiver.
     async fn subscribe_events(&self) -> anyhow::Result<mpsc::UnboundedReceiver<BrowserEvent>>;
+
+    /// A window the backend announced with [`BrowserEvent::Popup`] now has a
+    /// surface: `page` is the backend's name for it, `url` where it is.
+    async fn adopt_popup(&self, _page: &str, _surface: &str, _url: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub fn unsupported(method: &str) -> RpcError {
@@ -126,6 +132,10 @@ impl BrowserBackend for FakeBrowser {
         let (tx, rx) = mpsc::unbounded_channel();
         *self.tx.lock().unwrap() = Some(tx);
         Ok(rx)
+    }
+    async fn adopt_popup(&self, page: &str, surface: &str, url: &str) -> anyhow::Result<()> {
+        self.log(format!("adopt {page} {surface} {url}"));
+        Ok(())
     }
 }
 

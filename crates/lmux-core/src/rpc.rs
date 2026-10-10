@@ -294,7 +294,7 @@ fn recount_unread(state: &mut crate::tree::SessionState) {
 
 /// A fresh browser surface. Its page is created by the backend, or by the app
 /// when the browser is drawn there (`in_app`).
-fn browser_surface(id: Ref, url: Option<&str>, in_app: bool) -> Surface {
+pub(crate) fn browser_surface(id: Ref, url: Option<&str>, in_app: bool) -> Surface {
     Surface {
         id,
         title: url.unwrap_or("browser").to_string(),
@@ -1666,6 +1666,9 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             inner.mark_dirty();
             ok(id, json!({"surface": surface}))
         }
+        methods::BROWSER_MOUSE | methods::BROWSER_KEYBOARD => {
+            browser_input_rpc(inner, id, &req.method, params).await
+        }
         m if m.starts_with("browser.") => {
             // A browser the app draws: the app runs the command's steps.
             let in_app = {
@@ -1706,6 +1709,146 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             format!("unknown method: {other}"),
         ),
     }
+}
+
+/// `browser.mouse` and `browser.keyboard`: real pointer and key events, sent
+/// the way the app sends a viewer's input. They go through the engine's own
+/// input path, so they land in cross-origin iframes (Google's sign-in button,
+/// payment frames) that element refs and DOM events cannot reach.
+async fn browser_input_rpc(inner: &Arc<Inner>, id: u64, method: &str, params: &Value) -> RpcResponse {
+    let (surface, in_app) = {
+        let state = inner.state.lock().await;
+        let surface = resolve_browser_surface(&state, params);
+        let in_app = surface
+            .as_ref()
+            .is_some_and(|sf| matches!(state.surface(sf).map(|x| &x.kind), Some(SurfaceKind::Browser { in_app: true, .. })));
+        (surface, in_app)
+    };
+    let Some(surface) = surface else {
+        return err(id, RpcErrorCode::NotFound, "surface not found");
+    };
+    if in_app {
+        return err(
+            id,
+            RpcErrorCode::Unsupported,
+            "real pointer and key input is not available for browsers the lmux app draws itself; \
+             use a browser on a host (a WebKit helper or Chromium)",
+        );
+    }
+    let Some(backend) = &inner.browser else {
+        return err(id, RpcErrorCode::Unsupported, unsupported(method).message);
+    };
+    let events = match input_events(method, params) {
+        Ok(e) => e,
+        Err(m) => return err(id, RpcErrorCode::InvalidParams, m),
+    };
+    let n = events.len();
+    for ev in events {
+        if let Err(e) = backend.input(&surface, ev).await {
+            return err(id, RpcErrorCode::Internal, format!("input: {e}"));
+        }
+        // Pages see hover, press and release as separate moments.
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
+    ok(id, json!({ "events": n }))
+}
+
+fn input_mods(params: &Value) -> lmux_proto::Modifiers {
+    let flag = |k: &str| {
+        params
+            .get("modifiers")
+            .and_then(|m| m.get(k))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    lmux_proto::Modifiers { alt: flag("alt"), ctrl: flag("ctrl"), meta: flag("meta"), shift: flag("shift") }
+}
+
+/// DOM `KeyboardEvent.code` for a `key` as typed.
+fn dom_code(key: &str) -> String {
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii_alphabetic() => format!("Key{}", c.to_ascii_uppercase()),
+        (Some(c), None) if c.is_ascii_digit() => format!("Digit{c}"),
+        (Some(' '), None) => "Space".into(),
+        _ => key.to_owned(),
+    }
+}
+
+/// The input events for a `browser.mouse` or `browser.keyboard` request.
+pub(crate) fn input_events(method: &str, params: &Value) -> Result<Vec<lmux_proto::BrowserInputEvent>, String> {
+    use lmux_proto::{BrowserInputEvent as E, KeyAction, MouseAction, MouseButton};
+    let mods = input_mods(params);
+    if method == methods::BROWSER_MOUSE {
+        let num = |k: &str| params.get(k).and_then(Value::as_f64);
+        let action = s(params, "action").unwrap_or_else(|| "click".into());
+        let (Some(x), Some(y)) = (num("x"), num("y")) else {
+            return Err("x and y are required (CSS pixels from the top left of the page)".into());
+        };
+        let button = match s(params, "button").as_deref() {
+            None | Some("left") => MouseButton::Left,
+            Some("right") => MouseButton::Right,
+            Some("middle") => MouseButton::Middle,
+            Some(other) => return Err(format!("unknown button `{other}` (left, right, middle)")),
+        };
+        let mouse = |action: MouseAction, button: MouseButton, click_count: u32| E::Mouse {
+            action,
+            x,
+            y,
+            button,
+            click_count,
+            modifiers: mods,
+        };
+        return match action.as_str() {
+            "move" => Ok(vec![mouse(MouseAction::Move, MouseButton::None, 0)]),
+            "down" => Ok(vec![mouse(MouseAction::Move, MouseButton::None, 0), mouse(MouseAction::Down, button, 1)]),
+            "up" => Ok(vec![mouse(MouseAction::Up, button, 1)]),
+            "click" | "dblclick" => {
+                let n = if action == "dblclick" {
+                    2
+                } else {
+                    params.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 3) as u32
+                };
+                let mut out = vec![mouse(MouseAction::Move, MouseButton::None, 0)];
+                for i in 1..=n {
+                    out.push(mouse(MouseAction::Down, button, i));
+                    out.push(mouse(MouseAction::Up, button, i));
+                }
+                Ok(out)
+            }
+            "wheel" => Ok(vec![E::Wheel {
+                x,
+                y,
+                delta_x: num("dx").unwrap_or(0.0),
+                delta_y: num("dy").unwrap_or(0.0),
+                modifiers: mods,
+            }]),
+            other => Err(format!("unknown action `{other}` (click, dblclick, down, up, move, wheel)")),
+        };
+    }
+
+    // browser.keyboard
+    let mut out = Vec::new();
+    if let Some(text) = s(params, "text").filter(|t| !t.is_empty()) {
+        out.push(E::InsertText { text });
+    }
+    if let Some(combo) = s(params, "key").filter(|k| !k.is_empty()) {
+        let (key, ctrl, alt, shift, meta) = crate::app_browser::parse_key(&combo);
+        if key.is_empty() {
+            return Err(format!("unknown key `{combo}`"));
+        }
+        let mods = lmux_proto::Modifiers { alt, ctrl, meta, shift };
+        // A character key produces its text unless Ctrl or Cmd turn it into a
+        // shortcut.
+        let text = (key.chars().count() == 1 && !ctrl && !meta).then(|| key.clone());
+        let code = dom_code(&key);
+        out.push(E::Key { action: KeyAction::Down, key: key.clone(), code: code.clone(), text, modifiers: mods });
+        out.push(E::Key { action: KeyAction::Up, key, code, text: None, modifiers: mods });
+    }
+    if out.is_empty() {
+        return Err("give `text` to type, or `key` to press (ctrl+a, Enter, ...)".into());
+    }
+    Ok(out)
 }
 
 /// `browser.open` with no workspace to put it in: a new workspace holding just
@@ -2218,6 +2361,51 @@ async fn close_workspace(inner: &Arc<Inner>, ws: &str) {
 
 #[cfg(test)]
 mod tests {
+    use lmux_proto::{BrowserInputEvent as E, KeyAction, MouseAction, MouseButton};
+
+    #[test]
+    fn mouse_clicks_are_a_move_then_presses_and_releases() {
+        let ev = input_events(methods::BROWSER_MOUSE, &json!({"action": "click", "x": 10, "y": 20})).unwrap();
+        assert_eq!(ev.len(), 3);
+        assert!(matches!(ev[0], E::Mouse { action: MouseAction::Move, x, y, .. } if x == 10.0 && y == 20.0));
+        assert!(matches!(ev[1], E::Mouse { action: MouseAction::Down, button: MouseButton::Left, click_count: 1, .. }));
+        assert!(matches!(ev[2], E::Mouse { action: MouseAction::Up, button: MouseButton::Left, click_count: 1, .. }));
+
+        let ev = input_events(methods::BROWSER_MOUSE, &json!({"action": "dblclick", "x": 1, "y": 2, "button": "right"})).unwrap();
+        assert_eq!(ev.len(), 5, "move, then two press/release pairs");
+        assert!(matches!(ev[3], E::Mouse { action: MouseAction::Down, button: MouseButton::Right, click_count: 2, .. }));
+
+        let ev = input_events(methods::BROWSER_MOUSE, &json!({"action": "wheel", "x": 5, "y": 6, "dy": 120})).unwrap();
+        assert!(matches!(ev[0], E::Wheel { delta_y, delta_x, .. } if delta_y == 120.0 && delta_x == 0.0));
+
+        let ev = input_events(methods::BROWSER_MOUSE, &json!({"action": "click", "x": 1, "y": 1, "modifiers": {"shift": true}})).unwrap();
+        assert!(matches!(ev[1], E::Mouse { modifiers, .. } if modifiers.shift && !modifiers.ctrl));
+    }
+
+    #[test]
+    fn mouse_requests_are_checked() {
+        assert!(input_events(methods::BROWSER_MOUSE, &json!({"action": "click"})).is_err(), "no coordinates");
+        assert!(input_events(methods::BROWSER_MOUSE, &json!({"action": "swipe", "x": 1, "y": 1})).unwrap_err().contains("unknown action"));
+        assert!(input_events(methods::BROWSER_MOUSE, &json!({"x": 1, "y": 1, "button": "side"})).unwrap_err().contains("unknown button"));
+    }
+
+    #[test]
+    fn keyboard_text_and_keys() {
+        let ev = input_events(methods::BROWSER_KEYBOARD, &json!({"text": "héllo"})).unwrap();
+        assert_eq!(ev, vec![E::InsertText { text: "héllo".into() }]);
+
+        // A character key carries its text; Ctrl and Cmd make it a shortcut.
+        let ev = input_events(methods::BROWSER_KEYBOARD, &json!({"key": "a"})).unwrap();
+        assert!(matches!(&ev[0], E::Key { action: KeyAction::Down, key, code, text: Some(t), .. } if key == "a" && code == "KeyA" && t == "a"));
+        assert!(matches!(&ev[1], E::Key { action: KeyAction::Up, text: None, .. }));
+        let ev = input_events(methods::BROWSER_KEYBOARD, &json!({"key": "meta+a"})).unwrap();
+        assert!(matches!(&ev[0], E::Key { text: None, modifiers, .. } if modifiers.meta));
+        let ev = input_events(methods::BROWSER_KEYBOARD, &json!({"key": "Enter"})).unwrap();
+        assert!(matches!(&ev[0], E::Key { key, code, text: None, .. } if key == "Enter" && code == "Enter"));
+
+        assert!(input_events(methods::BROWSER_KEYBOARD, &json!({})).is_err());
+    }
+
     use super::*;
     use crate::tree::{terminal_surface, SessionState};
 

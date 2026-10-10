@@ -1655,6 +1655,37 @@ async fn browser_event_loop(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<B
                     .await;
                 inner.tree_changed();
             }
+            BrowserEvent::Popup { opener, page, url } => {
+                // A real popup: a tab beside its opener, shown at once. The
+                // page keeps its opener inside the engine; this only gives it
+                // a surface the app and agents can address.
+                let surface = {
+                    let mut state = inner.state.lock().await;
+                    match state.pane_of_surface(&opener) {
+                        Some(pane) => {
+                            let surface = state.next_surface();
+                            let shown = (!url.is_empty() && url != "about:blank").then_some(url.as_str());
+                            state.add_surface(&pane, crate::rpc::browser_surface(surface.clone(), shown, false));
+                            Some(surface)
+                        }
+                        None => None,
+                    }
+                };
+                match (surface, &inner.browser) {
+                    (Some(surface), Some(b)) => {
+                        if let Err(e) = b.adopt_popup(&page, &surface, &url).await {
+                            tracing::warn!("popup {page} for {surface}: {e}");
+                        }
+                        inner.tree_changed();
+                        inner.mark_dirty();
+                    }
+                    // Its opener is gone: nothing will show this window.
+                    (None, Some(b)) => {
+                        let _ = b.close_surface(&page).await;
+                    }
+                    _ => {}
+                }
+            }
             BrowserEvent::Closed { surface } => {
                 {
                     let mut state = inner.state.lock().await;
@@ -2354,6 +2385,168 @@ mod tests {
         let started = wait_for(5, || async { inner.is_streaming(&surf).await }).await;
         assert!(started, "no stream for the second viewer: {:?}", fake.calls.lock().unwrap());
         assert_eq!(fake.calls.lock().unwrap().last().unwrap(), &format!("start {surf} 900x600"));
+    }
+
+    /// An `Inner` with one workspace holding one browser tab, backed by a
+    /// fake browser whose events the daemon's browser loop is consuming.
+    async fn browser_daemon(tag: &str) -> Option<(Arc<Inner>, Arc<crate::browser::FakeBrowser>, Ref, Ref, crate::tmux::ScratchServer, tempfile::TempDir)> {
+        let socket = format!("lmux-test-{tag}-{}", std::process::id());
+        let scratch = crate::tmux::ScratchServer(socket.clone());
+        let state_dir = tempfile::tempdir().unwrap();
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let tmux = match Tmux::spawn(TmuxConfig { socket: socket.clone(), session: "lmux".into() }, ev_tx).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping: could not start tmux ({e})");
+                return None;
+            }
+        };
+        let mut state = SessionState::new("t");
+        let ws = state.next_workspace();
+        let pane = state.next_pane();
+        let surf = state.next_surface();
+        state.add_workspace(Workspace {
+            id: ws,
+            title: "w".into(),
+            folder: None,
+            cwd: "/tmp".into(),
+            git_branch: None,
+            agent: AgentState::None,
+            summary: None,
+            unread_notifications: 0,
+            status_pills: vec![],
+            progress: None,
+            layout: Layout::Pane { pane: pane.clone() },
+            panes: vec![Pane {
+                id: pane.clone(),
+                surfaces: vec![Surface {
+                    id: surf.clone(),
+                    title: "b".into(),
+                    kind: SurfaceKind::Browser {
+                        url: "https://a.test".into(),
+                        loading: false,
+                        can_go_back: false,
+                        can_go_forward: false,
+                        in_app: false,
+                    },
+                }],
+                active_surface: Some(surf.clone()),
+            }],
+            focused_pane: Some(pane.clone()),
+            ports: vec![],
+            pr: None,
+        });
+        let (fake, rx) = crate::browser::FakeBrowser::with_channel();
+        let fake = Arc::new(fake);
+        let inner = Arc::new(Inner {
+            cfg: Config {
+                state_dir: state_dir.path().to_path_buf(),
+                socket: None,
+                tmux_socket: socket,
+                ws_addr: "127.0.0.1:1".into(),
+                host: "t".into(),
+                app_browser: false,
+            },
+            state: Mutex::new(state),
+            tmux,
+            browser: Some(fake.clone()),
+            browser_streaming: Mutex::new(HashSet::new()),
+            browser_sizes: Default::default(),
+            clients: Mutex::new(Clients::default()),
+            dirty: Notify::new(),
+            tree_dirty: Notify::new(),
+            respawn: std::sync::Mutex::new(RespawnState::default()),
+            scrollback_dirty: std::sync::Mutex::new(HashSet::new()),
+            pane_activity: Default::default(),
+            paused_output: Default::default(),
+            prs: std::sync::Mutex::new(HashMap::new()),
+            app_calls: Default::default(),
+        });
+        tokio::spawn(browser_event_loop(inner.clone(), rx));
+        Some((inner, fake, pane, surf, scratch, state_dir))
+    }
+
+    /// A window a page opened becomes a tab beside its opener, selected so it
+    /// is shown, and the backend is told which surface it is. When the page
+    /// closes itself the tab goes.
+    #[tokio::test]
+    async fn a_popup_becomes_a_tab_beside_its_opener_and_closes_with_its_window() {
+        let Some((inner, fake, pane, opener, _scratch, _dir)) = browser_daemon("popup").await else { return };
+        fake.emit(BrowserEvent::Popup {
+            opener: opener.clone(),
+            page: "popup:1".into(),
+            url: "https://accounts.test/o/oauth".into(),
+        });
+        let appeared = wait_for(5, || async {
+            let s = inner.state.lock().await;
+            s.locate_pane(&pane).is_some_and(|(wi, pi)| s.workspaces[wi].panes[pi].surfaces.len() == 2)
+        })
+        .await;
+        assert!(appeared, "no tab for the popup");
+        let (popup, shown, url) = {
+            let s = inner.state.lock().await;
+            let (wi, pi) = s.locate_pane(&pane).unwrap();
+            let p = &s.workspaces[wi].panes[pi];
+            let popup = p.surfaces[1].id.clone();
+            let url = match &p.surfaces[1].kind {
+                SurfaceKind::Browser { url, in_app, .. } => {
+                    assert!(!in_app);
+                    url.clone()
+                }
+                other => panic!("{other:?}"),
+            };
+            (popup, p.active_surface.clone(), url)
+        };
+        assert_eq!(shown.as_deref(), Some(popup.as_str()), "the popup is the active tab");
+        assert_eq!(url, "https://accounts.test/o/oauth");
+        assert!(
+            fake.calls.lock().unwrap().contains(&format!("adopt popup:1 {popup} https://accounts.test/o/oauth")),
+            "the backend adopts it as that surface: {:?}",
+            fake.calls.lock().unwrap()
+        );
+
+        // `window.close()`.
+        fake.emit(BrowserEvent::Closed { surface: popup.clone() });
+        let gone = wait_for(5, || async { inner.state.lock().await.surface(&popup).is_none() }).await;
+        assert!(gone, "the popup's tab outlived its window");
+        assert!(inner.state.lock().await.surface(&opener).is_some(), "the opener stays");
+    }
+
+    /// A window whose opener is gone has nowhere to show: it is closed
+    /// instead of lingering in the backend.
+    #[tokio::test]
+    async fn a_popup_without_an_opener_is_closed() {
+        let Some((inner, fake, _pane, _opener, _scratch, _dir)) = browser_daemon("orphan").await else { return };
+        fake.emit(BrowserEvent::Popup { opener: "surface:999".into(), page: "popup:7".into(), url: String::new() });
+        let closed = wait_for(5, || async { fake.calls.lock().unwrap().contains(&"close popup:7".to_string()) }).await;
+        assert!(closed, "{:?}", fake.calls.lock().unwrap());
+        assert_eq!(inner.state.lock().await.workspaces[0].panes[0].surfaces.len(), 1);
+    }
+
+    /// `browser.mouse` and `browser.keyboard` reach the backend as real input
+    /// events, in order, and bad requests are refused up front.
+    #[tokio::test]
+    async fn browser_mouse_and_keyboard_become_input_events() {
+        let Some((inner, fake, _pane, surf, _scratch, _dir)) = browser_daemon("input").await else { return };
+        let call = |method: &str, params: serde_json::Value| RpcRequest { id: 1, method: method.into(), params };
+        let inputs = |fake: &crate::browser::FakeBrowser| {
+            fake.calls.lock().unwrap().iter().filter(|c| c.starts_with("input ")).count()
+        };
+
+        let r = crate::rpc::dispatch(&inner, &call(methods::BROWSER_MOUSE, json!({"surface": surf, "action": "click", "x": 12, "y": 34}))).await;
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(r.result.unwrap()["events"], 3, "move, press, release");
+        assert_eq!(inputs(&fake), 3);
+
+        let r = crate::rpc::dispatch(&inner, &call(methods::BROWSER_KEYBOARD, json!({"surface": surf, "text": "hi", "key": "Enter"}))).await;
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(r.result.unwrap()["events"], 3, "the text, then Enter down and up");
+
+        let r = crate::rpc::dispatch(&inner, &call(methods::BROWSER_MOUSE, json!({"surface": surf, "action": "click"}))).await;
+        assert_eq!(r.error.map(|e| e.code), Some(RpcErrorCode::InvalidParams), "x and y are required");
+        let r = crate::rpc::dispatch(&inner, &call(methods::BROWSER_KEYBOARD, json!({"surface": surf}))).await;
+        assert_eq!(r.error.map(|e| e.code), Some(RpcErrorCode::InvalidParams), "text or key is required");
+        assert_eq!(inputs(&fake), 6, "refused requests send nothing");
     }
 
     /// A closed workspace whose window outlived the kill (tmux too busy to

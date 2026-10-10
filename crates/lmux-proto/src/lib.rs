@@ -487,6 +487,11 @@ pub enum BrowserEvent {
     },
     /// The page or its target closed on its own.
     Closed { surface: Ref },
+    /// A page opened a window (`window.open`, `target=_blank`) that the
+    /// backend kept related to its opener, so `window.opener`, `postMessage`
+    /// and `window.close()` work. The window is known to the backend as `page`
+    /// until the daemon gives it a surface and adopts it.
+    Popup { opener: Ref, page: String, url: String },
 }
 
 #[cfg(test)]

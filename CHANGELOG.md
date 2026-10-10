@@ -7,6 +7,28 @@ All notable changes to lmux are listed here, newest first. The format follows
 
 ## Unreleased
 
+### Added
+
+- **Real pointer and keyboard input for agents:** `lmux browser mouse click|dblclick|down|up|move|wheel X Y`
+  and `lmux browser keyboard --text … | --key …`. They go through the browser
+  engine's own input path, so they land inside cross-origin iframes (Google's
+  sign-in button, payment frames) that element refs and DOM events cannot
+  reach. Not yet available for browsers the app draws itself.
+
+### Fixed
+
+- **Popups are real windows.** A page's `window.open` and `target=_blank` now
+  open a tab beside it that keeps `window.opener`, so sign-ins that finish with
+  `postMessage` and `window.close()` complete, and the tab goes away when the
+  popup closes. WebKit browsers on a host used to load the popup's URL into
+  the same page.
+- Typing in a WebKit browser on a host no longer types every character twice.
+- A terminal whose program turned on mouse reporting before the app attached
+  now gets the mouse wheel, instead of the app scrolling its own history.
+- Renaming a session no longer draws the sessions below it over its card.
+- `Cmd+A`, `Cmd+Z`, `Cmd+←/→` and Option+arrow/delete edit text in WebKit
+  browsers on a Mac host.
+
 ## 0.1.0 - 2026-10-10
 
 The first public release.

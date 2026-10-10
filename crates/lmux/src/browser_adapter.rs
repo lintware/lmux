@@ -142,5 +142,6 @@ fn convert(event: lmux_browser::BrowserEvent) -> BrowserEvent {
             can_go_forward,
         },
         lmux_browser::BrowserEvent::Closed { surface } => BrowserEvent::Closed { surface },
+        lmux_browser::BrowserEvent::Popup { opener, page, url } => BrowserEvent::Popup { opener, page, url },
     }
 }

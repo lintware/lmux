@@ -13,12 +13,18 @@
 //!   WebKit's JSON for the value, as text; a screenshot with `{"png_base64"}`
 //! - `{"cmd":"screencast","surface","width","height","scale"}` (width 0 stops)
 //!
+//! - `{"cmd":"adopt","page","surface"}`: the window the helper announced with
+//!   a `popup` event is now `surface`.
+//!
 //! Without an `id`, and unanswered: `{"cmd":"ack","surface","seq"}` (a frame
 //! was drawn; the next may come) and `{"cmd":"input","surface","event"}`.
 //!
 //! The helper sends `{"event":"frame","surface","seq","width","height","jpeg"}`
-//! (base64) and `{"event":"meta","surface","url","title","loading",
-//! "can_go_back","can_go_forward"}`.
+//! (base64), `{"event":"meta","surface","url","title","loading",
+//! "can_go_back","can_go_forward"}`, `{"event":"closed","surface"}` (the page
+//! called `window.close()`) and `{"event":"popup","opener","page","url"}`: the
+//! page opened a window. The helper keeps it related to its opener, so
+//! `window.opener` and `postMessage` work, and names it `page` until `adopt`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -236,7 +242,17 @@ fn handle_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
                 can_go_forward: b("can_go_forward"),
             }
         }
-        Some("closed") => BrowserEvent::Closed { surface: s("surface") },
+        Some("closed") => {
+            // Gone for good (a popup calling `window.close()`): a restarted
+            // helper must not reopen it.
+            let surface = s("surface");
+            let mut sh = shared.lock().unwrap();
+            sh.pages.remove(&surface);
+            sh.casts.remove(&surface);
+            drop(sh);
+            BrowserEvent::Closed { surface }
+        }
+        Some("popup") => BrowserEvent::Popup { opener: s("opener"), page: s("page"), url: s("url") },
         _ => return,
     };
     shared.lock().unwrap().listeners.retain(|l| l.send(event.clone()).is_ok());
@@ -308,6 +324,15 @@ impl BrowserBackend for WebKitBackend {
         self.shared.lock().unwrap().listeners.push(tx);
         Ok(rx)
     }
+
+    async fn adopt_popup(&self, page: &str, surface: &str, url: &str) -> anyhow::Result<()> {
+        // Reopened at this URL (without its opener) if the helper restarts.
+        self.shared.lock().unwrap().pages.insert(surface.to_owned(), url.to_owned());
+        self.call(json!({"cmd": "adopt", "page": page, "surface": surface}))
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!(e))
+    }
 }
 
 #[cfg(test)]
@@ -335,5 +360,20 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), BrowserEvent::Meta { .. }));
         // A new helper would reopen the page where it now is.
         assert_eq!(shared.lock().unwrap().pages["surface:1"], "https://a.test/");
+
+        // A window the page opened is announced under the helper's own name.
+        handle_message(&shared, json!({"event": "popup", "opener": "surface:1", "page": "popup:1", "url": "https://b.test/"}));
+        match rx.try_recv().unwrap() {
+            BrowserEvent::Popup { opener, page, url } => {
+                assert_eq!((opener.as_str(), page.as_str(), url.as_str()), ("surface:1", "popup:1", "https://b.test/"))
+            }
+            other => panic!("{other:?}"),
+        }
+        // One that closed itself is gone for good: a restarted helper must
+        // not reopen it.
+        shared.lock().unwrap().pages.insert("surface:2".into(), "https://b.test/".into());
+        handle_message(&shared, json!({"event": "closed", "surface": "surface:2"}));
+        assert!(matches!(rx.try_recv().unwrap(), BrowserEvent::Closed { .. }));
+        assert!(!shared.lock().unwrap().pages.contains_key("surface:2"));
     }
 }
