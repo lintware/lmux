@@ -124,13 +124,13 @@ pub fn close(p: &Painter, rect: Rect, color: Color32) {
     line(
         p,
         vec![Pos2::new(c.x - s, c.y - s), Pos2::new(c.x + s, c.y + s)],
-        1.3,
+        1.6,
         color,
     );
     line(
         p,
         vec![Pos2::new(c.x + s, c.y - s), Pos2::new(c.x - s, c.y + s)],
-        1.3,
+        1.6,
         color,
     );
 }

@@ -818,8 +818,18 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ct
         Sense::click(),
     );
     if c.state.tab_drag.is_none() && (resp.hovered() || close_resp.hovered()) {
-        let color = if close_resp.hovered() { theme::RED } else { theme::DIM_2 };
-        icons::close(&p, Rect::from_center_size(close_center, Vec2::splat(9.0)), color);
+        let hot = close_resp.hovered();
+        if hot {
+            // Round hover plate so the target reads as a button.
+            let plate = if selected { Color32::from_white_alpha(46) } else { Color32::from_white_alpha(22) };
+            p.circle_filled(close_center, 9.0, plate);
+        }
+        let color = match (hot, selected) {
+            (true, _) => Color32::WHITE,
+            (false, true) => Color32::from_white_alpha(200),
+            (false, false) => theme::DIM_2,
+        };
+        icons::close(&p, Rect::from_center_size(close_center, Vec2::splat(14.0)), color);
     }
     if close_resp.clicked() {
         c.state.close_workspace(&ws.id);

@@ -25,7 +25,7 @@ pub const ACCENT: Color32 = Color32::from_rgb(0xD9, 0x43, 0x20);
 pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0xF0, 0x7A, 0x3C);
 /// The flame's lighter orange.
 pub const FLAME: Color32 = Color32::from_rgb(0xF0, 0x7A, 0x3C);
-pub const GREEN: Color32 = Color32::from_rgb(0xB3, 0xBC, 0x88);
+pub const GREEN: Color32 = Color32::from_rgb(0x3D, 0xE0, 0x7A);
 pub const RED: Color32 = Color32::from_rgb(0xF0, 0x56, 0x3C);
 pub const AMBER: Color32 = Color32::from_rgb(0xFF, 0xC2, 0x7A);
 
