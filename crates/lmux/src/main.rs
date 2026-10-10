@@ -13,6 +13,7 @@ mod browser_adapter;
 mod cli;
 mod commands;
 mod import;
+mod share;
 mod wait;
 
 use cli::{ClaudeHook, Cli, Cmd, HooksCmd};
@@ -152,6 +153,9 @@ async fn run() -> anyhow::Result<()> {
         Cmd::WsProbe { surface, addr, timeout, resizes } => {
             ws_probe(&addr, &surface, timeout, resizes).await?;
             return Ok(());
+        }
+        Cmd::Share { allow_typing, port, no_tunnel, cloudflared } => {
+            return share::run(share::Opts { socket, allow_typing, port, no_tunnel, cloudflared, json }).await;
         }
         Cmd::ImportCmux { move_, force, dry_run, only, from } => {
             let opts = import::Opts { from, move_, force, dry_run, only };

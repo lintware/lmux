@@ -682,6 +682,7 @@ fn build(cmd: Cmd) -> anyhow::Result<Req> {
         Cmd::Server(_)
         | Cmd::Hooks { .. }
         | Cmd::WsProbe { .. }
+        | Cmd::Share { .. }
         | Cmd::Rpc { .. }
         | Cmd::ImportCmux { .. }
         | Cmd::WaitFor { .. }

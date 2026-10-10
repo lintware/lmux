@@ -56,6 +56,7 @@ pub fn install(ctx: &egui::Context) -> Option<MenuBar> {
             &item("Add Remote Host…", None),
             &item("New Cloud Box…", None),
             &item("Import from cmux…", None),
+            &item("Show QR…", None),
             &P::separator(),
             &P::services(None),
             &P::separator(),

@@ -11,6 +11,7 @@ pub mod layout;
 pub mod menu;
 pub mod net;
 pub mod pty;
+pub mod share_dialog;
 pub mod state;
 pub mod term;
 pub mod termio;

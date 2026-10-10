@@ -203,6 +203,7 @@ impl eframe::App for LmuxApp {
                 let modal = c.state.confirm_close.is_some()
                     || c.state.palette.is_some()
                     || c.state.add_host_draft.is_some()
+                    || c.state.share_draft.is_some()
                     || c.state.cloud_draft.is_some()
                     || c.state.confirm_cloud_delete.is_some();
                 if window_focused && !text_editing && !modal {
@@ -254,6 +255,7 @@ impl eframe::App for LmuxApp {
                 || s.confirm_close.is_some()
                 || s.palette.is_some()
                 || s.add_host_draft.is_some()
+                || s.share_draft.is_some()
                 || s.cloud_draft.is_some()
                 || s.confirm_cloud_delete.is_some()
                 || s.tab_drag.is_some();
@@ -335,6 +337,10 @@ impl eframe::App for LmuxApp {
         for i in removals.into_iter().rev() {
             self.remove_host(i);
         }
+    }
+
+    fn on_exit(&mut self) {
+        crate::share_dialog::shutdown();
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -800,6 +806,9 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
         if let Some(imp) = other.state.cmux_import.take() {
             c.state.cmux_import = Some(imp);
         }
+        if let Some(d) = other.state.share_draft.take() {
+            c.state.share_draft = Some(d);
+        }
         if let Some(name) = other.state.confirm_cloud_delete.take() {
             c.state.confirm_cloud_delete = Some(name);
         }
@@ -807,6 +816,7 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
     add_host_dialog(&ctx, c);
     cloud_dialog(&ctx, c);
     crate::cmux_import::dialog(&ctx, c);
+    crate::share_dialog::dialog(&ctx, c);
     confirm_cloud_delete_dialog(&ctx, c);
     confirm_close_dialog(&ctx, c);
 
@@ -1439,6 +1449,7 @@ pub fn run_command(c: &mut ui::Ctx, name: &str) {
         }
         "Add Remote Host…" => c.state.add_host_draft = Some(String::new()),
         "New Cloud Box…" => c.state.cloud_draft = Some(crate::state::CloudDraft::new("aws")),
+        "Show QR…" => c.state.share_draft = Some(crate::share_dialog::Draft::default()),
         "Import from cmux…" => {
             if c.state.cmux_import.is_none() {
                 c.state.cmux_import = Some(crate::cmux_import::CmuxImport::new());

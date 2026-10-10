@@ -276,3 +276,118 @@ fn import_cmux_builds_workspaces_from_an_export() {
     let clients = tree["folders"].as_array().unwrap().iter().filter(|f| f["name"] == "Clients").count();
     assert_eq!(clients, 1);
 }
+
+/// `lmux share --no-tunnel`: the code-for-cookie exchange, the Origin and
+/// cookie checks on the WebSocket, the session list, a live screen, and the
+/// view-only default.
+#[tokio::test(flavor = "multi_thread")]
+async fn share_serves_sessions_with_the_security_rules() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+    let Some(d) = Daemon::start() else { return };
+    d.ok(&["new-workspace", "--name", "shared", "--command", "/bin/sh"]);
+    d.ok(&["send", "echo", "SHARE_$((6*7))\\n", "--surface", "surface:1"]);
+    d.ok(&["wait-for", "--text", "SHARE_42", "--surface", "surface:1", "--timeout", "10"]);
+
+    // View-only share; stdin stays open (closing it would end the share).
+    let mut share = d.cmd(&["--json", "share", "--no-tunnel"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut line = String::new();
+    BufReader::new(share.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let info: serde_json::Value = serde_json::from_str(&line).expect("share prints JSON");
+    let url = info["url"].as_str().unwrap().to_string();
+    assert_eq!(info["typing"], false);
+    let (base, code) = url.split_once("/#").unwrap();
+    let addr = base.trim_start_matches("http://").to_string();
+
+    let http = |req: String| -> String {
+        let mut s = std::net::TcpStream::connect(&addr).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    };
+    let post = |origin: &str, code: &str| {
+        let body = format!("{{\"code\":\"{code}\"}}");
+        http(format!(
+            "POST /auth HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))
+    };
+
+    // The page carries a strict CSP and no cookie yet.
+    let page = http(format!("GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n"));
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    assert!(page.to_lowercase().contains("content-security-policy: default-src 'none'"), "{page}");
+
+    // A wrong code and a foreign origin are refused and do not spend the code.
+    assert!(post(base, "nope").starts_with("HTTP/1.1 401"));
+    assert!(post("http://evil.example", code).starts_with("HTTP/1.1 403"));
+    let ok = post(base, code);
+    assert!(ok.starts_with("HTTP/1.1 204"), "{ok}");
+    let cookie_line = ok.lines().find(|l| l.starts_with("Set-Cookie:")).expect("cookie");
+    for flag in ["HttpOnly", "Secure", "SameSite=Strict"] {
+        assert!(cookie_line.contains(flag), "{cookie_line}");
+    }
+    let cookie = cookie_line.trim_start_matches("Set-Cookie: ").split(';').next().unwrap().to_string();
+    // Single use.
+    assert!(post(base, code).starts_with("HTTP/1.1 401"));
+
+    let connect = |origin: Option<&str>, cookie: Option<&str>| {
+        let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+        if let Some(o) = origin {
+            req.headers_mut().insert("Origin", o.parse().unwrap());
+        }
+        if let Some(c) = cookie {
+            req.headers_mut().insert("Cookie", c.parse().unwrap());
+        }
+        tokio_tungstenite::connect_async(req)
+    };
+    assert!(connect(Some(base), None).await.is_err(), "no cookie must be refused");
+    assert!(connect(Some("http://evil.example"), Some(&cookie)).await.is_err(), "bad origin must be refused");
+    assert!(connect(None, Some(&cookie)).await.is_err(), "missing origin must be refused");
+
+    let (mut ws, _) = connect(Some(base), Some(&cookie)).await.expect("good upgrade");
+    let mut tree = None;
+    while let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if v["t"] == "tree" {
+            tree = Some(v);
+            break;
+        }
+    }
+    let tree = tree.expect("a tree message");
+    assert_eq!(tree["typing"], false);
+    assert_eq!(tree["workspaces"][0]["title"], "shared");
+    assert_eq!(tree["workspaces"][0]["tabs"][0]["id"], "surface:1");
+
+    // The live screen arrives once a tab is opened.
+    ws.send(Message::Text(r#"{"t":"open","surface":"surface:1"}"#.into())).await.unwrap();
+    let mut saw = false;
+    while let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if v["t"] == "screen" && v["text"].as_str().unwrap_or("").contains("SHARE_42") {
+            saw = true;
+            break;
+        }
+    }
+    assert!(saw, "screen frame with the output");
+
+    // View-only: typing is refused and nothing reaches the terminal.
+    ws.send(Message::Text(r#"{"t":"send","surface":"surface:1","text":"echo TYPED_IN","enter":true}"#.into())).await.unwrap();
+    let mut refused = false;
+    while let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if v["t"] == "error" {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "typing refused");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!d.ok(&["read-screen", "--surface", "surface:1"]).contains("TYPED_IN"));
+
+    let _ = share.kill();
+    let _ = share.wait();
+}

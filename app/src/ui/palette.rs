@@ -36,6 +36,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("Add Remote Host…", ""),
     ("New Cloud Box…", ""),
     ("Import from cmux…", ""),
+    ("Show QR…", ""),
     ("Zoom In", "⌘="),
     ("Zoom Out", "⌘-"),
     ("Reset Zoom", "⌘0"),

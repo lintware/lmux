@@ -71,6 +71,7 @@ Browser:
 
 Other:
   import-cmux                Bring cmux's workspaces over (--move hands over their Claude sessions)
+  share                      Share sessions to a phone or browser through a Cloudflare Quick Tunnel
   rpc                        Call a daemon method: rpc <method> [json-params]
   ping                       Check the daemon answers
   hooks                      Claude Code hooks
@@ -729,6 +730,22 @@ pub enum Cmd {
     Hooks {
         #[command(subcommand)]
         cmd: HooksCmd,
+    },
+    /// Show a QR code that opens your sessions in a phone browser through a
+    /// Cloudflare Quick Tunnel. View only unless --allow-typing.
+    Share {
+        /// Let the viewer type into terminals (view only by default).
+        #[arg(long)]
+        allow_typing: bool,
+        /// Serve on this local port (default: any free port).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Skip the tunnel and serve on 127.0.0.1 only (for testing).
+        #[arg(long)]
+        no_tunnel: bool,
+        /// The cloudflared binary (default: found on PATH, or downloaded once).
+        #[arg(long)]
+        cloudflared: Option<String>,
     },
     /// Diagnostic: connect to the websocket, subscribe, print snapshot/output.
     #[command(hide = true)]

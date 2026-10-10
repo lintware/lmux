@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>lmux</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header>
+  <button id="back" hidden>‹ Sessions</button>
+  <h1 id="title">lmux</h1>
+  <span id="mode" class="badge"></span>
+</header>
+<main>
+  <section id="status" class="notice">Connecting…</section>
+  <section id="list" hidden></section>
+  <section id="term" hidden>
+    <pre id="screen"></pre>
+    <form id="composer" hidden autocomplete="off">
+      <div id="keys">
+        <button type="button" data-key="escape">Esc</button>
+        <button type="button" data-key="tab">Tab</button>
+        <button type="button" data-key="ctrl+c">^C</button>
+        <button type="button" data-key="up">↑</button>
+        <button type="button" data-key="down">↓</button>
+        <button type="button" data-key="left">←</button>
+        <button type="button" data-key="right">→</button>
+        <button type="button" data-key="enter">⏎</button>
+      </div>
+      <div id="line">
+        <input id="text" type="text" enterkeyhint="send" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Type to the terminal">
+        <button type="submit">Send</button>
+      </div>
+    </form>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

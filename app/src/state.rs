@@ -174,6 +174,8 @@ pub struct AppState {
     pub cloud_draft: Option<CloudDraft>,
     /// The "Import from cmux" dialog, while it is open.
     pub cmux_import: Option<crate::cmux_import::CmuxImport>,
+    /// The "Share to a phone" dialog, while it is open.
+    pub share_draft: Option<crate::share_dialog::Draft>,
     /// The cloud box whose deletion is waiting for a yes: its host's name.
     pub confirm_cloud_delete: Option<String>,
     /// This host's cloud box being deleted; the host goes when it is done.
@@ -571,6 +573,7 @@ impl AppState {
             add_host_install: true,
             cloud_draft: None,
             cmux_import: None,
+            share_draft: None,
             confirm_cloud_delete: None,
             cloud_delete: None,
             install: None,

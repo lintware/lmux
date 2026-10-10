@@ -9,6 +9,18 @@ All notable changes to lmux are listed here, newest first. The format follows
 
 ### Added
 
+- **Share your sessions to a phone (`lmux share`, lmux menu > Show QR…).** Starts
+  a Cloudflare Quick Tunnel and shows a QR code and a `trycloudflare.com` link.
+  Opened on a phone, it lists every workspace and tab with its agent status,
+  shows a tab's live screen, and (when you allow typing) accepts keys and text.
+  View only by default. The link carries a single-use code in its `#` fragment
+  that expires in 5 minutes; the page swaps it for an `HttpOnly`, `Secure`,
+  `SameSite=Strict` cookie, the WebSocket checks `Origin` and that cookie, and
+  the page loads no third-party scripts. `cloudflared` is taken from `PATH` or
+  downloaded once. Quick Tunnel limits apply: the address changes every start,
+  there is no uptime guarantee, and requests above 200 in flight get a 429.
+  Sharing ends on Stop sharing, Ctrl-C, or when the app quits.
+
 - **Terminals look like Ghostty.** Panes are drawn by a new GPU renderer
   ported from Ghostty's: its default font (JetBrains Mono, bundled) at 13pt,
   CoreText glyphs with Ghostty's cell metrics, box drawing, blocks, braille,
