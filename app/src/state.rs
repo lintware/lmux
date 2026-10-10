@@ -1510,7 +1510,13 @@ impl AppState {
         }
     }
 
-    pub fn apply_tree(&mut self, tree: Tree) {
+    pub fn apply_tree(&mut self, mut tree: Tree) {
+        for ws in &mut tree.workspaces {
+            let bare = crate::util::strip_title_icon(&ws.title);
+            if bare.len() != ws.title.len() {
+                ws.title = bare.to_owned();
+            }
+        }
         // Remember this host's folders, so the create menu can offer them even
         // while another host is on screen.
         if !self.current_host.is_empty() {

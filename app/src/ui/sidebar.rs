@@ -1,14 +1,14 @@
 //! Sidebar: top icon strip, folder rows, workspace cards.
 
 use egui::{
-    Align2, Color32, CornerRadius, Id, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2,
+    Align2, Color32, CornerRadius, Id, Rect, Sense, Ui, UiBuilder, Vec2,
 };
 use lmux_proto::{AgentState, Folder, Ref, Workspace};
 
 use super::Ctx;
 use crate::state::{CreateKind, CreateTarget, DragItem, SidebarRow, SidebarRowKind};
 use crate::theme;
-use crate::util::{ellipsize, tilde, wrap_lines};
+use crate::util::ellipsize;
 
 use super::icons::{self, Arrow};
 
@@ -18,6 +18,8 @@ const PAD_Y: f32 = 7.0;
 const LINE: f32 = 15.0;
 /// How far each nesting level of a folder shifts its row right.
 const INDENT: f32 = 13.0;
+/// Where a folder's name starts, past its chevron and icon.
+const FOLDER_TEXT_X: f32 = 34.0;
 const ROW_H: f32 = 26.0;
 
 /// The sidebar for a single host.
@@ -191,7 +193,7 @@ fn host_list(ui: &mut Ui, c: &mut Ctx, is_active: bool, multi: bool) {
 
     // Workspaces without a folder.
     for ws in workspaces.iter().filter(|w| w.folder.is_none()) {
-        ws_card(ui, ws, selected.as_deref() == Some(ws.id.as_str()), c);
+        ws_card(ui, ws, 0, selected.as_deref() == Some(ws.id.as_str()), c);
     }
 }
 
@@ -353,7 +355,9 @@ fn folder_level(
 ) {
     for folder in folders.iter().filter(|f| f.parent.as_deref() == parent) {
         let collapsed = c.state.collapsed.contains(&folder.id) || folder.collapsed;
-        let has_children = folders.iter().any(|f| f.parent.as_deref() == Some(folder.id.as_str()));
+        // Any content gets a chevron, sessions included, as in a file tree.
+        let has_children = folders.iter().any(|f| f.parent.as_deref() == Some(folder.id.as_str()))
+            || workspaces.iter().any(|w| w.folder.as_deref() == Some(folder.id.as_str()));
         if folder_row(ui, folder, depth, has_children, collapsed, c) {
             continue;
         }
@@ -362,7 +366,7 @@ fn folder_level(
             .iter()
             .filter(|w| w.folder.as_deref() == Some(folder.id.as_str()))
         {
-            ws_card(ui, ws, selected == Some(ws.id.as_str()), c);
+            ws_card(ui, ws, depth + 1, selected == Some(ws.id.as_str()), c);
         }
     }
 }
@@ -406,7 +410,7 @@ fn folder_row(
         Rect::from_center_size(egui::pos2(lead + 21.0, cy), Vec2::splat(13.0)),
         theme::DIM,
     );
-    let text_x = lead + 34.0;
+    let text_x = lead + FOLDER_TEXT_X;
     let avail = (inner.max.x - text_x - 4.0).max(10.0);
 
     let editing = c.state.folder_rename.as_ref().is_some_and(|r| r.folder == folder.id);
@@ -697,11 +701,16 @@ fn folder_rename_editor(
     }
 }
 
-fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
+fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ctx) {
     let w = ui.available_width();
-    let h = card_height(ui.ctx(), ws, w - 2.0 * theme::SIDEBAR_PAD, selected);
+    let h = card_height(ws);
     let (row, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click_and_drag());
-    let rect = row.shrink2(Vec2::new(theme::SIDEBAR_PAD, 3.0));
+    let mut rect = row.shrink2(Vec2::new(theme::SIDEBAR_PAD, 3.0));
+    // A session in a folder lines its title up with the folder's name, so the
+    // sidebar reads as a tree.
+    if depth > 0 {
+        rect.min.x += (depth - 1) as f32 * INDENT + FOLDER_TEXT_X - PAD_X;
+    }
     c.state.card_rects.insert(ws.id.clone(), rect);
     c.state.sidebar_rows.push(SidebarRow {
         id: ws.id.clone(),
@@ -722,16 +731,6 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
     }
 
     let title_color = if selected { Color32::WHITE } else { theme::TEXT };
-    let body_color = if selected {
-        Color32::from_rgb(0xDC, 0xE9, 0xFB)
-    } else {
-        theme::DIM
-    };
-    let faint = if selected {
-        Color32::from_rgb(0xC3, 0xD7, 0xF2)
-    } else {
-        theme::DIM_2
-    };
 
     let x = rect.min.x + PAD_X;
     let max_w = rect.width() - 2.0 * PAD_X;
@@ -752,22 +751,7 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
     }
     y += 17.0;
 
-    // Summary (up to three lines).
-    if let Some(summary) = ws.summary.as_deref().filter(|s| !s.is_empty()) {
-        for line in wrap_lines(ui.ctx(), summary, &theme::ui(theme::FS_SMALL), max_w, 3) {
-            p.text(
-                egui::pos2(x, y),
-                Align2::LEFT_TOP,
-                ellipsize(ui.ctx(), &line, &theme::ui(theme::FS_SMALL), max_w, false),
-                theme::ui(theme::FS_SMALL),
-                body_color,
-            );
-            y += LINE;
-        }
-        y += 2.0;
-    }
-
-    // Agent state line.
+    // Agent state line: the card is just a name and what its agent is doing.
     if let Some(color) = agent_color(ws.agent) {
         // Idle's accent blue is the selected card's own colour: go white there.
         let color = if selected && color == theme::ACCENT { Color32::WHITE } else { color };
@@ -788,136 +772,6 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, selected: bool, c: &mut Ctx) {
             theme::ui(theme::FS_SMALL),
             if selected { title_color } else { theme::TEXT_SOFT },
         );
-        if let Some(branch) = ws.git_branch.as_deref() {
-            let bx = x + 12.0 + 68.0;
-            icons::branch(&p, Rect::from_center_size(egui::pos2(bx + 5.0, y + 7.0), Vec2::splat(12.0)), faint);
-            p.text(
-                egui::pos2(bx + 14.0, y),
-                Align2::LEFT_TOP,
-                ellipsize(ui.ctx(), branch, &theme::ui(theme::FS_SMALL), (rect.max.x - 10.0) - (bx + 14.0), false),
-                theme::ui(theme::FS_SMALL),
-                faint,
-            );
-        }
-        y += LINE;
-    } else if let Some(branch) = ws.git_branch.as_deref() {
-        // No agent: the branch gets the line to itself, as on every cmux card.
-        icons::branch(&p, Rect::from_center_size(egui::pos2(x + 5.0, y + 7.0), Vec2::splat(12.0)), faint);
-        p.text(
-            egui::pos2(x + 14.0, y),
-            Align2::LEFT_TOP,
-            ellipsize(ui.ctx(), branch, &theme::ui(theme::FS_SMALL), max_w - 14.0, false),
-            theme::ui(theme::FS_SMALL),
-            faint,
-        );
-        y += LINE;
-    }
-
-    // cwd, middle-truncated.
-    if !ws.cwd.is_empty() {
-        let cwd = tilde(&ws.cwd);
-        p.text(
-            egui::pos2(x, y),
-            Align2::LEFT_TOP,
-            ellipsize(ui.ctx(), &cwd, &theme::mono(theme::FS_TINY), max_w, true),
-            theme::mono(theme::FS_TINY),
-            faint,
-        );
-        y += LINE - 1.0;
-    }
-
-    // Listening ports and the pull request, as links: a port opens in a
-    // browser tab on the workspace's own host, the PR in the system browser.
-    if !ws.ports.is_empty() || ws.pr.is_some() {
-        let font = theme::ui(theme::FS_SMALL);
-        let mut lx = x;
-        let link = if selected { Color32::WHITE } else { theme::ACCENT };
-        let mut links: Vec<(String, Color32, Option<u16>)> =
-            ws.ports.iter().map(|p| (format!(":{p}"), link, Some(*p))).collect();
-        if let Some(pr) = &ws.pr {
-            let color = if selected {
-                Color32::WHITE
-            } else {
-                match pr.state.as_str() {
-                    "open" => theme::GREEN,
-                    "merged" => Color32::from_rgb(0xA3, 0x71, 0xF7),
-                    "closed" => theme::RED,
-                    _ => theme::DIM,
-                }
-            };
-            links.push((format!("#{} {}", pr.number, pr.state), color, None));
-        }
-        for (text, color, port) in links {
-            let w = crate::util::measure(ui.ctx(), &text, &font);
-            if lx + w > rect.max.x - PAD_X {
-                break;
-            }
-            let r = Rect::from_min_size(egui::pos2(lx, y), Vec2::new(w, LINE));
-            let id = Id::new(("cardlink", &c.state.host_salt, &ws.id, &text));
-            let resp = ui.interact(r, id, Sense::click());
-            p.text(r.min, Align2::LEFT_TOP, &text, font.clone(), color);
-            if resp.hovered() {
-                p.line_segment(
-                    [egui::pos2(r.min.x, r.max.y - 1.0), egui::pos2(r.max.x, r.max.y - 1.0)],
-                    Stroke::new(1.0, color),
-                );
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if resp.clicked() {
-                match (port, &ws.pr) {
-                    (Some(port), _) => c.state.open_in_browser_tab(&ws.id, &format!("http://localhost:{port}/")),
-                    (None, Some(pr)) => ui.ctx().open_url(egui::OpenUrl::new_tab(&pr.url)),
-                    _ => {}
-                }
-            }
-            lx = r.max.x + 10.0;
-        }
-        y += LINE;
-    }
-
-    // Status pills.
-    if !ws.status_pills.is_empty() {
-        y += 2.0;
-        let mut px = x;
-        for pill in &ws.status_pills {
-            let color = pill
-                .color
-                .as_deref()
-                .map(|h| super::parse_hex(h, theme::DIM))
-                .unwrap_or(theme::DIM);
-            let label = match (&pill.icon, pill.value.is_empty()) {
-                (Some(icon), false) => format!("{icon} {}", pill.value),
-                (Some(icon), true) => icon.clone(),
-                (None, _) => pill.value.clone(),
-            };
-            let tw = crate::util::measure(ui.ctx(), &label, &theme::ui(theme::FS_TINY));
-            let chip = Rect::from_min_size(egui::pos2(px, y), Vec2::new(tw + 12.0, 15.0));
-            if chip.max.x > rect.max.x - PAD_X {
-                break;
-            }
-            let border = if selected { Color32::from_white_alpha(90) } else { theme::HAIRLINE };
-            p.rect_stroke(chip, CornerRadius::same(7), Stroke::new(1.0, border), StrokeKind::Inside);
-            p.text(
-                chip.center(),
-                Align2::CENTER_CENTER,
-                label,
-                theme::ui(theme::FS_TINY),
-                if selected { Color32::WHITE } else { color },
-            );
-            px = chip.max.x + 4.0;
-        }
-    }
-
-    // Progress bar across the bottom.
-    if let Some(progress) = &ws.progress {
-        let bar = Rect::from_min_size(
-            egui::pos2(rect.min.x + PAD_X, rect.max.y - 6.0),
-            Vec2::new(rect.width() - 2.0 * PAD_X, 3.0),
-        );
-        let track = if selected { Color32::from_white_alpha(60) } else { theme::HAIRLINE };
-        p.rect_filled(bar, CornerRadius::same(2), track);
-        let filled = Rect::from_min_size(bar.min, Vec2::new(bar.width() * progress.value.clamp(0.0, 1.0), bar.height()));
-        p.rect_filled(filled, CornerRadius::same(2), if selected { Color32::WHITE } else { theme::ACCENT });
     }
 
     // ⌘N while Cmd is held: the key that selects this card (9 is the last).
@@ -1142,27 +996,10 @@ fn ws_rename_editor(ui: &mut Ui, rect: Rect, ws: &Workspace, c: &mut Ctx) {
     }
 }
 
-fn card_height(ctx: &egui::Context, ws: &Workspace, inner_w: f32, selected: bool) -> f32 {
-    let _ = (ctx, selected);
+fn card_height(ws: &Workspace) -> f32 {
     let mut h = PAD_Y + 17.0; // title
-    if ws.summary.as_deref().is_some_and(|s| !s.is_empty()) {
-        let lines = wrap_lines(ctx, ws.summary.as_deref().unwrap_or(""), &theme::ui(theme::FS_SMALL), inner_w, 3).len();
-        h += lines as f32 * LINE + 2.0;
-    }
-    if agent_color(ws.agent).is_some() || ws.git_branch.is_some() {
+    if agent_color(ws.agent).is_some() {
         h += LINE;
-    }
-    if !ws.cwd.is_empty() {
-        h += LINE - 1.0;
-    }
-    if !ws.ports.is_empty() || ws.pr.is_some() {
-        h += LINE;
-    }
-    if !ws.status_pills.is_empty() {
-        h += 19.0;
-    }
-    if ws.progress.is_some() {
-        h += 8.0;
     }
     h += PAD_Y + 3.0;
     h.max(30.0)

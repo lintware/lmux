@@ -110,6 +110,18 @@ pub fn wrap_lines(
     lines
 }
 
+/// A title without the symbol a program put in front of it (`☁ api · box`,
+/// `✳ task`): the sidebar already groups sessions by host, so the glyph is
+/// noise. Only leading non-ASCII symbols go; letters in any script stay.
+pub fn strip_title_icon(title: &str) -> &str {
+    let bare = title.trim_start_matches(|c: char| c.is_whitespace() || (!c.is_ascii() && !c.is_alphanumeric()));
+    if bare.is_empty() {
+        title
+    } else {
+        bare
+    }
+}
+
 /// Shorten a home directory to `~`.
 pub fn tilde(path: &str) -> String {
     for prefix in ["/Users/", "/home/"] {
@@ -125,3 +137,17 @@ pub fn tilde(path: &str) -> String {
 
 // `ellipsize`/`wrap_lines` need a live egui context (fonts are only available
 // after the first pass), so they are exercised by the kittest snapshot tests.
+
+#[cfg(test)]
+mod tests {
+    use super::strip_title_icon;
+
+    #[test]
+    fn title_icons_are_stripped() {
+        assert_eq!(strip_title_icon("☁ lintlabs · server-hm"), "lintlabs · server-hm");
+        assert_eq!(strip_title_icon("✳ fix the sidebar"), "fix the sidebar");
+        assert_eq!(strip_title_icon("über ☁"), "über ☁");
+        assert_eq!(strip_title_icon("~/code"), "~/code");
+        assert_eq!(strip_title_icon("☁"), "☁");
+    }
+}
