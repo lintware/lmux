@@ -606,3 +606,16 @@ fn snapshot_terminal_scrollbar() {
     let mut h = harness(fx, Vec2::new(900.0, 500.0));
     h.snapshot("terminal_scrollbar");
 }
+
+#[test]
+fn snapshot_tmp_claude() {
+    let mut fx = fixture("workspace:1", false);
+    fx.state.tree.workspaces[0].panes[0].active_surface = Some("surface:1".into());
+    let mut t = TermView::new(138, 43);
+    let raw = std::fs::read_to_string("/tmp/pane36.ansi").unwrap();
+    t.feed(raw.replace('\n', "\r\n").as_bytes());
+    t.feed(b"\x1b[41;1H\x1b[2K\x1b[40;3H");
+    fx.state.terms.insert("surface:1".into(), t);
+    let mut h = harness(fx, Vec2::new(1400.0, 900.0));
+    h.snapshot("tmp_claude");
+}

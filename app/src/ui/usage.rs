@@ -8,10 +8,10 @@ use crate::theme;
 use crate::usage::{self, Provider, Resource, Usage};
 use crate::util::ellipsize;
 
-const BAR_H: f32 = 28.0;
-const ROW_H: f32 = 22.0;
-const HEAD_H: f32 = 24.0;
-const MAX_PANEL_H: f32 = 320.0;
+const BAR_H: f32 = 36.0;
+const ROW_H: f32 = 32.0;
+const HEAD_H: f32 = 32.0;
+const MAX_PANEL_H: f32 = 520.0;
 
 fn open_id() -> Id {
     Id::new("usage-open")
@@ -37,7 +37,7 @@ fn panel_content_h(u: &Usage) -> f32 {
     }
     u.providers
         .iter()
-        .map(|(_, p)| HEAD_H + rows(p).len() as f32 * ROW_H + 6.0)
+        .map(|(_, p)| HEAD_H + rows(p).len() as f32 * ROW_H + 8.0)
         .sum()
 }
 
@@ -64,6 +64,8 @@ pub fn show(ui: &mut Ui, rect: Rect) {
     }
     if resp.clicked() {
         ctx.data_mut(|d| d.insert_temp(open_id(), !open));
+        // The section's height was already chosen this frame.
+        ctx.request_repaint();
     }
 
     let inner = bar.shrink2(Vec2::new(theme::SIDEBAR_PAD, 0.0));
@@ -77,7 +79,7 @@ pub fn show(ui: &mut Ui, rect: Rect) {
     };
     icons::dot(&p, egui::pos2(inner.min.x + 4.0, cy), 3.0, dot);
     let color = if open || resp.hovered() { theme::TEXT_SOFT } else { theme::DIM };
-    p.text(egui::pos2(inner.min.x + 16.0, cy), Align2::LEFT_CENTER, "USAGE", theme::pixel(theme::FS_TINY), color);
+    p.text(egui::pos2(inner.min.x + 16.0, cy), Align2::LEFT_CENTER, "USAGE", theme::pixel(theme::FS_SMALL), color);
     if let Some(peak) = u.peak() {
         let pct = (peak * 100.0).round() as i64;
         p.text(
@@ -139,20 +141,20 @@ fn provider(ui: &mut Ui, prov: &Provider, now: i64) {
     let (head, _) = ui.allocate_exact_size(Vec2::new(w, HEAD_H), Sense::hover());
     let p = ui.painter_at(head);
     let name = prov.display_name.split(" — ").next().unwrap_or(&prov.display_name);
-    let font = theme::ui_semibold(theme::FS_SMALL);
+    let font = theme::ui_semibold(theme::FS_FOLDER);
     let plan_w = prov
         .plan
         .as_deref()
-        .map(|s| crate::util::measure(ui.ctx(), s, &theme::ui(theme::FS_TINY)) + 6.0)
+        .map(|s| crate::util::measure(ui.ctx(), s, &theme::ui(theme::FS_SMALL)) + 6.0)
         .unwrap_or(0.0);
     let name = ellipsize(ui.ctx(), name, &font, (w - 2.0 * pad - plan_w).max(20.0), false);
-    p.text(egui::pos2(head.min.x + pad, head.center().y + 2.0), Align2::LEFT_CENTER, &name, font, theme::TEXT_SOFT);
+    p.text(egui::pos2(head.min.x + pad, head.center().y + 4.0), Align2::LEFT_CENTER, &name, font, theme::TEXT_SOFT);
     if let Some(plan) = &prov.plan {
         p.text(
-            egui::pos2(head.max.x - pad, head.center().y + 2.0),
+            egui::pos2(head.max.x - pad, head.center().y + 4.0),
             Align2::RIGHT_CENTER,
             plan,
-            theme::ui(theme::FS_TINY),
+            theme::ui(theme::FS_SMALL),
             theme::DIM,
         );
     }
@@ -164,26 +166,26 @@ fn provider(ui: &mut Ui, prov: &Provider, now: i64) {
         let x0 = row.min.x + pad;
         let x1 = row.max.x - pad;
         let cy = row.center().y;
-        p.text(egui::pos2(x0, cy - 3.0), Align2::LEFT_CENTER, &label, theme::ui(theme::FS_TINY), theme::DIM);
+        p.text(egui::pos2(x0, cy - 5.0), Align2::LEFT_CENTER, &label, theme::ui(theme::FS_BODY), theme::DIM);
 
         let value = match (r.kind.as_str(), r.utilization) {
             ("consumption", Some(f)) => format!("{}%", (f * 100.0).round() as i64),
             _ => balance_text(r),
         };
         let vcolor = r.utilization.map(level_color).unwrap_or(theme::TEXT_SOFT);
-        p.text(egui::pos2(x1, cy - 3.0), Align2::RIGHT_CENTER, &value, theme::ui(theme::FS_TINY), vcolor);
+        p.text(egui::pos2(x1, cy - 5.0), Align2::RIGHT_CENTER, &value, theme::ui_semibold(theme::FS_BODY), vcolor);
 
         if let Some(f) = r.utilization {
-            let track = Rect::from_min_max(egui::pos2(x0, cy + 5.0), egui::pos2(x1, cy + 8.0));
-            p.rect_filled(track, CornerRadius::same(2), Color32::from_white_alpha(14));
+            let track = Rect::from_min_max(egui::pos2(x0, cy + 6.0), egui::pos2(x1, cy + 11.0));
+            p.rect_filled(track, CornerRadius::same(3), Color32::from_white_alpha(14));
             let fill = Rect::from_min_size(track.min, Vec2::new(track.width() * f.clamp(0.0, 1.0) as f32, track.height()));
-            p.rect_filled(fill, CornerRadius::same(2), level_color(f));
+            p.rect_filled(fill, CornerRadius::same(3), level_color(f));
         }
         if let Some(secs) = r.resets_at.as_deref().and_then(|s| usage::secs_until(s, now)) {
             resp.on_hover_text(format!("Resets in {}", usage::countdown(secs)));
         }
     }
-    ui.add_space(6.0);
+    ui.add_space(8.0);
 }
 
 fn balance_text(r: &Resource) -> String {
