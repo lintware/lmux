@@ -14,6 +14,9 @@ struct Face {
     weight: Option<f32>,
 }
 
+/// The pixel face of the site and the app icon (OFL, assets/fonts/Silkscreen-OFL.txt).
+static PIXEL: &[u8] = include_bytes!("../assets/fonts/Silkscreen-Regular.ttf");
+
 const UI_FACES: &[Face] = &[
     Face { file: "/System/Library/Fonts/SFNS.ttf", index: 0, weight: None },
     Face { file: "/System/Library/Fonts/SFNSDisplay.ttf", index: 0, weight: None },
@@ -99,6 +102,9 @@ pub fn install(ctx: &egui::Context) -> (String, String) {
         &[FontFamily::Monospace, FontFamily::Name(theme::MONO_FAMILY.into())],
     );
 
+    defs.font_data.insert(theme::PIXEL_FAMILY.to_owned(), Arc::new(FontData::from_static(PIXEL)));
+    defs.families.insert(FontFamily::Name(theme::PIXEL_FAMILY.into()), vec![theme::PIXEL_FAMILY.to_owned()]);
+
     // Symbols SF lacks (◆ ⏺ ✻ ⎿ braille spinners, box drawing…) come from
     // Menlo and Apple Symbols, then egui's own faces. Every family gets the
     // whole chain, the named ones too: theme::ui() draws with a named family,
@@ -112,13 +118,16 @@ pub fn install(ctx: &egui::Context) -> (String, String) {
     }
     let ui_fams = [
         FontFamily::Proportional,
+        FontFamily::Name(theme::PIXEL_FAMILY.into()),
         FontFamily::Name(theme::UI_FAMILY.into()),
         FontFamily::Name(theme::UI_SEMIBOLD_FAMILY.into()),
     ];
     let mono_fams = [FontFamily::Monospace, FontFamily::Name(theme::MONO_FAMILY.into())];
     for fam in &ui_fams {
         let list = defs.families.entry(fam.clone()).or_default();
-        for key in symbols.iter().chain(prop_fallbacks.iter()) {
+        // The pixel face covers ASCII; anything else falls back to SF.
+        let ui_key = ui.as_ref().map(|_| theme::UI_FAMILY.to_owned());
+        for key in ui_key.iter().chain(symbols.iter()).chain(prop_fallbacks.iter()) {
             append_unique(list, key);
         }
     }

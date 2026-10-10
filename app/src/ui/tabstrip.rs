@@ -49,8 +49,8 @@ pub fn workspace_header(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
     };
     icons::folder(
         &p,
-        Rect::from_center_size(egui::pos2(rect.min.x + lead + 18.0, cy), Vec2::splat(13.0)),
-        theme::ACCENT,
+        Rect::from_center_size(egui::pos2(rect.min.x + lead + 18.0, cy), Vec2::splat(15.0)),
+        theme::FLAME,
     );
 
     let title = c
@@ -59,7 +59,8 @@ pub fn workspace_header(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
         .map(|w| w.title.clone())
         .unwrap_or_else(|| "lmux".to_owned());
     let font = theme::ui(theme::FS_SMALL);
-    let max_w = (rect.width() - 40.0 - lead).max(20.0);
+    // Clear of the notifications bell in the right corner.
+    let max_w = (rect.width() - 80.0 - lead).max(20.0);
     p.text(
         egui::pos2(rect.min.x + lead + 32.0, cy),
         Align2::LEFT_CENTER,

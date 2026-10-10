@@ -19,8 +19,8 @@ const LINE: f32 = 15.0;
 /// How far each nesting level of a folder shifts its row right.
 const INDENT: f32 = 13.0;
 /// Where a folder's name starts, past its chevron and icon.
-const FOLDER_TEXT_X: f32 = 34.0;
-const ROW_H: f32 = 26.0;
+const FOLDER_TEXT_X: f32 = 38.0;
+const ROW_H: f32 = 30.0;
 
 /// The sidebar for a single host.
 pub fn show(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
@@ -52,8 +52,8 @@ pub fn show_hosts(ui: &mut Ui, rect: Rect, hosts: &mut [Ctx], active: usize) {
 fn top_icons(ui: &mut Ui, rect: Rect, c: &mut Ctx, unread: u32) {
     let p = ui.painter_at(rect);
     let y = rect.center().y;
-    let start = rect.min.x + 12.0 + theme::titlebar_inset();
-    let step = 23.0;
+    let start = rect.min.x + 16.0 + theme::titlebar_inset();
+    let step = 28.0;
 
     let items: [(&str, f32); 5] = [
         ("sidebar", start),
@@ -64,10 +64,13 @@ fn top_icons(ui: &mut Ui, rect: Rect, c: &mut Ctx, unread: u32) {
     ];
 
     for (name, x) in items {
-        let hit = Rect::from_center_size(egui::pos2(x, y), Vec2::splat(24.0));
+        let hit = Rect::from_center_size(egui::pos2(x, y), Vec2::splat(26.0));
         let resp = ui.interact(hit, Id::new(("sb", name)), Sense::click());
+        if resp.hovered() {
+            p.rect_filled(hit, CornerRadius::same(6), theme::chip_hover_bg());
+        }
         let color = if resp.hovered() { theme::TEXT } else { theme::DIM };
-        let icon = Rect::from_center_size(hit.center(), Vec2::splat(theme::ICON));
+        let icon = Rect::from_center_size(hit.center(), Vec2::splat(theme::STRIP_ICON));
         match name {
             "sidebar" => icons::sidebar_toggle(&p, icon, color),
             "bell" => icons::bell(&p, icon, color),
@@ -100,15 +103,7 @@ fn top_icons(ui: &mut Ui, rect: Rect, c: &mut Ctx, unread: u32) {
             new_item_menu(&resp, c);
         }
         if name == "bell" && unread > 0 {
-            let badge = egui::pos2(x + 8.0, y - 8.0);
-            p.circle_filled(badge, 6.0, theme::BADGE);
-            p.text(
-                badge,
-                Align2::CENTER_CENTER,
-                unread.to_string(),
-                theme::ui(9.0),
-                Color32::WHITE,
-            );
+            icons::badge(&p, egui::pos2(x + 9.0, y - 8.0), unread);
         }
     }
 }
@@ -240,7 +235,7 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
         _ => {}
     }
     icons::dot(&painter, egui::pos2(inner.min.x + 18.0, cy), 3.0, dot);
-    let font = theme::ui_semibold(theme::FS_SMALL);
+    let font = theme::pixel(theme::FS_TINY);
     let name = c.net.host_name().to_uppercase();
     let color = if is_active || resp.hovered() { theme::TEXT_SOFT } else { theme::DIM };
     let name_w = crate::util::measure(ui.ctx(), &name, &font);
@@ -400,15 +395,15 @@ fn folder_row(
         icons::chevron(
             &painter,
             egui::pos2(lead + 5.0, cy),
-            3.4,
+            3.8,
             theme::DIM,
             if collapsed { Arrow::Right } else { Arrow::Down },
         );
     }
     icons::folder(
         &painter,
-        Rect::from_center_size(egui::pos2(lead + 21.0, cy), Vec2::splat(13.0)),
-        theme::DIM,
+        Rect::from_center_size(egui::pos2(lead + 23.0, cy), Vec2::splat(17.0)),
+        if collapsed { theme::DIM } else { theme::FLAME },
     );
     let text_x = lead + FOLDER_TEXT_X;
     let avail = (inner.max.x - text_x - 4.0).max(10.0);
@@ -417,14 +412,9 @@ fn folder_row(
     if editing {
         folder_rename_editor(ui, rect, text_x, avail, folder, c);
     } else {
-        let label = ellipsize(ui.ctx(), &folder.name, &theme::ui_semibold(theme::FS_BODY), avail, false);
-        painter.text(
-            egui::pos2(text_x, cy),
-            Align2::LEFT_CENTER,
-            label,
-            theme::ui_semibold(theme::FS_BODY),
-            color,
-        );
+        let font = theme::ui_semibold(theme::FS_FOLDER);
+        let label = ellipsize(ui.ctx(), &folder.name, &font, avail, false);
+        painter.text(egui::pos2(text_x, cy), Align2::LEFT_CENTER, label, font, color);
     }
 
     if resp.double_clicked() {
@@ -725,7 +715,7 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ct
         p.rect_filled(rect, radius, theme::CARD_SELECTED);
         // Thin, brighter bar at the left edge (as in the reference).
         let bar = Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height()));
-        p.rect_filled(bar, radius, Color32::from_rgb(0x66, 0xB6, 0xFF));
+        p.rect_filled(bar, radius, Color32::from_rgb(0xFF, 0xC2, 0x7A));
     } else if resp.hovered() {
         p.rect_filled(rect, radius, Color32::from_white_alpha(8));
     }

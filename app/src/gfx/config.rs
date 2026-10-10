@@ -74,25 +74,26 @@ const MAX_LINE: usize = 4096;
 /// How deep `config-file` includes may nest before they are skipped.
 const MAX_INCLUDE_DEPTH: u8 = 10;
 
-/// The 16 base colours of cmux's default dark theme (Apple's system colours), which lmux users see in cmux. Ghostty's
-/// own default is a Tomorrow Night set (terminal/color.zig:495); a `palette` or `theme` line replaces either.
+/// The 16 base colours of lmux's default theme: the pixel-fire palette of the app icon and the site, warm ink and
+/// cream with flame reds and oranges, muted so long agent transcripts stay easy to read. Ghostty's own default is a
+/// Tomorrow Night set (terminal/color.zig:495); a `palette` or `theme` line replaces either.
 const BASE16: [Rgb; 16] = [
-    [0x1a, 0x1a, 0x1a],
-    [0xcc, 0x37, 0x2e],
-    [0x26, 0xa4, 0x39],
-    [0xcd, 0xac, 0x08],
-    [0x08, 0x69, 0xcb],
-    [0x96, 0x47, 0xbf],
-    [0x47, 0x9e, 0xc2],
-    [0x98, 0x98, 0x9d],
-    [0x46, 0x46, 0x46],
-    [0xff, 0x45, 0x3a],
-    [0x32, 0xd7, 0x4b],
-    [0xff, 0xd6, 0x0a],
-    [0x0a, 0x84, 0xff],
-    [0xbf, 0x5a, 0xf2],
-    [0x76, 0xd6, 0xff],
-    [0xff, 0xff, 0xff],
+    [0x24, 0x22, 0x1d],
+    [0xe0, 0x50, 0x2c],
+    [0xb3, 0xbc, 0x88],
+    [0xe5, 0xad, 0x71],
+    [0x7f, 0xa6, 0xbd],
+    [0xc8, 0x83, 0xa6],
+    [0x8c, 0xbc, 0xaa],
+    [0xd8, 0xd4, 0xc9],
+    [0x74, 0x72, 0x68],
+    [0xf0, 0x7a, 0x3c],
+    [0xcd, 0xd6, 0xa0],
+    [0xff, 0xc2, 0x7a],
+    [0x9c, 0xc2, 0xd8],
+    [0xe0, 0x9e, 0xc0],
+    [0xa8, 0xd8, 0xc6],
+    [0xff, 0xf4, 0xe4],
 ];
 
 /// The default 256-colour palette: the base 16 above, then the xterm cube and gray ramp (color.zig:12).
@@ -117,8 +118,8 @@ fn default_palette() -> [Rgb; 256] {
 }
 
 impl Default for TermConfig {
-    /// Ghostty's defaults, with cmux's default dark theme for the palette, cursor and selection, and lmux's own
-    /// terminal background `#141414` and foreground `#D2D2D2` (they match the window around the terminal).
+    /// Ghostty's defaults, with lmux's pixel-fire theme for the palette, cursor and selection, and the site's ink
+    /// `#12110E` and cream `#EAE6DC` for background and foreground (they match the window around the terminal).
     fn default() -> Self {
         TermConfig {
             font_family: Vec::new(),
@@ -130,16 +131,16 @@ impl Default for TermConfig {
             font_thicken_strength: 255,
             adjust_cell_width: None,
             adjust_cell_height: None,
-            background: [0x14, 0x14, 0x14],
-            foreground: [0xd2, 0xd2, 0xd2],
+            background: [0x12, 0x11, 0x0e],
+            foreground: [0xea, 0xe6, 0xdc],
             palette: default_palette(),
-            cursor_color: Some(CellColor::Color([0x98, 0x98, 0x9d])),
-            cursor_text: Some(CellColor::Color([0xff, 0xff, 0xff])),
+            cursor_color: Some(CellColor::Color([0xf0, 0x7a, 0x3c])),
+            cursor_text: Some(CellColor::Color([0x12, 0x11, 0x0e])),
             cursor_opacity: 1.0,
             cursor_style: CursorStyle::Block,
             cursor_style_blink: None,
-            selection_background: Some(CellColor::Color([0x3f, 0x63, 0x8b])),
-            selection_foreground: Some(CellColor::Color([0xff, 0xff, 0xff])),
+            selection_background: Some(CellColor::Color([0x6b, 0x2c, 0x18])),
+            selection_foreground: Some(CellColor::Color([0xff, 0xf4, 0xe4])),
             minimum_contrast: 1.0,
             faint_opacity: 0.5,
             bold_color: None,
@@ -1355,20 +1356,20 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_ghostty_with_cmux_and_lmux_colours() {
+    fn defaults_are_ghostty_with_lmux_fire_colours() {
         let c = TermConfig::default();
-        assert_eq!(c.background, [0x14, 0x14, 0x14]);
-        assert_eq!(c.foreground, [0xd2, 0xd2, 0xd2]);
+        assert_eq!(c.background, [0x12, 0x11, 0x0e]);
+        assert_eq!(c.foreground, [0xea, 0xe6, 0xdc]);
         assert_eq!(c.font_size, None);
         assert!(!c.font_thicken);
         assert_eq!(c.font_thicken_strength, 255);
-        assert_eq!(c.cursor_color, Some(CellColor::Color([0x98, 0x98, 0x9d])));
-        assert_eq!(c.cursor_text, Some(CellColor::Color([0xff, 0xff, 0xff])));
+        assert_eq!(c.cursor_color, Some(CellColor::Color([0xf0, 0x7a, 0x3c])));
+        assert_eq!(c.cursor_text, Some(CellColor::Color([0x12, 0x11, 0x0e])));
         assert_eq!(c.cursor_opacity, 1.0);
         assert_eq!(c.cursor_style, CursorStyle::Block);
         assert_eq!(c.cursor_style_blink, None);
-        assert_eq!(c.selection_background, Some(CellColor::Color([0x3f, 0x63, 0x8b])));
-        assert_eq!(c.selection_foreground, Some(CellColor::Color([0xff, 0xff, 0xff])));
+        assert_eq!(c.selection_background, Some(CellColor::Color([0x6b, 0x2c, 0x18])));
+        assert_eq!(c.selection_foreground, Some(CellColor::Color([0xff, 0xf4, 0xe4])));
         assert_eq!(c.minimum_contrast, 1.0);
         assert_eq!(c.faint_opacity, 0.5);
         assert_eq!(c.bold_color, None);
@@ -1379,13 +1380,13 @@ mod tests {
     }
 
     #[test]
-    fn default_palette_is_cmux_base_plus_xterm_cube_and_grays() {
+    fn default_palette_is_fire_base_plus_xterm_cube_and_grays() {
         let p = TermConfig::default().palette;
-        assert_eq!(p[0], [0x1a, 0x1a, 0x1a]);
-        assert_eq!(p[1], [0xcc, 0x37, 0x2e]);
-        assert_eq!(p[7], [0x98, 0x98, 0x9d]);
-        assert_eq!(p[8], [0x46, 0x46, 0x46]);
-        assert_eq!(p[15], [0xff, 0xff, 0xff]);
+        assert_eq!(p[0], [0x24, 0x22, 0x1d]);
+        assert_eq!(p[1], [0xe0, 0x50, 0x2c]);
+        assert_eq!(p[7], [0xd8, 0xd4, 0xc9]);
+        assert_eq!(p[8], [0x74, 0x72, 0x68]);
+        assert_eq!(p[15], [0xff, 0xf4, 0xe4]);
         assert_eq!(p[16], [0, 0, 0]);
         assert_eq!(p[17], [0, 0, 95]);
         assert_eq!(p[21], [0, 0, 255]);

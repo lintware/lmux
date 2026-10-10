@@ -236,7 +236,7 @@ pub fn show(ui: &mut Ui, area: Rect, hosts: &mut [&mut Ctx], active: usize) -> O
                     Align2::RIGHT_CENTER,
                     &it.detail,
                     theme::ui(theme::FS_SMALL),
-                    if row == pal.index { Color32::from_rgb(0xDC, 0xE9, 0xFB) } else { theme::DIM },
+                    if row == pal.index { Color32::from_rgb(0xFF, 0xE4, 0xC8) } else { theme::DIM },
                 );
                 if resp.clicked() {
                     picked = Some(it.pick.clone());

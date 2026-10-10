@@ -247,6 +247,10 @@ pub struct AppState {
     pub folder_toggle: Option<FolderToggle>,
     /// `folder.new` requests whose result should open the rename editor.
     folder_rename_pending: Option<u64>,
+    /// A `workspace.new` this app sent: its session is shown once it exists.
+    session_select_pending: Option<u64>,
+    /// The session made by that call, waiting for a tree that holds it.
+    select_when_listed: Option<Ref>,
     /// Browser requests whose reply the app acts on, by RPC id.
     browser_replies: HashMap<u64, BrowserReply>,
     /// Text for the system clipboard, put there on the next frame (the reply to
@@ -608,6 +612,8 @@ impl AppState {
             term_font: crate::theme::FS_TERM,
             folder_toggle: None,
             folder_rename_pending: None,
+            session_select_pending: None,
+            select_when_listed: None,
             last_width: 0.0,
             host: String::new(),
             server_version: String::new(),
@@ -658,11 +664,10 @@ impl AppState {
     /// The session is a terminal in the sidebar, running on the connected host.
     pub fn new_session(&mut self, folder: Option<Ref>) {
         self.activated = true;
-        self.rpc(
-            m::WORKSPACE_NEW,
-            // No command: the daemon runs the shell tmux defaults to.
-            serde_json::json!({ "name": "workspace", "folder": folder }),
-        );
+        // No command: the daemon runs the shell tmux defaults to.
+        let id = self.rpc_with_id(m::WORKSPACE_NEW, serde_json::json!({ "name": "workspace", "folder": folder }));
+        // The new session is the one you want to look at.
+        self.session_select_pending = Some(id);
     }
 
     /// A new folder, nested inside `parent` when one is given. Its rename
@@ -1494,6 +1499,22 @@ impl AppState {
                     }
                     _ => {}
                 }
+                if self.session_select_pending == Some(response.id) {
+                    self.session_select_pending = None;
+                    let ws = response
+                        .result
+                        .as_ref()
+                        .and_then(|r| r.get("workspace"))
+                        .and_then(|w| w.as_str())
+                        .map(str::to_owned);
+                    if let Some(ws) = ws {
+                        if self.workspace(&ws).is_some() {
+                            self.select_workspace(&ws);
+                        } else {
+                            self.select_when_listed = Some(ws);
+                        }
+                    }
+                }
                 if self.folder_rename_pending == Some(response.id) {
                     self.folder_rename_pending = None;
                     let folder = response
@@ -1552,6 +1573,12 @@ impl AppState {
         }
         if self.selected.is_none() {
             self.selected = self.tree.workspaces.first().map(|w| w.id.clone());
+        }
+        if let Some(ws) = self.select_when_listed.clone() {
+            if self.workspace(&ws).is_some() {
+                self.select_when_listed = None;
+                self.select_workspace(&ws);
+            }
         }
 
         // Drop terminal/browser state for surfaces that no longer exist.
@@ -2326,6 +2353,31 @@ mod tests {
         });
         let ren = st.folder_rename.as_ref().expect("editor opens on the new folder");
         assert_eq!((ren.folder.as_str(), ren.text.as_str()), ("folder:9", "New Folder"));
+    }
+
+    #[test]
+    fn a_new_session_is_shown_once_the_daemon_lists_it() {
+        let mut st = state_with(&["s1"], "s1");
+        st.new_session(None);
+        let id = match st.pending.last().unwrap() {
+            ClientMsg::Rpc { request } => request.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        // The reply can beat the tree that lists the new session.
+        st.handle_server_msg(ServerMsg::RpcResult {
+            response: lmux_proto::RpcResponse {
+                id,
+                result: Some(serde_json::json!({ "workspace": "workspace:9" })),
+                error: None,
+            },
+        });
+        assert_eq!(st.selected.as_deref(), Some("workspace:1"), "nothing to show yet");
+        let mut tree = st.tree.clone();
+        let mut ws = tree.workspaces[0].clone();
+        ws.id = "workspace:9".into();
+        tree.workspaces.push(ws);
+        st.apply_tree(tree);
+        assert_eq!(st.selected.as_deref(), Some("workspace:9"));
     }
 
     #[test]

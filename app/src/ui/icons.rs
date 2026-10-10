@@ -135,19 +135,15 @@ pub fn close(p: &Painter, rect: Rect, color: Color32) {
     );
 }
 
+/// A window with its sidebar panel shaded, as the macOS sidebar button.
 pub fn sidebar_toggle(p: &Painter, rect: Rect, color: Color32) {
-    let r = rect.shrink(rect.width() * 0.18);
-    p.rect_stroke(
-        r,
-        egui::CornerRadius::same(3),
-        Stroke::new(1.3, color),
-        egui::StrokeKind::Inside,
-    );
-    let x = r.min.x + r.width() * 0.36;
-    p.line_segment(
-        [Pos2::new(x, r.min.y + 1.0), Pos2::new(x, r.max.y - 1.0)],
-        Stroke::new(1.3, color),
-    );
+    let r = Rect::from_center_size(rect.center(), Vec2::new(rect.width() * 0.86, rect.height() * 0.70));
+    let w = 1.4;
+    p.rect_stroke(r, egui::CornerRadius::same(3), Stroke::new(w, color), egui::StrokeKind::Inside);
+    let x = r.min.x + r.width() * 0.38;
+    p.line_segment([Pos2::new(x, r.min.y + w), Pos2::new(x, r.max.y - w)], Stroke::new(w, color));
+    let panel = Rect::from_min_max(Pos2::new(r.min.x + w, r.min.y + w), Pos2::new(x, r.max.y - w));
+    p.rect_filled(panel, egui::CornerRadius { nw: 2, sw: 2, ne: 0, se: 0 }, color.gamma_multiply(0.35));
 }
 
 /// A rounded rect with a divider: "split right" or "split down".
@@ -288,4 +284,99 @@ pub fn check(p: &Painter, rect: Rect, color: Color32) {
         1.4,
         color,
     );
+}
+
+/// An unread count in a flame-orange pill centred on `center`.
+pub fn badge(p: &Painter, center: Pos2, count: u32) {
+    let text = if count > 99 { "99+".to_owned() } else { count.to_string() };
+    let w = (7.0 + text.len() as f32 * 6.0).max(14.0);
+    let r = Rect::from_center_size(center, Vec2::new(w, 14.0));
+    p.rect_filled(r, egui::CornerRadius::same(7), crate::theme::BADGE);
+    p.text(center, egui::Align2::CENTER_CENTER, text, crate::theme::ui_semibold(9.5), crate::theme::MAIN_BG);
+}
+
+/// The app icon's pixel flame, one string per row (`deploy/macos/make-icon.swift`
+/// draws the same grid; keep them in step).
+const FLAME: [&str; 20] = [
+    "........y.......",
+    ".......yo.......",
+    ".......oo.......",
+    "......roo.......",
+    "..o...rroo......",
+    "..rr..rroo....o.",
+    "..rro.rrooo..ro.",
+    ".drrorrroooo.ro.",
+    ".drroorroyoorro.",
+    ".drroooroyyooro.",
+    "ddrrooooyyyooroo",
+    "drroooyyyyyyoorr",
+    "drrooyyywyyyoorr",
+    "drrooyywwwyyoord",
+    "ddrooyywwwwyyord",
+    ".drrooywwwwyyord",
+    ".ddrooyywwyyoodd",
+    "..ddrooyyyyoodd.",
+    "...dddrooooddd..",
+    ".....dddddd.....",
+];
+
+/// The pixel flame, `cell` points per pixel, its top-left at `min`. `flicker`
+/// in 0..1 lifts the tips a row on alternate columns, so it can burn.
+pub fn flame(p: &Painter, min: Pos2, cell: f32, flicker: f32) {
+    for (y, row) in FLAME.iter().enumerate() {
+        for (x, ch) in row.chars().enumerate() {
+            let color = match ch {
+                'd' => Color32::from_rgb(0x8a, 0x24, 0x10),
+                'r' => Color32::from_rgb(0xd9, 0x43, 0x20),
+                'o' => Color32::from_rgb(0xf0, 0x7a, 0x3c),
+                'y' => Color32::from_rgb(0xff, 0xc2, 0x7a),
+                'w' => Color32::from_rgb(0xff, 0xf4, 0xe4),
+                _ => continue,
+            };
+            // Only the top third moves, a pixel at a time.
+            let lift = if y < 7 && (x + (flicker * 4.0) as usize) % 3 == 0 { cell } else { 0.0 };
+            let r = Rect::from_min_size(
+                Pos2::new(min.x + x as f32 * cell, min.y + y as f32 * cell - lift),
+                Vec2::splat(cell),
+            );
+            p.rect_filled(r, 0.0, color);
+        }
+    }
+    // The burner under it.
+    let burner = Rect::from_min_size(
+        Pos2::new(min.x + 3.0 * cell, min.y + 21.0 * cell),
+        Vec2::new(10.0 * cell, cell),
+    );
+    p.rect_filled(burner, 0.0, Color32::from_rgba_unmultiplied(0x4a, 0x46, 0x3c, 140));
+}
+
+/// The flame over a caption in the pixel face, centred in `rect`: the screen
+/// shown while lmux connects or has nothing selected.
+pub fn flame_screen(p: &Painter, rect: Rect, caption: &str, detail: &str, time: f64) {
+    let cell = (rect.height() / 90.0).clamp(3.0, 6.0).round();
+    let size = Vec2::new(16.0 * cell, 22.0 * cell);
+    let min = rect.center() - Vec2::new(size.x / 2.0, size.y / 2.0 + 24.0);
+    // Warm light around the core, in stepped rings like the icon's.
+    let core = min + Vec2::new(8.0 * cell, 13.0 * cell);
+    for (radius, a) in [(15.0, 6u8), (11.0, 8), (7.5, 10)] {
+        p.circle_filled(core, radius * cell, Color32::from_rgba_unmultiplied(0xd9, 0x43, 0x20, a));
+    }
+    flame(p, min, cell, ((time * 3.0).floor() % 4.0) as f32 / 4.0);
+    let y = min.y + size.y + 28.0;
+    p.text(
+        Pos2::new(rect.center().x, y),
+        egui::Align2::CENTER_TOP,
+        caption.to_uppercase(),
+        crate::theme::pixel(11.0),
+        crate::theme::FLAME,
+    );
+    if !detail.is_empty() {
+        p.text(
+            Pos2::new(rect.center().x, y + 20.0),
+            egui::Align2::CENTER_TOP,
+            detail,
+            crate::theme::ui(crate::theme::FS_SMALL),
+            crate::theme::DIM,
+        );
+    }
 }
