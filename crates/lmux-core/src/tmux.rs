@@ -397,6 +397,43 @@ impl Tmux {
         ))
     }
 
+    /// The terminal modes the pane's program has set, as the escape sequences
+    /// that set (or reset) them in a viewer: mouse reporting, application
+    /// cursor keys, bracketed paste, focus events and cursor visibility.
+    ///
+    /// A viewer learns these from the program's own output, so one that
+    /// attaches after the program started (the app reopening, a reconnect)
+    /// never sees them and would treat the pane as a plain terminal: the wheel
+    /// would scroll its own history instead of reaching a TUI that asked for
+    /// mouse reports. A flag the tmux version does not have is left out.
+    pub async fn pane_modes(&self, pane: &str) -> anyhow::Result<String> {
+        // (tmux format variable, DEC private mode)
+        const MODES: [(&str, u32); 9] = [
+            ("mouse_standard_flag", 1000),
+            ("mouse_button_flag", 1002),
+            ("mouse_all_flag", 1003),
+            ("mouse_utf8_flag", 1005),
+            ("mouse_sgr_flag", 1006),
+            ("keypad_cursor_flag", 1),
+            ("bracket_paste_flag", 2004),
+            ("focus_flag", 1004),
+            ("cursor_flag", 25),
+        ];
+        // `|`-separated: an unknown variable is an empty field, which
+        // whitespace splitting would fold away and shift the rest.
+        let format = MODES.iter().map(|(v, _)| format!("#{{{v}}}")).collect::<Vec<_>>().join("|");
+        let out = self.display(pane, &format).await?;
+        let mut seq = String::new();
+        for ((_, mode), flag) in MODES.iter().zip(out.trim().split('|')) {
+            match flag.trim() {
+                "1" => seq.push_str(&format!("\x1b[?{mode}h")),
+                "0" => seq.push_str(&format!("\x1b[?{mode}l")),
+                _ => {}
+            }
+        }
+        Ok(seq)
+    }
+
     /// Full screen snapshot as ANSI text that reproduces the pane in a fresh
     /// terminal, ending with the cursor positioned.
     pub async fn snapshot(&self, pane: &str) -> anyhow::Result<(u16, u16, String)> {
@@ -426,6 +463,11 @@ impl Tmux {
         // Erase the rest of the screen then position the cursor.
         out.push_str("\x1b[0J");
         out.push_str(&format!("\x1b[{};{}H", cy + 1, cx + 1));
+        // The program's modes, last so that cursor visibility applies to the
+        // cursor just placed. A failed query only loses the modes.
+        if let Ok(modes) = self.pane_modes(pane).await {
+            out.push_str(&modes);
+        }
         Ok((cols, rows, out))
     }
 
@@ -1341,6 +1383,64 @@ mod tests {
         assert!(sent.is_ok(), "send_bytes failed: {sent:?}");
         assert_eq!(got.len(), payload.len(), "every byte arrives");
         assert!(got == payload, "in order");
+    }
+
+    /// A viewer that attaches after a program enabled mouse reporting still
+    /// learns of it: the snapshot sets the program's modes, since it will
+    /// never see the escape sequences that did.
+    #[tokio::test]
+    async fn snapshot_restores_the_modes_the_program_set() {
+        if Command::new("tmux").arg("-V").output().await.is_err() {
+            return;
+        }
+        let socket = format!("lmux-test-modes-{}", std::process::id());
+        let _scratch = ScratchServer(socket.clone());
+        let cfg = TmuxConfig { socket: socket.clone(), session: "lmux".into() };
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let tmux = match Tmux::spawn(cfg, ev_tx).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping: could not start tmux ({e})");
+                return;
+            }
+        };
+        // Any-motion mouse tracking with SGR coordinates, and application
+        // cursor keys: what a TUI asks for when it handles the wheel itself.
+        let (_w, on) = tmux
+            .new_terminal(
+                "/tmp",
+                Some("printf '\\033[?1003h\\033[?1006h\\033[?1h'; sleep 30"),
+                &[],
+                80,
+                24,
+                "on",
+                "surface:1",
+                "workspace:1",
+            )
+            .await
+            .expect("new_terminal");
+        let (_w, off) = tmux
+            .new_terminal("/tmp", Some("sleep 30"), &[], 80, 24, "off", "surface:2", "workspace:1")
+            .await
+            .expect("new_terminal");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut modes = String::new();
+        while Instant::now() < deadline {
+            modes = tmux.pane_modes(&on).await.unwrap_or_default();
+            if modes.contains("\x1b[?1003h") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(modes.contains("\x1b[?1003h"), "any-motion tracking is set: {modes:?}");
+        assert!(modes.contains("\x1b[?1006h"), "SGR coordinates are set: {modes:?}");
+        assert!(modes.contains("\x1b[?1h"), "application cursor keys are set: {modes:?}");
+        assert!(modes.contains("\x1b[?1000l"), "modes the program did not set are reset: {modes:?}");
+
+        let (_, _, snap) = tmux.snapshot(&on).await.expect("snapshot");
+        assert!(snap.contains("\x1b[?1003h") && snap.contains("\x1b[?1006h"), "the snapshot carries them");
+        let (_, _, plain) = tmux.snapshot(&off).await.expect("snapshot");
+        assert!(!plain.contains("\x1b[?1003h") && !plain.contains("\x1b[?1006h"), "a plain pane sets none: {plain:?}");
     }
 
     /// A snapshot can carry tmux's history before the screen, for a viewer
