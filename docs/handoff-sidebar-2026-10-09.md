@@ -75,7 +75,7 @@ menu, and fixed the close deadlock. The tests are green.
 - Mock over the real websocket (`bun app/mock/server.ts`, ws `127.0.0.1:7900`): nested
   folder create, a session inside a nested folder, close-promotion, and tab creation.
 - A local session really runs on this Mac: a daemon on `127.0.0.1:7879` created a
-  workspace whose shell answered `echo` (`vas@Vass-MacBook-Air ~ %`).
+  workspace whose shell answered `echo` (`user@host ~ %`).
 - The app on the rebuilt binary showed `this mac · connected` and the local tree, with a
   working local shell in a pane. The host menus are covered by the `sidebar_menu` and
   `sidebar_folder_menu` snapshots and by interaction tests that drive real pointer
