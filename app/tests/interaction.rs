@@ -401,6 +401,28 @@ fn double_clicking_a_workspace_card_renames_it() {
     assert!(h.state().state.ws_rename.is_none());
 }
 
+/// Opening a title editor must not move the sessions below it: the rows keep
+/// the places they had, whichever card is being renamed.
+#[test]
+fn renaming_a_card_leaves_every_card_where_it_was() {
+    let mut h = harness(fixture());
+    let before = h.state().state.card_rects.clone();
+    assert!(before.len() >= 3, "the fixture has several sessions");
+    let ids: Vec<String> = h.state().state.tree.workspaces.iter().map(|w| w.id.clone()).collect();
+    for id in ids {
+        h.state_mut().state.begin_ws_rename(Some(&id));
+        h.run();
+        h.run();
+        assert!(h.state().state.ws_rename.is_some(), "{id} is editing");
+        let after = h.state().state.card_rects.clone();
+        for (card, was) in &before {
+            assert_eq!(after.get(card), Some(was), "{card} moved while renaming {id}");
+        }
+        h.state_mut().state.ws_rename = None;
+        h.run();
+    }
+}
+
 #[test]
 fn right_clicking_the_sidebar_asks_which_host() {
     use egui_kittest::kittest::Queryable;
