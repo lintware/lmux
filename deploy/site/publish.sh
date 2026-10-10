@@ -24,9 +24,15 @@ ln -s /Applications "$out/stage/Applications"
 hdiutil create -volname lmux -srcfolder "$out/stage" -ov -format UDZO "$out/public/lmux.dmg" >/dev/null
 codesign --sign "$identity" --timestamp "$out/public/lmux.dmg"
 
-if xcrun notarytool history --keychain-profile lmux-notary >/dev/null 2>&1; then
+# Notarization belongs to the Apple developer team, so any stored profile for
+# team UTSTY3J6NS works: lmux-notary, else the older MacWispr-notary.
+notary=""
+for cand in lmux-notary MacWispr-notary; do
+  if xcrun notarytool history --keychain-profile "$cand" >/dev/null 2>&1; then notary=$cand; break; fi
+done
+if [ -n "$notary" ]; then
   echo "==> notarizing (a few minutes)"
-  xcrun notarytool submit "$out/public/lmux.dmg" --keychain-profile lmux-notary --wait
+  xcrun notarytool submit "$out/public/lmux.dmg" --keychain-profile "$notary" --wait
   xcrun stapler staple "$out/public/lmux.dmg"
   notarized=1
 else
