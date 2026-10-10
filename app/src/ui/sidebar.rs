@@ -815,7 +815,7 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ct
     // otherwise keep the hover that is supposed to reveal it.
     let close_center = egui::pos2(
         rect.max.x - if ws.unread_notifications > 0 { 30.0 } else { 12.0 },
-        rect.min.y + 11.0,
+        rect.center().y,
     );
     let close_resp = ui.interact(
         Rect::from_center_size(close_center, Vec2::splat(18.0)),
