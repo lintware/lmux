@@ -191,7 +191,7 @@ impl Tmux {
             shell_quote(&sanitize_window_name(title)),
             shell_quote(cwd),
         );
-        for (k, v) in env {
+        for (k, v) in PANE_ENV.iter().map(|(k, v)| (k.to_string(), v.to_string())).chain(env.iter().cloned()) {
             line.push_str(&format!(" -e {}", shell_quote(&format!("{k}={v}"))));
         }
         if let Some(cmd) = command {
@@ -750,6 +750,13 @@ async fn ensure_session(cfg: &TmuxConfig) -> anyhow::Result<()> {
     server_defaults(cfg).await;
     Ok(())
 }
+
+/// What programs in a pane are told about their terminal. tmux announces
+/// itself (`TMUX`, `TERM_PROGRAM=tmux`), and programs that see it play safe:
+/// Claude Code, for one, drops to 256 colours. lmux draws panes the way
+/// Ghostty does, so panes say Ghostty, and `TMUX` is left empty (programs
+/// test it for being non-empty). `TMUX_PANE` and tmux itself still work.
+pub const PANE_ENV: &[(&str, &str)] = &[("TERM_PROGRAM", "ghostty"), ("TERM_PROGRAM_VERSION", "1.3.1"), ("TMUX", "")];
 
 /// tmux reads its own command syntax; wrap a value in double quotes and escape.
 pub fn shell_quote(s: &str) -> String {

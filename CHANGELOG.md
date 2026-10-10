@@ -9,6 +9,17 @@ All notable changes to lmux are listed here, newest first. The format follows
 
 ### Added
 
+- **Terminals look like Ghostty.** Panes are drawn by a new GPU renderer
+  ported from Ghostty's: its default font (JetBrains Mono, bundled) at 13pt,
+  CoreText glyphs with Ghostty's cell metrics, box drawing, blocks, braille,
+  Powerline and legacy-computing characters drawn to the exact cell, all five
+  underline styles, colour emoji, and cmux's default colours. Your Ghostty
+  config and themes (`~/.config/ghostty/config`) are read too.
+  `LMUX_RENDERER=egui` brings back the previous renderer.
+- Programs in a pane are told they run in Ghostty (`TERM_PROGRAM=ghostty`,
+  an empty `TMUX`), so tools that play safe inside tmux use their full
+  settings: Claude Code draws in true colour instead of 256 colours.
+
 - **Real pointer and keyboard input for agents:** `lmux browser mouse click|dblclick|down|up|move|wheel X Y`
   and `lmux browser keyboard --text … | --key …`. They go through the browser
   engine's own input path, so they land inside cross-origin iframes (Google's
