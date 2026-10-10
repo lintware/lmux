@@ -1,0 +1,8 @@
+// The download site, https://lmux.lintlabs.org. Deployed by publish.sh,
+// which builds the assets into target/site/public.
+{
+  "name": "lmux-site",
+  "account_id": "7efeb52ec5727a903edd8ef7ae8eb925",
+  "compatibility_date": "2026-09-01",
+  "routes": [{ "pattern": "lmux.lintlabs.org", "custom_domain": true }]
+}

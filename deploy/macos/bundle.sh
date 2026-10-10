@@ -43,6 +43,9 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+  <key>NSDocumentsFolderUsageDescription</key><string>Terminals in lmux open and run programs in your folders.</string>
+  <key>NSDesktopFolderUsageDescription</key><string>Terminals in lmux open and run programs in your folders.</string>
+  <key>NSDownloadsFolderUsageDescription</key><string>Terminals in lmux open and run programs in your folders.</string>
 </dict>
 </plist>
 PLIST
@@ -65,12 +68,34 @@ for s in 16 32 128 256 512; do
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/lmux.icns"
 
-echo "==> signing (ad hoc)"
-codesign --force --deep --sign - "$app" 2>&1 | grep -v 'replacing existing signature' || true
+# macOS remembers privacy grants (Documents, Desktop…) by signing identity.
+# An ad-hoc signature changes with every build, so each reinstall would ask
+# again; a certificate keeps the grant. LMUX_SIGN_IDENTITY picks one, else the
+# first Developer ID Application, then Apple Development, then ad hoc.
+identity=${LMUX_SIGN_IDENTITY:-}
+if [ -z "$identity" ]; then
+  ids=$(security find-identity -v -p codesigning 2>/dev/null || true)
+  identity=$(printf '%s\n' "$ids" | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -1)
+  [ -n "$identity" ] || identity=$(printf '%s\n' "$ids" | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' | head -1)
+fi
+if [ -n "$identity" ] && [ "$identity" != - ]; then
+  echo "==> signing as $identity"
+  # Hardened runtime and a timestamp: what notarization needs. Inner
+  # binary first; --deep is deprecated for signing.
+  sign() { codesign --force --options runtime --timestamp --sign "$identity" "$@"; }
+  sign --identifier dev.lmux.cli "$app/Contents/MacOS/lmux"
+  sign "$app"
+else
+  echo "==> signing (ad hoc: no certificate, so macOS asks for folder access after each reinstall)"
+  codesign --force --sign - "$app/Contents/MacOS/lmux"
+  codesign --force --sign - "$app"
+fi
+codesign --verify --strict "$app"
 
 echo "==> installing to $dest and ~/.local/bin/lmux"
 rm -rf "$dest/lmux.app"
 cp -R "$app" "$dest/lmux.app"
 mkdir -p "$HOME/.local/bin"
-install -m755 "$repo/target/release/lmux" "$HOME/.local/bin/lmux"
+# The signed copy, so the CLI and daemon carry the same identity as the app.
+install -m755 "$app/Contents/MacOS/lmux" "$HOME/.local/bin/lmux"
 echo "==> done: open -a lmux"
