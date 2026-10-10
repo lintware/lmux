@@ -185,6 +185,10 @@ impl eframe::App for LmuxApp {
                     || c.state.cloud_draft.is_some()
                     || c.state.confirm_cloud_delete.is_some();
                 if window_focused && !text_editing && !modal {
+                    // Tab and the arrows belong to the terminal: without this,
+                    // egui walks keyboard focus onto the sidebar's buttons, the
+                    // terminal stops getting keys and Enter presses the button.
+                    ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
                     route_input(&ctx, &mut c);
                 }
             }

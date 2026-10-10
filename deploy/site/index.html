@@ -4,143 +4,101 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>lmux · lean mux</title>
-<meta name="description" content="lmux, the lean mux: cmux's workspace window and herdr's persistence in one small app. Terminals, browsers and agents keep running on your Mac and your servers.">
-<link rel="icon" href="icon.png">
+<meta name="description" content="lmux, the lean mux: cmux's workspace window and herdr's persistence in one 29 MB app. Terminals, browsers and agents keep running on your Mac and your servers.">
+<meta name="theme-color" content="#f3f0e7">
+<meta property="og:title" content="lmux · close the laptop, nothing stops">
+<meta property="og:description" content="cmux's window, herdr's persistence, tmux inside. 29 MB, MIT licensed, and every terminal, browser and agent survives quit, reboot and lost network.">
+<link rel="icon" href="lmux-mark.svg" type="image/svg+xml">
+<link rel="icon" href="icon.png" sizes="256x256">
+<link rel="apple-touch-icon" href="icon.png">
+<meta property="og:image" content="https://lmux.lintlabs.org/icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-  /* Matches lintlabs.org: neutral greys, Inter, black headlines, pill buttons. */
-  :root {
-    --n50: #fafafa; --n100: #f5f5f5; --n200: #e5e5e5; --n300: #d4d4d4; --n400: #a3a3a3;
-    --n500: #737373; --n600: #525252; --n700: #404040; --n800: #262626; --n900: #171717; --n950: #0a0a0a;
-    --accent: #0a84ff;
-    --font: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
-    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
-  }
-  * { box-sizing: border-box; }
-  html { color-scheme: light; }
-  body { margin: 0; background: #fff; color: var(--n900); font: 16px/1.6 var(--font); -webkit-font-smoothing: antialiased; }
-  a { color: inherit; }
-
-  nav.liquid {
-    position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 50;
-    width: min(96%, 900px); display: flex; align-items: center; justify-content: space-between;
-    padding: 6px; border-radius: 999px;
-    background: #ffffffd1; backdrop-filter: blur(24px) saturate(180%); -webkit-backdrop-filter: blur(24px) saturate(180%);
-    border: 1px solid rgba(0,0,0,.08); box-shadow: 0 12px 36px -12px #0000001f, 0 0 0 1px #00000008;
-  }
-  nav.liquid .brand { display: flex; align-items: center; gap: 10px; padding-left: 8px; text-decoration: none; }
-  nav.liquid .brand img { height: 26px; opacity: .9; }
-  nav.liquid .brand span { font-size: 12px; font-weight: 700; color: #0000008c; border-left: 1px solid var(--n200); padding-left: 10px; }
-  .pill-sm {
-    display: inline-flex; align-items: center; height: 36px; padding: 0 16px; border-radius: 999px;
-    background: var(--n900); color: #fff; font-size: 12px; font-weight: 700; text-decoration: none;
-    transition: transform .3s; box-shadow: 0 1px 2px #0000000d;
-  }
-  .pill-sm:hover { transform: scale(1.05); }
-
-  .hero {
-    background: var(--n200); padding: 136px 24px 64px; text-align: center; overflow: hidden;
-    background-image: radial-gradient(ellipse at top, #ffffff99, transparent 60%);
-  }
-  .eyebrow { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .28em; color: var(--n500); margin: 0 0 12px; }
-  h1 { font-size: clamp(40px, 8vw, 72px); font-weight: 900; letter-spacing: -0.035em; line-height: 1.05; margin: 0 auto 14px; max-width: 760px; }
-  .lede { font-size: clamp(16px, 2.2vw, 18px); color: var(--n600); max-width: 560px; margin: 0 auto 32px; }
-  .actions { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
-  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 14px 32px; border-radius: 999px; font-weight: 600; text-decoration: none; transition: background .2s, border-color .2s; }
-  .btn-dark { background: var(--n900); color: #fff; box-shadow: 0 10px 15px -3px #0000001a, 0 4px 6px -4px #0000001a; }
-  .btn-dark:hover { background: var(--n800); }
-  .btn-ghost { border: 1px solid var(--n400); background: #ffffff99; color: var(--n700); font-weight: 500; }
-  .btn-ghost:hover { border-color: var(--n900); }
-  .meta { font-size: 13px; color: var(--n500); margin: 14px 0 0; }
-
-  /* The animated demo (demo.html): Claude drives a browser, the laptop closes, everything comes back. */
-  .demo { max-width: 920px; margin: 48px auto 0; aspect-ratio: 960 / 560; }
-  .demo iframe { display: block; width: 100%; height: 100%; border: 0; border-radius: 14px; box-shadow: 0 30px 60px -20px #00000059; background: #1c1c1e; }
-
-  section { padding: 72px 24px; }
-  .wrap { max-width: 1000px; margin: 0 auto; }
-  .alt { background: var(--n50); border-top: 1px solid var(--n200); border-bottom: 1px solid var(--n200); }
-  h2 { font-size: clamp(28px, 4vw, 36px); font-weight: 700; letter-spacing: -0.025em; margin: 0 0 12px; }
-  .sub { color: var(--n600); margin: 0 0 36px; max-width: 620px; }
-  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-  .card { border: 1px solid var(--n200); background: #fff; border-radius: 16px; padding: 24px; transition: border-color .2s, box-shadow .2s; }
-  .card:hover { border-color: var(--n900); box-shadow: 0 4px 6px -1px #0000001a; }
-  .card .n { font-size: 11px; font-weight: 700; color: var(--n400); letter-spacing: .2em; }
-  h3 { font-size: 18px; font-weight: 900; letter-spacing: -0.02em; margin: 8px 0 8px; color: var(--n950); }
-  .card p { margin: 0; color: var(--n600); font-size: 15px; }
-  code { font: 13px var(--mono); background: var(--n100); border: 1px solid var(--n200); padding: 1px 6px; border-radius: 6px; }
-  .note { margin-top: 20px; border: 1px solid var(--n200); background: #fff; border-radius: 16px; padding: 18px 22px; font-size: 15px; color: var(--n700); }
-
-  .wordmark { font-size: 15px; font-weight: 600; color: var(--n600); margin: 0 0 10px; letter-spacing: -0.01em; }
-  .wordmark b { color: var(--n950); font-weight: 900; }
-  .mix { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 0 0 28px; }
-  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 999px; background: #ffffffb3; border: 1px solid var(--n300); font-size: 13px; font-weight: 600; color: var(--n800); }
-  .chip.plus { background: none; border: 0; padding: 6px 2px; color: var(--n400); }
-  .chip.eq { background: var(--n900); border-color: var(--n900); color: #fff; }
-  .card .from { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; color: var(--n500); }
-  .card ul { margin: 12px 0 0; padding-left: 18px; color: var(--n600); font-size: 14.5px; }
-  .card ul li { margin-bottom: 4px; }
-  .card .drop { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--n200); font-size: 13.5px; color: var(--n500); }
-  .card .drop b { color: var(--n700); }
-  .stats { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid var(--n200); border-radius: 16px; overflow: hidden; font-size: 15px; }
-  .stats th, .stats td { text-align: left; padding: 12px 18px; border-bottom: 1px solid var(--n200); }
-  .stats tr:last-child td { border-bottom: 0; }
-  .stats th { font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--n500); background: var(--n50); }
-  .stats td:nth-child(2) { color: var(--n500); }
-  .stats td:nth-child(3) { font-weight: 700; color: var(--n950); }
-  .fine { font-size: 13px; color: var(--n500); margin: 12px 0 0; }
-
-  footer { background: var(--n50); border-top: 1px solid var(--n200); padding: 40px 24px; }
-  footer .wrap { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; font-size: 14px; color: var(--n500); }
-  footer a { text-decoration: none; }
-  footer a:hover { color: var(--n950); }
-
-  @media (max-width: 760px) {
-    .grid { grid-template-columns: 1fr; }
-    .stats th, .stats td { padding: 10px 12px; font-size: 14px; }
-    nav.liquid .brand span { display: none; }
-  }
+:root{--bg:#f3f0e7;--panel:#eae6dc;--text:#24241f;--dim:#64635a;--mute:#747268;--line:#24241f25;--line2:#24241f40;--accent:#d94320;--font:"Space Grotesk",sans-serif;--mono:"IBM Plex Mono",monospace}
+*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:100px}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 var(--font);-webkit-font-smoothing:antialiased}a{color:inherit}::selection{background:var(--accent);color:#fffaf0}a:focus-visible{outline:3px solid var(--accent);outline-offset:5px} .glow,.grain{display:none}
+nav.top{max-width:1280px;margin:auto;padding:26px 40px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}.brand{display:flex;align-items:center;gap:16px;text-decoration:none}.brand img{width:100px;height:28px}.brand span{border-left:1px solid var(--line2);padding-left:16px;font:600 17px var(--mono);display:flex;align-items:center;gap:9px}.brand span img{width:auto;height:24px}.links{display:flex;gap:25px;align-items:center}.links a{font-size:13px;text-decoration:none}.links a:hover{color:var(--accent)}.links .go{background:var(--text);color:var(--bg);padding:10px 18px}
+.hero{max-width:1280px;margin:auto;padding:64px 40px 0;position:relative}.pill{display:inline-flex;align-items:center;gap:14px;font:12px var(--mono);text-decoration:none;margin-bottom:30px}.pill b{background:var(--accent);color:#fffaf0;padding:6px 10px}.pill span{color:var(--dim)}h1{font-size:clamp(60px,8.7vw,118px);line-height:.94;letter-spacing:-.075em;font-weight:600;margin:0 0 30px}.g{color:var(--accent)}.lede{max-width:625px;font-size:18px;line-height:1.65;color:var(--dim);margin:0 0 28px}.lede b{color:var(--text);font-weight:500}.actions{display:flex;gap:12px;flex-wrap:wrap}.btn{display:inline-flex;align-items:center;justify-content:center;gap:13px;text-decoration:none;padding:16px 24px;font-weight:600;font-size:15px;transition:transform .2s,background .2s}.btn:hover{transform:translateY(-3px)}.btn-primary{background:var(--accent);color:#fffaf0}.btn-primary:hover{background:#b63216}.btn-ghost{border:1px solid var(--line2)}.btn svg{width:19px;height:19px}.meta{font:11px/1.8 var(--mono);color:var(--dim);margin:18px 0 0}
+.stage{margin:52px 0 0;padding:16px;background:#24241f;box-shadow:12px 12px 0 #d94320;position:relative}.stage:before{content:"LMUX / LIVE WORKSPACE";display:block;font:10px var(--mono);letter-spacing:.16em;color:#d8d4c9;margin:0 0 14px}.demo{aspect-ratio:960/560;background:#191919;overflow:hidden;border:1px solid #ffffff25}.demo iframe{display:block;width:100%;height:100%;border:0}.numbers{display:grid;grid-template-columns:repeat(4,1fr);margin:48px 0 0;border-top:1px solid var(--line2);border-bottom:1px solid var(--line2)}.numbers>div{padding:26px 22px 28px 0}.numbers>div+div{padding-left:24px;border-left:1px solid var(--line)}.v{display:block;font-size:44px;letter-spacing:-.06em;line-height:1.1;font-weight:600}.l{display:block;margin-top:9px;color:var(--dim);font:11px/1.6 var(--mono);max-width:190px}
+section{padding:110px 40px 0}.wrap{max-width:1200px;margin:auto}.kicker{font:12px var(--mono);text-transform:uppercase;letter-spacing:.12em;color:var(--accent);margin:0 0 24px;display:flex;align-items:center;gap:12px}.kicker:before{content:"";width:25px;height:2px;background:currentColor}h2{font-size:clamp(36px,4.8vw,64px);font-weight:500;letter-spacing:-.055em;line-height:1.05;margin:0 0 24px;max-width:850px}.sub{font-size:18px;color:var(--dim);max-width:700px;margin:0 0 40px}code{font:12px var(--mono);background:#24241f0b;padding:3px 6px;overflow-wrap:anywhere}.split{display:grid;grid-template-columns:1.1fr 1fr;gap:56px;align-items:center}.term{background:#24241f;color:#eae6dc;border:1px solid var(--line2)}.bar{display:flex;gap:6px;padding:14px 18px;border-bottom:1px solid #ffffff20}.bar i{width:8px;height:8px;background:#d94320;border-radius:50%}.bar i:nth-child(2){background:#d9a646}.bar i:nth-child(3){background:#b3bc88}.bar span{margin-left:12px;font:11px var(--mono);color:#bdb9ad}.term pre{padding:22px;margin:0;min-height:330px;font:12px/1.9 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}.term .p,.term .b{color:#e5ad71}.term .d{color:#aca99b}.term .o{color:#f07a56}.cur{display:inline-block;width:7px;height:14px;background:#eae6dc;animation:blink 1s steps(2) infinite}@keyframes blink{50%{opacity:0}}.steps{list-style:none;margin:0;padding:0}.steps li{display:grid;grid-template-columns:40px 1fr;gap:18px;padding:22px 0;border-bottom:1px solid var(--line)}.steps .n{font:12px var(--mono);color:var(--accent);padding-top:4px}.steps b{display:block;font-size:22px;font-weight:500;letter-spacing:-.03em}.steps span{display:block;color:var(--dim);font-size:15px;margin-top:5px}
+.bento{display:grid;grid-template-columns:repeat(6,1fr);gap:1px;background:var(--line);border:1px solid var(--line)}.tile{padding:30px;background:var(--bg);min-width:0;transition:background .25s}.tile:hover{background:#ebe6d9}.tile.w4{grid-column:span 4}.tile.w2{grid-column:span 2}.tile.w3{grid-column:span 3}.tag,.num{font:11px var(--mono);text-transform:uppercase;letter-spacing:.09em;color:var(--accent)}.tile h3{font-size:27px;line-height:1.15;letter-spacing:-.04em;font-weight:500;margin:18px 0 15px}.tile p,.tile ul{font-size:15px;color:var(--dim);margin:0}.tile ul{list-style:none;padding:0;display:grid;gap:9px}.tile li:before{content:"↗";color:var(--accent);margin-right:12px}.drop{font-size:13px;color:var(--dim);border-top:1px dashed var(--line2);padding-top:18px;margin-top:24px}.drop b{color:var(--text)}.hosts{display:grid;gap:8px;margin-top:24px}.hostrow{font:12px var(--mono);display:flex;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--line)}.hostrow i{width:6px;height:6px;background:var(--accent)}.hostrow span{margin-left:auto;color:var(--dim);font-size:10px}.engine{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:25px;font:11px var(--mono)}.engine .c{padding:8px;border:1px solid var(--line2)}.engine .eq{background:var(--accent);color:#fffaf0;border-color:var(--accent)}
+#lean{background:#24241f;color:#f3f0e7;margin-top:110px;padding-top:72px;padding-bottom:72px;--line:#f3f0e725;--line2:#f3f0e740;--dim:#bebbad;--mute:#aaa797}#lean .kicker{color:#f07a56}.bars{display:grid;grid-template-columns:1fr 1fr;gap:20px}.row{padding:24px;border:1px solid var(--line)}.row:last-child{grid-column:1/-1}.row h4{font-size:14px;font-weight:400;margin:0 0 22px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}.row em{font:11px var(--mono);color:#f07a56;font-style:normal}.meter{display:grid;grid-template-columns:42px 1fr 116px;gap:12px;align-items:center;margin-top:12px;font:11px var(--mono)}.meter label{color:var(--dim)}.meter b{text-align:right;font-weight:400}.track{height:7px;background:#ffffff0b}.fill{height:100%;width:var(--w);min-width:3px;transform-origin:left;animation:grow .9s ease both}.fill.old{background:#747268}.fill.mid{background:#c9b48a}.fill.new{background:#f07a56}@keyframes grow{from{transform:scaleX(0)}to{transform:scaleX(1)}}.fine{font:12px/1.9 var(--mono);color:var(--dim);max-width:800px;margin:26px 0 0}
+.install{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line)}.note{margin-top:20px;border-left:3px solid var(--accent);background:#d9432009;padding:18px 24px;font-size:14px;color:var(--dim)}.note b{color:var(--text)}.server{display:grid;grid-template-columns:1fr 1fr;margin-top:35px;border:1px solid var(--line)}.cmdbox{background:#24241f;color:#eae6dc;padding:30px;font:12px/2 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}.cmdbox .d{color:#aca99b}.cta{max-width:1200px;margin:100px auto 0;padding:60px;background:var(--accent);color:#fffaf0;position:relative}.cta h2{max-width:700px}.cta p{max-width:520px;margin-bottom:28px}.cta .btn-primary{background:var(--text);color:var(--bg)}footer{padding:40px;margin-top:50px}footer .wrap{display:flex;justify-content:space-between;gap:24px;border-top:1px solid var(--line);padding-top:26px;font:11px/1.8 var(--mono);color:var(--dim)}footer nav{display:flex;gap:24px;flex-wrap:wrap}footer a{text-decoration:none}footer a:hover{color:var(--accent)}.rv{opacity:1}
+@media(min-width:1100px){.hero:after{content:"lean\A mux.";white-space:pre;position:absolute;right:40px;top:292px;font:500 86px/.83 var(--font);letter-spacing:-.075em;color:#d6d1c3;border-left:1px solid var(--line);padding-left:45px}}
+@media(max-width:860px){nav.top{padding:20px 24px}.links{gap:15px}.links a:not(.go){display:none}.hero{padding:48px 24px 0}h1{font-size:clamp(58px,10vw,90px)}section{padding:76px 24px 0}.split{grid-template-columns:1fr;gap:24px}.bento{grid-template-columns:1fr 1fr}.tile.w2,.tile.w3,.tile.w4{grid-column:auto}.numbers{grid-template-columns:1fr 1fr}.numbers>div:nth-child(3){border-left:0;padding-left:0}.numbers>div:nth-child(-n+2){border-bottom:1px solid var(--line)}.bars{grid-template-columns:1fr}.row:last-child{grid-column:auto}.install{grid-template-columns:1fr}.server{grid-template-columns:1fr}.cta{padding:36px;margin-top:70px}footer{padding:30px 24px}footer .wrap{flex-direction:column}#lean{margin-top:76px}}
+@media(max-width:480px){.brand img{width:80px}.brand span{font-size:14px;padding-left:12px}.brand{gap:12px}.links .go{font-size:11px;padding:9px 12px}.pill{font-size:10px;gap:8px}h1{font-size:59px}.lede{font-size:16px}.btn{padding:14px 18px;font-size:13px}.meta{font-size:10px}.stage{padding:8px;box-shadow:6px 6px 0 var(--accent);margin-top:34px}.stage:before{font-size:8px;margin:3px 0 9px}.numbers{margin-top:32px}.v{font-size:36px}.numbers>div{padding-top:20px;padding-bottom:20px}.numbers>div+div{padding-left:16px}.l{font-size:10px}.sub{font-size:16px}.bento{grid-template-columns:1fr}.tile{padding:24px}.term pre{font-size:10px;padding:16px;min-height:290px}.meter{grid-template-columns:36px 1fr 104px;gap:8px;font-size:10px}.row{padding:20px}.cta{padding:28px}.cta h2{font-size:38px}footer nav{gap:14px}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*:before,*:after{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
-<nav class="liquid">
-  <a class="brand" href="https://lintlabs.org"><img src="lintlabs-logo.svg" alt="LintLabs"><span>lmux · lean mux</span></a>
-  <a class="pill-sm" href="lmux.dmg">Download</a>
+
+<nav class="top">
+  <a class="brand" href="https://lintlabs.org"><img src="lintlabs-logo.svg" alt="LintLabs"><span><img src="lmux-mark.svg" alt="">lmux</span></a>
+  <div class="links">
+    <a href="#persistence">Persistence</a>
+    <a href="#built-in">Built in</a>
+    <a href="#lean">Lean</a>
+    <a href="#install">Install</a>
+    <a class="go" href="lmux.dmg">Download</a>
+  </div>
 </nav>
 
 <main>
   <div class="hero">
-    <p class="eyebrow">LintLabs · Open beta</p>
-    <p class="wordmark"><b>lmux</b> is the lean mux</p>
-    <h1>cmux and herdr, in one lean app.</h1>
-    <p class="lede">The cmux window you know, with herdr's persistence built in. Terminals, browsers and agents keep running on your Mac and your servers. Quit, reboot or lose the network, and everything is where you left it.</p>
-    <div class="mix" aria-label="cmux plus herdr plus tmux equals lmux">
-      <span class="chip">cmux window</span><span class="chip plus">+</span>
-      <span class="chip">herdr persistence</span><span class="chip plus">+</span>
-      <span class="chip">tmux inside</span><span class="chip plus">=</span>
-      <span class="chip eq">lmux</span>
-    </div>
+    <a class="pill" href="#lean"><b>29 MB</b><span>The whole app. cmux is 744 MB.</span></a>
+    <h1>Close the laptop.<br><span class="g">Nothing stops.</span></h1>
+    <p class="lede">lmux is <b>cmux's window</b> with <b>herdr's persistence</b> built in. Terminals, browsers and Claude sessions live on the machine they run on, so quitting, rebooting or losing the network changes nothing.</p>
     <div class="actions">
-      <a class="btn btn-dark" href="lmux.dmg">Download for Mac</a>
+      <a class="btn btn-primary" href="lmux.dmg">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-5-5m5 5l5-5M5 21h14"/></svg>
+        Download for Mac</a>
       <a class="btn btn-ghost" href="#install">How to install</a>
     </div>
-    <p class="meta">Version @VERSION@ · macOS 12 or later · Apple silicon</p>
+    <p class="meta">Version @VERSION@ · macOS 12 or later · Apple silicon · MIT licensed</p>
 
-    <div class="demo">
-      <iframe src="demo.html" title="lmux demo: Claude on a server drives a browser pane, the laptop closes, and every pane comes back where it was"></iframe>
+    <div class="stage rv">
+      <div class="demo">
+        <iframe src="demo.html" title="lmux demo: Claude on a server drives a browser pane, the laptop closes, and every pane comes back where it was"></iframe>
+      </div>
+    </div>
+
+    <div class="numbers rv">
+      <div><span class="v">29 MB</span><span class="l">app on disk, down from 744 MB</span></div>
+      <div><span class="v">3 ms</span><span class="l">per agent command, down from ~170 ms</span></div>
+      <div><span class="v">0.3 s</span><span class="l">to create 40 workspaces, down from 11.5 s</span></div>
+      <div><span class="v">400</span><span class="l">terminals tested across 200 workspaces</span></div>
     </div>
   </div>
 
+  <section id="persistence">
+    <div class="wrap">
+      <p class="kicker">Persistence</p>
+      <h2>Everything comes back exactly where you left it.</h2>
+      <p class="sub">Each computer runs a small lmux service that owns its terminals. The app on your Mac is only a view, so closing it stops nothing.</p>
+      <div class="split">
+        <div class="term rv" aria-label="A terminal session showing lmux resuming work after a reboot">
+          <div class="bar"><i></i><i></i><i></i><span>my-server · webapp</span></div>
+          <pre id="tty" data-fallback></pre>
+        </div>
+        <ol class="steps rv">
+          <li><div class="n">01</div><div><b>Work anywhere</b><span>Open a workspace on a server and every terminal in it runs there. No manual SSH.</span></div></li>
+          <li><div class="n">02</div><div><b>Walk away</b><span>Quit the app, close the lid, lose the network or reboot. Remote work keeps running.</span></div></li>
+          <li><div class="n">03</div><div><b>Come back</b><span>Same folder, same scrollback, same Claude session via <code>claude --resume</code>. Unread notifications say what happened.</span></div></li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
   <section id="built-in">
     <div class="wrap">
-      <h2>Built in together.</h2>
-      <p class="sub">lmux takes the parts of cmux and herdr people actually use and puts them in one app, with tmux underneath. You don't install or run any of them separately.</p>
-      <div class="grid">
-        <div class="card">
-          <span class="from">From cmux</span>
-          <h3>The window</h3>
+      <p class="kicker">Built in together</p>
+      <h2>The best parts of three tools. None of the setup.</h2>
+      <p class="sub">lmux takes what people actually use from cmux and herdr, and puts tmux underneath. You don't install or run any of them separately.</p>
+      <div class="bento">
+        <div class="tile w4 rv">
+          <span class="tag">From cmux</span>
+          <h3>The window you already know</h3>
           <ul>
             <li>Folders and workspaces in a sidebar</li>
             <li>Splits, tabs and browser panes</li>
@@ -150,85 +108,111 @@
           </ul>
           <div class="drop"><b>Left out:</b> the cloud VM service, team features, vault, recordings, the iOS simulator and ~25 background helpers.</div>
         </div>
-        <div class="card">
-          <span class="from">From herdr</span>
-          <h3>Persistence</h3>
-          <ul>
-            <li>Nothing closes for good</li>
-            <li>Quit, close the lid, lose the network or reboot</li>
-            <li>Every pane returns to the same folder and scrollback</li>
-            <li>Each Claude session resumes with <code>claude --resume</code></li>
-            <li>Browsers keep running while you're away</li>
-          </ul>
+        <div class="tile w2 rv">
+          <span class="tag">From herdr</span>
+          <h3>Nothing closes for good</h3>
+          <p>Every pane returns to the same folder and scrollback. Browsers keep running while you're away.</p>
           <div class="drop"><b>Left out:</b> nothing.</div>
         </div>
-        <div class="card">
-          <span class="from">From tmux</span>
-          <h3>The engine</h3>
-          <ul>
-            <li>Every terminal lives in tmux on its own machine</li>
-            <li>Keeps running with no window attached</li>
-            <li>tmux ships inside the app</li>
-          </ul>
-          <div class="drop"><b>Left out:</b> having to install it, configure it or remember its keys.</div>
+        <div class="tile w3 rv">
+          <span class="tag">Agents</span>
+          <h3>Claude gets a browser, you get a front-row seat</h3>
+          <p>Claude Code opens a browser pane on the same host, clicks, types, and works inside iframes and popups. You watch it live from your Mac.</p>
+        </div>
+        <div class="tile w3 rv">
+          <span class="tag">Hosts</span>
+          <h3>One sidebar, every machine</h3>
+          <div class="hosts">
+            <div class="hostrow"><i></i>this mac<span>local</span></div>
+            <div class="hostrow"><i></i>my-server<span>ssh · tailscale</span></div>
+            <div class="hostrow"><i></i>cloud box<span>planned</span></div>
+          </div>
+        </div>
+        <div class="tile w3 rv">
+          <span class="tag">From tmux</span>
+          <h3>The engine, hidden</h3>
+          <p>Every terminal lives in tmux on its own machine and keeps running with no window attached. tmux ships inside the app.</p>
+          <div class="drop"><b>Left out:</b> installing it, configuring it, remembering its keys.</div>
+        </div>
+        <div class="tile w3 rv">
+          <span class="tag">Equation</span>
+          <h3>It adds up</h3>
+          <div class="engine">
+            <span class="c">cmux window</span><span class="x">+</span>
+            <span class="c">herdr persistence</span><span class="x">+</span>
+            <span class="c">tmux inside</span><span class="x">=</span>
+            <span class="c eq">lmux</span>
+          </div>
         </div>
       </div>
     </div>
   </section>
 
-  <section class="alt" id="lean">
+  <section id="lean">
     <div class="wrap">
-      <h2>Why it's lean.</h2>
-      <p class="sub">The same workload in cmux and lmux on one MacBook Air: each workspace has a terminal printing about 20 lines a second, plus an idle split. Figures are what each app added on top of idle.</p>
-      <table class="stats">
-        <thead><tr><th></th><th>cmux</th><th>lmux</th></tr></thead>
-        <tbody>
-          <tr><td>App on disk</td><td>744 MB</td><td>29 MB</td></tr>
-          <tr><td>Memory, 40 workspaces</td><td>+698 MB</td><td>about +100 MB</td></tr>
-          <tr><td>CPU, 40 workspaces</td><td>15.5%</td><td>10%</td></tr>
-          <tr><td>Each agent command</td><td>~170 ms</td><td>~3 ms</td></tr>
-          <tr><td>Creating 40 workspaces</td><td>11.5 s</td><td>0.3 s</td></tr>
-          <tr><td>Most tested</td><td>40 workspaces</td><td>200 workspaces, 400 terminals</td></tr>
-        </tbody>
-      </table>
-      <p class="fine">The app draws only the pane on screen. Remote terminals and browsers run on the server, so the laptop receives only what you're looking at.</p>
-    </div>
-  </section>
-
-  <section>
-    <div class="wrap">
-      <h2>One window for every machine.</h2>
-      <p class="sub">Each computer runs a small lmux service that owns its terminals. The app on your Mac is just a view, so closing it stops nothing.</p>
-      <div class="grid">
-        <div class="card"><div class="n">01</div><h3>Nothing closes</h3><p>Quit the app or restart your Mac. Every pane comes back with the same folder, history and Claude session.</p></div>
-        <div class="card"><div class="n">02</div><h3>Servers feel local</h3><p>Open a workspace on a server and every terminal in it runs there. No manual SSH.</p></div>
-        <div class="card"><div class="n">03</div><h3>Agents with a browser</h3><p>Claude Code can open a browser pane, click and type, and you watch it happen live.</p></div>
+      <p class="kicker">Lean, measured</p>
+      <h2>Same workload. A fraction of the weight.</h2>
+      <p class="sub">The same workload in cmux, herdr and lmux on one MacBook Air: each workspace has a terminal printing about 20 lines a second, plus an idle split. Figures are what each app added on top of idle.</p>
+      <div class="bars" id="bars">
+        <div class="row rv"><h4>App on disk <em>26× smaller than cmux</em></h4>
+          <div class="meter"><label>cmux</label><div class="track"><div class="fill old" style="--w:100%"></div></div><b class="hi">744 MB</b></div>
+          <div class="meter"><label>herdr</label><div class="track"><div class="fill mid" style="--w:2.7%"></div></div><b class="hi">20 MB</b></div>
+          <div class="meter"><label>lmux</label><div class="track"><div class="fill new" style="--w:3.9%"></div></div><b class="hi">29 MB</b></div></div>
+        <div class="row rv"><h4>Memory, 40 workspaces <em>~7× less than cmux, ~2× less than herdr</em></h4>
+          <div class="meter"><label>cmux</label><div class="track"><div class="fill old" style="--w:100%"></div></div><b class="hi">+698 MB</b></div>
+          <div class="meter"><label>herdr</label><div class="track"><div class="fill mid" style="--w:29.8%"></div></div><b class="hi">+208 MB</b></div>
+          <div class="meter"><label>lmux</label><div class="track"><div class="fill new" style="--w:14.3%"></div></div><b class="hi">about +100 MB</b></div></div>
+        <div class="row rv"><h4>Each agent command <em>~57× faster than cmux, ~8× faster than herdr</em></h4>
+          <div class="meter"><label>cmux</label><div class="track"><div class="fill old" style="--w:100%"></div></div><b class="hi">~170 ms</b></div>
+          <div class="meter"><label>herdr</label><div class="track"><div class="fill mid" style="--w:14.7%"></div></div><b class="hi">~25 ms</b></div>
+          <div class="meter"><label>lmux</label><div class="track"><div class="fill new" style="--w:1.8%"></div></div><b class="hi">~3 ms</b></div></div>
+        <div class="row rv"><h4>Creating 40 workspaces <em>~38× faster than cmux, ~6× faster than herdr</em></h4>
+          <div class="meter"><label>cmux</label><div class="track"><div class="fill old" style="--w:100%"></div></div><b class="hi">11.5 s</b></div>
+          <div class="meter"><label>herdr</label><div class="track"><div class="fill mid" style="--w:15.7%"></div></div><b class="hi">1.8 s</b></div>
+          <div class="meter"><label>lmux</label><div class="track"><div class="fill new" style="--w:2.6%"></div></div><b class="hi">0.3 s</b></div></div>
+        <div class="row rv"><h4>CPU, 40 workspaces <em>about a third less than cmux, but herdr is lower</em></h4>
+          <div class="meter"><label>cmux</label><div class="track"><div class="fill old" style="--w:100%"></div></div><b class="hi">15.5%</b></div>
+          <div class="meter"><label>herdr</label><div class="track"><div class="fill mid" style="--w:35.5%"></div></div><b class="hi">5.5%</b></div>
+          <div class="meter"><label>lmux</label><div class="track"><div class="fill new" style="--w:64.5%"></div></div><b class="hi">10%</b></div></div>
       </div>
+      <p class="fine">Most tested: 40 workspaces in cmux and herdr, 200 workspaces and 400 terminals in lmux. herdr is terminals only, with no browser panes, and was measured with its TUI client attached. The app draws only the pane on screen. Remote terminals and browsers run on the server, so your laptop receives only what you're looking at.</p>
     </div>
   </section>
 
-  <section class="alt" id="install">
+  <section id="install">
     <div class="wrap">
-      <h2>Install in a minute.</h2>
+      <p class="kicker">Install</p>
+      <h2>Up and running in a minute.</h2>
       <p class="sub">Everything lmux needs is inside the app. There's nothing else to set up.</p>
-      <div class="grid">
-        <div class="card"><div class="n">01</div><h3>Download</h3><p>Get <a href="lmux.dmg"><code>lmux.dmg</code></a> and open it.</p></div>
-        <div class="card"><div class="n">02</div><h3>Drag to Applications</h3><p>Drag lmux onto the Applications folder, then open it from there.</p></div>
-        <div class="card"><div class="n">03</div><h3>Allow folder access</h3><p>If macOS asks whether lmux may use a folder like Documents, click Allow. It asks once.</p></div>
+      <div class="install">
+        <div class="tile rv"><span class="num">01</span><h3>Download</h3><p>Get <a href="lmux.dmg"><code>lmux.dmg</code></a> and open it.</p></div>
+        <div class="tile rv"><span class="num">02</span><h3>Drag to Applications</h3><p>Drag lmux onto the Applications folder, then open it from there.</p></div>
+        <div class="tile rv"><span class="num">03</span><h3>Allow folder access</h3><p>If macOS asks whether lmux may use a folder like Documents, click Allow. It asks once.</p></div>
       </div>
       <div class="note" id="gatekeeper">
         If macOS says it can't check lmux for malicious software, open <b>System Settings › Privacy &amp; Security</b>,
         scroll down and click <b>Open Anyway</b>. This step goes away once the build is notarized by Apple.
       </div>
-    </div>
-  </section>
 
-  <section>
-    <div class="wrap">
-      <h2>Add a server.</h2>
-      <p class="sub" style="margin-bottom:0">Right-click the sidebar, choose <b>Add Remote Host…</b> and enter an SSH address like <code>me@my-server</code>.
-      lmux installs itself there over SSH. The server needs tmux and Rust
-      (<code>curl https://sh.rustup.rs -sSf | sh</code>), and on Linux <code>loginctl enable-linger $USER</code> so terminals outlive logout.</p>
+      <div class="server">
+        <div class="tile rv">
+          <span class="tag">Add a server</span>
+          <h3>Right-click the sidebar.</h3>
+          <p>Choose <b>Add Remote Host…</b> and enter an SSH address like <code>me@my-server</code>. lmux installs itself there over SSH.</p>
+        </div>
+        <div class="cmdbox rv"><span class="d"># on the server, once</span>
+curl https://sh.rustup.rs -sSf | sh
+<span class="d"># Linux only: terminals outlive logout</span>
+loginctl enable-linger $USER</div>
+      </div>
+    </div>
+
+    <div class="cta rv">
+      <h2>Stop babysitting terminals.</h2>
+      <p>Open source, MIT licensed, 29 MB. Your agents keep working when you don't.</p>
+      <div class="actions">
+        <a class="btn btn-primary" href="lmux.dmg">Download for Mac</a>
+      </div>
     </div>
   </section>
 </main>
@@ -236,8 +220,67 @@
 <footer>
   <div class="wrap">
     <span>© 2026 LintLabs · Singapore</span>
-    <a href="https://lintlabs.org">lintlabs.org</a>
+    <nav><a href="#persistence">Persistence</a><a href="#lean">Lean</a><a href="#install">Install</a><a href="https://lintlabs.org">lintlabs.org</a></nav>
   </div>
 </footer>
+
+<script>
+(function () {
+  var reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // Scroll reveals, and the lean bars grow when they scroll into view.
+  var io = 'IntersectionObserver' in window ? new IntersectionObserver(function (es) {
+    es.forEach(function (e) {
+      if (!e.isIntersecting) return;
+      e.target.classList.add('in');
+      e.target.querySelectorAll('.fill').forEach(function (f) { f.style.width = f.style.getPropertyValue('--w'); });
+      io.unobserve(e.target);
+    });
+  }, { threshold: .15 }) : null;
+  document.querySelectorAll('.rv').forEach(function (el) {
+    if (io) io.observe(el); else { el.classList.add('in'); el.querySelectorAll('.fill').forEach(function (f) { f.style.width = f.style.getPropertyValue('--w'); }); }
+  });
+
+  // The terminal scene: a reboot, then everything resumes.
+  var tty = document.getElementById('tty');
+  var S = [
+    ['p', '$ ', 'claude --resume'],
+    ['d', '', 'Resuming session 4f2a… "migrate webapp to postgres 16"'],
+    ['b', '', '● browser pane opened on my-server'],
+    ['', '', 'Running migrations (14/14)...'],
+    ['o', '', '— laptop lid closed · network lost · mac rebooted —'],
+    ['d', '', '...nothing on my-server noticed'],
+    ['p', '$ ', 'lmux'],
+    ['b', '', '✓ my-server connected'],
+    ['b', '', '✓ 6 workspaces, 14 panes restored'],
+    ['b', '', '✓ claude resumed · 3 unread notifications']
+  ];
+  function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+  function full() {
+    tty.innerHTML = S.map(function (l) { return '<span class="' + l[0] + '">' + esc(l[1]) + '</span>' + esc(l[2]); }).join('\n') + '\n<span class="p">$ </span><span class="cur"></span>';
+  }
+  if (reduce) { full(); return; }
+  var started = false;
+  new IntersectionObserver(function (es, o) {
+    if (started || !es[0].isIntersecting) return;
+    started = true; o.disconnect(); play();
+  }, { threshold: .4 }).observe(tty);
+  function play() {
+    var html = '', li = 0;
+    (function line() {
+      if (li >= S.length) { tty.innerHTML = html + '<span class="p">$ </span><span class="cur"></span>'; return; }
+      var l = S[li], typed = l[0] === 'p', n = 0;
+      (function ch() {
+        var txt = typed ? l[2].slice(0, n) : l[2];
+        tty.innerHTML = html + '<span class="' + l[0] + '">' + esc(l[1]) + '</span>' + esc(txt) + '<span class="cur"></span>';
+        if (typed && n < l[2].length) { n++; setTimeout(ch, 55); return; }
+        html += '<span class="' + l[0] + '">' + esc(l[1]) + '</span>' + esc(l[2]) + '\n';
+        li++;
+        setTimeout(line, l[0] === 'o' ? 1100 : typed ? 450 : 650);
+      })();
+    })();
+  }
+})();
+</script>
 </body>
 </html>
