@@ -40,7 +40,12 @@ pub fn show_hosts(ui: &mut Ui, rect: Rect, hosts: &mut [Ctx], active: usize) {
         top_icons(ui, strip, c, unread);
     }
 
-    let list = Rect::from_min_max(egui::pos2(rect.min.x, strip.max.y), rect.max);
+    // OpenUsage's limits sit at the bottom, under the list.
+    let usage_h = super::usage::height(ui.ctx(), rect.height() - strip.height());
+    let usage_rect = Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - usage_h), rect.max);
+    super::usage::show(ui, usage_rect);
+
+    let list = Rect::from_min_max(egui::pos2(rect.min.x, strip.max.y), egui::pos2(rect.max.x, usage_rect.min.y));
     // Rows are hit-tested against the area they were drawn in, so a drop while
     // the pointer is over the panes cannot land in the sidebar.
     for h in hosts.iter_mut() {
