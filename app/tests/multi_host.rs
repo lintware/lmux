@@ -138,6 +138,38 @@ fn both_hosts_are_drawn_as_separate_groups() {
     assert!(a.max.y <= b.min.y + 0.5, "sections do not overlap: {a:?} {b:?}");
 }
 
+/// A title editor sits inside its card, so it must not pull the list's cursor
+/// up with it: the next host's header drew over the card while renaming.
+#[test]
+fn renaming_a_card_keeps_the_next_host_below_it() {
+    let mut fx = fixture();
+    fx.hosts[0].state.begin_ws_rename(Some("workspace:1"));
+    let mut h = harness(fx, 1.0);
+    h.run();
+    let fx = h.state();
+    assert!(fx.hosts[0].state.ws_rename.is_some(), "the card is editing");
+    let local = fx.hosts[0].state.card_rects["workspace:1"];
+    let remote = fx.hosts[1].state.card_rects["workspace:1"];
+    assert!(remote.min.y > local.max.y, "the remote group sits below the edited card: {local:?} {remote:?}");
+    let a = fx.hosts[0].state.sidebar_list_rect.expect("local section");
+    let b = fx.hosts[1].state.sidebar_list_rect.expect("remote section");
+    assert!(a.max.y <= b.min.y + 0.5, "sections do not overlap: {a:?} {b:?}");
+    assert!(a.max.y >= local.max.y, "the local section still holds its whole card: {a:?} {local:?}");
+}
+
+#[test]
+fn renaming_a_folder_keeps_the_next_host_below_it() {
+    let mut fx = fixture();
+    fx.hosts[0].state.begin_folder_rename("folder:1", "lmux");
+    let mut h = harness(fx, 1.0);
+    h.run();
+    let fx = h.state();
+    assert!(fx.hosts[0].state.folder_rename.is_some(), "the folder is editing");
+    let local = fx.hosts[0].state.card_rects["workspace:1"];
+    let remote = fx.hosts[1].state.card_rects["workspace:1"];
+    assert!(remote.min.y > local.max.y, "the remote group sits below the local one: {local:?} {remote:?}");
+}
+
 #[test]
 fn clicking_the_other_hosts_card_selects_it_there_only() {
     let mut fx = fixture();
