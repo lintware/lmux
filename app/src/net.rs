@@ -109,11 +109,21 @@ fn local_host() -> HostConfig {
     }
 }
 
-/// PATH for the daemon we spawn. tmux may be a source build in `~/.local/bin`
-/// or a Homebrew one, and neither is guaranteed to be in the app's own
-/// environment when it is launched from Finder.
+/// The app's own `Contents/MacOS` when it ships tmux there (a packaged
+/// lmux.app does, so a fresh Mac needs no Homebrew); `None` in a dev build.
+pub fn bundled_bin_dir() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    dir.join("tmux").is_file().then_some(dir)
+}
+
+/// PATH for the daemon we spawn: the bundled tmux first, else a source build
+/// in `~/.local/bin` or a Homebrew one, none of which is guaranteed to be in
+/// the app's own environment when it is launched from Finder.
 pub fn daemon_path() -> String {
     let mut parts: Vec<String> = Vec::new();
+    if let Some(dir) = bundled_bin_dir() {
+        parts.push(dir.display().to_string());
+    }
     if let Some(home) = dirs::home_dir() {
         parts.push(home.join(".local/bin").display().to_string());
         parts.push(home.join(".cargo/bin").display().to_string());

@@ -3,77 +3,195 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>lmux</title>
-<meta name="description" content="Persistent terminal and browser workspaces on your Mac and your servers.">
+<title>lmux by LintLabs</title>
+<meta name="description" content="Terminal and browser workspaces that keep running on your Mac and your servers.">
+<link rel="icon" href="icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap" rel="stylesheet">
 <style>
+  /* Matches lintlabs.org: neutral greys, Inter, black headlines, pill buttons. */
   :root {
-    --bg: #fafafa; --fg: #1a1a1c; --muted: #6b6b70; --card: #ffffff;
-    --line: #e4e4e7; --accent: #0a84ff; --accent-fg: #ffffff; --code: #f1f1f3;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      --bg: #111113; --fg: #ededef; --muted: #9a9aa1; --card: #19191c;
-      --line: #2a2a2e; --accent: #0a84ff; --accent-fg: #ffffff; --code: #222226;
-    }
+    --n50: #fafafa; --n100: #f5f5f5; --n200: #e5e5e5; --n300: #d4d4d4; --n400: #a3a3a3;
+    --n500: #737373; --n600: #525252; --n700: #404040; --n800: #262626; --n900: #171717; --n950: #0a0a0a;
+    --accent: #0a84ff;
+    --font: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--fg);
-    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  html { color-scheme: light; }
+  body { margin: 0; background: #fff; color: var(--n900); font: 16px/1.6 var(--font); -webkit-font-smoothing: antialiased; }
+  a { color: inherit; }
+
+  nav.liquid {
+    position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 50;
+    width: min(96%, 900px); display: flex; align-items: center; justify-content: space-between;
+    padding: 6px; border-radius: 999px;
+    background: #ffffffd1; backdrop-filter: blur(24px) saturate(180%); -webkit-backdrop-filter: blur(24px) saturate(180%);
+    border: 1px solid rgba(0,0,0,.08); box-shadow: 0 12px 36px -12px #0000001f, 0 0 0 1px #00000008;
   }
-  main { max-width: 680px; margin: 0 auto; padding: 64px 16px 80px; }
-  header { display: flex; align-items: center; gap: 16px; }
-  header img { width: 72px; height: 72px; }
-  h1 { font-size: 34px; margin: 0; letter-spacing: -0.02em; }
-  .tag { color: var(--muted); margin: 2px 0 0; }
-  .download {
-    display: inline-block; margin: 32px 0 6px; padding: 12px 22px; border-radius: 10px;
-    background: var(--accent); color: var(--accent-fg); font-weight: 600; text-decoration: none;
+  nav.liquid .brand { display: flex; align-items: center; gap: 10px; padding-left: 8px; text-decoration: none; }
+  nav.liquid .brand img { height: 26px; opacity: .9; }
+  nav.liquid .brand span { font-size: 12px; font-weight: 700; color: #0000008c; border-left: 1px solid var(--n200); padding-left: 10px; }
+  .pill-sm {
+    display: inline-flex; align-items: center; height: 36px; padding: 0 16px; border-radius: 999px;
+    background: var(--n900); color: #fff; font-size: 12px; font-weight: 700; text-decoration: none;
+    transition: transform .3s; box-shadow: 0 1px 2px #0000000d;
   }
-  .meta { color: var(--muted); font-size: 14px; }
-  h2 { font-size: 18px; margin: 40px 0 10px; }
-  ol, ul { padding-left: 22px; }
-  li { margin: 6px 0; }
-  code {
-    font: 13.5px ui-monospace, SFMono-Regular, Menlo, monospace;
-    background: var(--code); padding: 2px 6px; border-radius: 5px;
+  .pill-sm:hover { transform: scale(1.05); }
+
+  .hero {
+    background: var(--n200); padding: 136px 24px 0; text-align: center; overflow: hidden;
+    background-image: radial-gradient(ellipse at top, #ffffff99, transparent 60%);
   }
-  .note {
-    border: 1px solid var(--line); background: var(--card); border-radius: 10px;
-    padding: 14px 16px; margin-top: 14px; font-size: 15px;
+  .eyebrow { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .28em; color: var(--n500); margin: 0 0 12px; }
+  h1 { font-size: clamp(40px, 8vw, 72px); font-weight: 900; letter-spacing: -0.035em; line-height: 1.05; margin: 0 auto 14px; max-width: 760px; }
+  .lede { font-size: clamp(16px, 2.2vw, 18px); color: var(--n600); max-width: 560px; margin: 0 auto 32px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 14px 32px; border-radius: 999px; font-weight: 600; text-decoration: none; transition: background .2s, border-color .2s; }
+  .btn-dark { background: var(--n900); color: #fff; box-shadow: 0 10px 15px -3px #0000001a, 0 4px 6px -4px #0000001a; }
+  .btn-dark:hover { background: var(--n800); }
+  .btn-ghost { border: 1px solid var(--n400); background: #ffffff99; color: var(--n700); font-weight: 500; }
+  .btn-ghost:hover { border-color: var(--n900); }
+  .meta { font-size: 13px; color: var(--n500); margin: 14px 0 0; }
+
+  /* A drawing of the app window, not a screenshot. */
+  .window {
+    max-width: 920px; margin: 56px auto 0; border-radius: 16px 16px 0 0; overflow: hidden; text-align: left;
+    background: #1c1c1e; border: 1px solid #00000026; border-bottom: 0; box-shadow: 0 30px 60px -20px #00000059;
+    display: grid; grid-template-columns: 200px 1fr 1fr; height: 340px; font-size: 12px;
+  }
+  .side { background: #161618; border-right: 1px solid #2a2a2d; padding: 14px 10px; color: #d4d4d8; }
+  .host { display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 600; letter-spacing: .06em; color: #8e8e93; margin: 10px 4px 6px; }
+  .host i { width: 6px; height: 6px; border-radius: 50%; background: #30d158; }
+  .ws { padding: 7px 10px; border-radius: 8px; margin-bottom: 4px; font-weight: 600; color: #f2f2f7; }
+  .ws small { display: block; font-weight: 400; color: #8e8e93; font-size: 10.5px; }
+  .ws.on { background: var(--accent); }
+  .ws.on small { color: #ffffffcc; }
+  .pane { padding: 14px 16px; font: 11.5px/1.7 var(--mono); color: #d1d1d6; border-right: 1px solid #2a2a2d; overflow: hidden; }
+  .pane .p { color: #30d158; }
+  .pane .d { color: #8e8e93; }
+  .browser { background: #f5f5f7; display: flex; flex-direction: column; }
+  .bar { background: #e5e5ea; padding: 8px 10px; }
+  .bar div { background: #fff; border-radius: 6px; padding: 4px 10px; color: var(--n500); font-size: 11px; }
+  .page { flex: 1; padding: 22px; }
+  .page b { display: block; height: 14px; width: 60%; background: var(--n300); border-radius: 4px; margin-bottom: 10px; }
+  .page b:nth-child(2) { width: 85%; background: var(--n200); }
+  .page b:nth-child(3) { width: 72%; background: var(--n200); }
+
+  section { padding: 72px 24px; }
+  .wrap { max-width: 1000px; margin: 0 auto; }
+  .alt { background: var(--n50); border-top: 1px solid var(--n200); border-bottom: 1px solid var(--n200); }
+  h2 { font-size: clamp(28px, 4vw, 36px); font-weight: 700; letter-spacing: -0.025em; margin: 0 0 12px; }
+  .sub { color: var(--n600); margin: 0 0 36px; max-width: 620px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .card { border: 1px solid var(--n200); background: #fff; border-radius: 16px; padding: 24px; transition: border-color .2s, box-shadow .2s; }
+  .card:hover { border-color: var(--n900); box-shadow: 0 4px 6px -1px #0000001a; }
+  .card .n { font-size: 11px; font-weight: 700; color: var(--n400); letter-spacing: .2em; }
+  h3 { font-size: 18px; font-weight: 900; letter-spacing: -0.02em; margin: 8px 0 8px; color: var(--n950); }
+  .card p { margin: 0; color: var(--n600); font-size: 15px; }
+  code { font: 13px var(--mono); background: var(--n100); border: 1px solid var(--n200); padding: 1px 6px; border-radius: 6px; }
+  .note { margin-top: 20px; border: 1px solid var(--n200); background: #fff; border-radius: 16px; padding: 18px 22px; font-size: 15px; color: var(--n700); }
+
+  footer { background: var(--n50); border-top: 1px solid var(--n200); padding: 40px 24px; }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; font-size: 14px; color: var(--n500); }
+  footer a { text-decoration: none; }
+  footer a:hover { color: var(--n950); }
+
+  @media (max-width: 760px) {
+    .grid { grid-template-columns: 1fr; }
+    .window { grid-template-columns: 130px 1fr; height: 280px; }
+    .browser { display: none; }
+    .pane { border-right: 0; }
+    nav.liquid .brand span { display: none; }
   }
 </style>
 </head>
 <body>
+<nav class="liquid">
+  <a class="brand" href="https://lintlabs.org"><img src="lintlabs-logo.svg" alt="LintLabs"><span>lmux</span></a>
+  <a class="pill-sm" href="lmux.dmg">Download</a>
+</nav>
+
 <main>
-  <header>
-    <img src="icon.png" alt="">
-    <div>
-      <h1>lmux</h1>
-      <p class="tag">Terminal and browser workspaces that keep running on your Mac and your servers.</p>
+  <div class="hero">
+    <p class="eyebrow">LintLabs · Open beta</p>
+    <h1>Terminals that never close.</h1>
+    <p class="lede">lmux keeps your terminals, browsers and agents running on your Mac and your servers, side by side in one window. Quit, reboot or lose the network. Everything is where you left it.</p>
+    <div class="actions">
+      <a class="btn btn-dark" href="lmux.dmg">Download for Mac</a>
+      <a class="btn btn-ghost" href="#install">How to install</a>
     </div>
-  </header>
+    <p class="meta">Version @VERSION@ · macOS 12 or later · Apple silicon</p>
 
-  <a class="download" href="lmux.dmg">Download for Mac</a>
-  <div class="meta">Version @VERSION@ · macOS 12 or later · Apple silicon</div>
-
-  <h2>Install</h2>
-  <ol>
-    <li>Open <code>lmux.dmg</code> and drag <b>lmux</b> to Applications.</li>
-    <li>Install tmux, which keeps your terminals running: <code>brew install tmux</code></li>
-    <li>Open lmux from Applications. If macOS asks to access a folder like Documents, click Allow. It asks once.</li>
-  </ol>
-  <div class="note" id="gatekeeper">
-    If macOS says it can't check lmux for malicious software, open
-    <b>System Settings › Privacy &amp; Security</b>, scroll down and click <b>Open Anyway</b>.
-    This step goes away once the build is notarized by Apple.
+    <div class="window" aria-hidden="true">
+      <div class="side">
+        <div class="host"><i></i>THIS MAC</div>
+        <div class="ws">website<small>~/code/site</small></div>
+        <div class="host"><i></i>MY-SERVER</div>
+        <div class="ws on">api<small>claude · working</small></div>
+        <div class="ws">deploy<small>Idle</small></div>
+      </div>
+      <div class="pane">
+        <div><span class="p">me@my-server</span> <span class="d">~/api</span></div>
+        <div>$ claude</div>
+        <div class="d">● Reading src/routes.ts</div>
+        <div class="d">● Running the tests</div>
+        <div>&nbsp;&nbsp;42 passed</div>
+        <div class="d">● Opening the preview</div>
+        <div>&nbsp;</div>
+        <div><span class="p">›</span> ▍</div>
+      </div>
+      <div class="browser">
+        <div class="bar"><div>localhost:3000</div></div>
+        <div class="page"><b></b><b></b><b></b></div>
+      </div>
+    </div>
   </div>
 
-  <h2>Use it with a server</h2>
-  <p>Right-click the sidebar and pick <b>Add Remote Host…</b>, then enter an SSH target such as
-  <code>me@my-server</code>. lmux installs itself on that host over SSH. The host needs tmux, a Rust
-  toolchain (<code>curl https://sh.rustup.rs -sSf | sh</code>), and on Linux
-  <code>loginctl enable-linger $USER</code> so terminals outlive logout.</p>
+  <section>
+    <div class="wrap">
+      <h2>One window for every machine.</h2>
+      <p class="sub">Each computer runs a small lmux service that owns its terminals. The app on your Mac is just a view, so closing it stops nothing.</p>
+      <div class="grid">
+        <div class="card"><div class="n">01</div><h3>Nothing closes</h3><p>Quit the app or restart your Mac. Every pane comes back with the same folder, history and Claude session.</p></div>
+        <div class="card"><div class="n">02</div><h3>Servers feel local</h3><p>Open a workspace on a server and every terminal in it runs there. No manual SSH.</p></div>
+        <div class="card"><div class="n">03</div><h3>Agents with a browser</h3><p>Claude Code can open a browser pane, click and type, and you watch it happen live.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="alt" id="install">
+    <div class="wrap">
+      <h2>Install in a minute.</h2>
+      <p class="sub">Everything lmux needs is inside the app. There's nothing else to set up.</p>
+      <div class="grid">
+        <div class="card"><div class="n">01</div><h3>Download</h3><p>Get <a href="lmux.dmg"><code>lmux.dmg</code></a> and open it.</p></div>
+        <div class="card"><div class="n">02</div><h3>Drag to Applications</h3><p>Drag lmux onto the Applications folder, then open it from there.</p></div>
+        <div class="card"><div class="n">03</div><h3>Allow folder access</h3><p>If macOS asks whether lmux may use a folder like Documents, click Allow. It asks once.</p></div>
+      </div>
+      <div class="note" id="gatekeeper">
+        If macOS says it can't check lmux for malicious software, open <b>System Settings › Privacy &amp; Security</b>,
+        scroll down and click <b>Open Anyway</b>. This step goes away once the build is notarized by Apple.
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <h2>Add a server.</h2>
+      <p class="sub" style="margin-bottom:0">Right-click the sidebar, choose <b>Add Remote Host…</b> and enter an SSH address like <code>me@my-server</code>.
+      lmux installs itself there over SSH. The server needs tmux and Rust
+      (<code>curl https://sh.rustup.rs -sSf | sh</code>), and on Linux <code>loginctl enable-linger $USER</code> so terminals outlive logout.</p>
+    </div>
+  </section>
 </main>
+
+<footer>
+  <div class="wrap">
+    <span>© 2026 LintLabs · Singapore</span>
+    <a href="https://lintlabs.org">lintlabs.org</a>
+  </div>
+</footer>
 </body>
 </html>

@@ -38,10 +38,14 @@ pub fn socket_name() -> String {
     std::env::var("LMUX_TMUX_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET.to_owned())
 }
 
-/// tmux to run: the source build in `~/.local/bin` first, then Homebrew, then
-/// the system paths, and finally a bare `tmux` for `PATH` to resolve.
+/// tmux to run: the one bundled in lmux.app, which the daemon runs too; then
+/// the source build in `~/.local/bin`, Homebrew, the system paths, and
+/// finally a bare `tmux` for `PATH` to resolve.
 pub fn tmux_bin() -> String {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dir) = crate::net::bundled_bin_dir() {
+        candidates.push(dir.join("tmux"));
+    }
     if let Some(home) = dirs::home_dir() {
         candidates.push(home.join(".local/bin/tmux"));
     }

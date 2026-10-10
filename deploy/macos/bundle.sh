@@ -25,6 +25,9 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$repo/app/target/release/lmux-app" "$app/Contents/MacOS/lmux-app"
 cp "$repo/target/release/lmux" "$app/Contents/MacOS/lmux"
+# tmux ships in the app, so a fresh Mac needs no Homebrew; the app puts this
+# directory first on the daemon's PATH.
+"$repo/deploy/macos/build-tmux.sh" "$app/Contents/MacOS"
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo/app/Cargo.toml" | head -1)
 cat > "$app/Contents/Info.plist" <<PLIST
@@ -84,10 +87,12 @@ if [ -n "$identity" ] && [ "$identity" != - ]; then
   # binary first; --deep is deprecated for signing.
   sign() { codesign --force --options runtime --timestamp --sign "$identity" "$@"; }
   sign --identifier dev.lmux.cli "$app/Contents/MacOS/lmux"
+  sign --identifier dev.lmux.tmux "$app/Contents/MacOS/tmux"
   sign "$app"
 else
   echo "==> signing (ad hoc: no certificate, so macOS asks for folder access after each reinstall)"
   codesign --force --sign - "$app/Contents/MacOS/lmux"
+  codesign --force --sign - "$app/Contents/MacOS/tmux"
   codesign --force --sign - "$app"
 fi
 codesign --verify --strict "$app"
