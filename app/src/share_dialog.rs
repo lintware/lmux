@@ -104,9 +104,19 @@ fn start(allow_typing: bool, ctx: &egui::Context) {
 static FAILED: Mutex<Option<Phase>> = Mutex::new(None);
 
 fn stop() {
-    if let Some(mut run) = RUN.lock().unwrap().take() {
-        let _ = run.child.kill();
-        let _ = run.child.wait();
+    if let Some(run) = RUN.lock().unwrap().take() {
+        let Run { mut child, _stdin, .. } = run;
+        // Closing stdin makes `lmux share` stop its tunnel and exit; kill only
+        // if it does not, which would leave cloudflared running.
+        drop(_stdin);
+        for _ in 0..30 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
     FAILED.lock().unwrap().take();
 }

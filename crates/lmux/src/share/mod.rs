@@ -76,7 +76,8 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
         let mut sink = [0u8; 64];
         use tokio::io::AsyncReadExt;
         let mut stdin = tokio::io::stdin();
-        while matches!(stdin.read(&mut sink).await, Ok(n) if n > 0) {}
+        let closed = async { while matches!(stdin.read(&mut sink).await, Ok(n) if n > 0) {} };
+        tokio::select! { _ = closed => {}, _ = stop_signal() => {} }
         return Ok(());
     }
 
@@ -95,6 +96,18 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
         );
     }
     println!("Press Ctrl-C to stop sharing.");
-    tokio::signal::ctrl_c().await.ok();
+    stop_signal().await;
     Ok(())
+}
+
+/// Resolves on Ctrl-C or SIGTERM, so the tunnel is dropped (and cloudflared
+/// killed) instead of being orphaned.
+async fn stop_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut term) => tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} },
+        Err(_) => {
+            tokio::signal::ctrl_c().await.ok();
+        }
+    }
 }
