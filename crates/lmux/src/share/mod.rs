@@ -7,6 +7,7 @@
 //! checks `Origin` and that cookie, and typing is off unless asked for.
 //! Screen contents are never logged.
 
+mod agents;
 mod server;
 mod tunnel;
 

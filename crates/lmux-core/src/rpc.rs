@@ -1267,6 +1267,34 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             }
             ok(id, json!({"surface": surface}))
         }
+        methods::TERM_PROCESSES => {
+            let wins = match inner.tmux.list_windows().await {
+                Ok(w) => w,
+                Err(e) => return err(id, RpcErrorCode::Internal, format!("tmux: {e}")),
+            };
+            let pids = inner.tmux.pane_pids().await.unwrap_or_default();
+            let state = inner.state.lock().await;
+            let terminals: Vec<Value> = wins
+                .iter()
+                .filter_map(|w| {
+                    let surface = state.surface_of_pane(&w.pane)?;
+                    let agent = state
+                        .resume
+                        .get(&surface)
+                        .and_then(|r| r.agent.as_ref())
+                        .map(|a| format!("{}:{}", a.agent, a.id))
+                        .or_else(|| w.agent_session.clone());
+                    Some(json!({
+                        "surface": surface,
+                        "pid": pids.get(&w.pane),
+                        "command": w.command,
+                        "cwd": w.cwd,
+                        "agent_session": agent,
+                    }))
+                })
+                .collect();
+            ok(id, json!({"terminals": terminals}))
+        }
 
         // --- notifications / status ---------------------------------------
         methods::NOTIFY => {

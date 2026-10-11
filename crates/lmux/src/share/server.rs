@@ -12,6 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio_tungstenite::tungstenite::Message;
 
+use super::agents::{self, Finder, TabAgent};
 use super::{CODE_TTL, SESSION_TTL};
 
 const PAGE: &str = include_str!("page.html");
@@ -26,22 +27,39 @@ const KEYS: &[&str] = &[
     "enter", "escape", "esc", "tab", "up", "down", "left", "right", "backspace", "ctrl+c", "ctrl+d",
 ];
 
+/// How long one tree (and the `ps`/`lsof` agent detection behind it) serves
+/// every socket's poll, so viewers do not multiply the process scans.
+const TREE_TTL: Duration = Duration::from_millis(1500);
+
+/// What is known about each terminal tab, by surface id.
+type Tabs = Arc<HashMap<String, TabAgent>>;
+
+/// The last tree message and agent detection, shared by all sockets.
+struct TreeCache {
+    finder: Finder,
+    last: Option<(Instant, String, Tabs)>,
+}
+
 pub struct Shared {
     socket: String,
     allow_typing: bool,
     codes: Mutex<HashMap<String, Instant>>,
     sessions: Mutex<HashMap<String, Instant>>,
     clients: Mutex<usize>,
+    tree: tokio::sync::Mutex<TreeCache>,
 }
 
 impl Shared {
     pub fn new(socket: String, allow_typing: bool) -> Self {
+        // Agent transcripts live under `~/.claude`, `~/.codex` and `~/.grok`.
+        let home = std::env::var_os("HOME").map(Into::into).unwrap_or_default();
         Shared {
             socket,
             allow_typing,
             codes: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             clients: Mutex::new(0),
+            tree: tokio::sync::Mutex::new(TreeCache { finder: Finder::new(home), last: None }),
         }
     }
 
@@ -269,6 +287,10 @@ async fn handle_ws(shared: Arc<Shared>, mut stream: TcpStream, req: Request) -> 
     let mut surface: Option<String> = None;
     let mut last_tree = String::new();
     let mut last_screen = String::new();
+    // What is known about each tab, and the open tab's transcript
+    // (path, mtime, length) as last sent.
+    let mut tabs: Tabs = Arc::default();
+    let mut last_chat: Option<(std::path::PathBuf, std::time::SystemTime, u64)> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     let mut n: u64 = 0;
 
@@ -280,6 +302,21 @@ async fn handle_ws(shared: Arc<Shared>, mut stream: TcpStream, req: Request) -> 
                     let _ = sink.send(Message::Text(json!({"t":"error","msg":"The session expired."}).to_string())).await;
                     break;
                 }
+                if n % 4 == 1 {
+                    match tree_message(&shared).await {
+                        Ok((m, t)) => {
+                            tabs = t;
+                            if m != last_tree {
+                                last_tree = m.clone();
+                                if sink.send(Message::Text(m)).await.is_err() { break; }
+                            }
+                        }
+                        Err(e) => {
+                            let m = json!({"t":"error","msg":format!("{e}")}).to_string();
+                            if sink.send(Message::Text(m)).await.is_err() { break; }
+                        }
+                    }
+                }
                 if let Some(s) = &surface {
                     if let Ok(r) = rpc(&shared.socket, "term.read_screen", json!({"surface": s})).await {
                         let text = r["text"].as_str().unwrap_or("").to_string();
@@ -289,16 +326,9 @@ async fn handle_ws(shared: Arc<Shared>, mut stream: TcpStream, req: Request) -> 
                             if sink.send(Message::Text(m)).await.is_err() { break; }
                         }
                     }
-                }
-                if n % 4 == 1 {
-                    match tree_message(&shared).await {
-                        Ok(m) if m != last_tree => {
-                            last_tree = m.clone();
-                            if sink.send(Message::Text(m)).await.is_err() { break; }
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            let m = json!({"t":"error","msg":format!("{e}")}).to_string();
+                    // About once a second, a fresh chat snapshot when the transcript changed.
+                    if n % 2 == 1 {
+                        if let Some(m) = chat_message(s, tabs.get(s), &mut last_chat).await {
                             if sink.send(Message::Text(m)).await.is_err() { break; }
                         }
                     }
@@ -316,6 +346,7 @@ async fn handle_ws(shared: Arc<Shared>, mut stream: TcpStream, req: Request) -> 
                         if let Some(s) = v["surface"].as_str().filter(|s| valid_surface(s)) {
                             surface = Some(s.to_string());
                             last_screen.clear();
+                            last_chat = None;
                             n = 0;
                         }
                     }
@@ -366,13 +397,44 @@ fn valid_surface(s: &str) -> bool {
     s.strip_prefix("surface:").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-async fn tree_message(shared: &Shared) -> anyhow::Result<String> {
+/// The tree message and agent detection, reused by every socket for `TREE_TTL`.
+async fn tree_message(shared: &Shared) -> anyhow::Result<(String, Tabs)> {
+    // Held across the work so concurrent sockets wait for one result.
+    let mut cache = shared.tree.lock().await;
+    if let Some((at, m, tabs)) = &cache.last {
+        if at.elapsed() < TREE_TTL {
+            return Ok((m.clone(), tabs.clone()));
+        }
+    }
     let tree = rpc(&shared.socket, "system.tree", json!({})).await?;
-    Ok(tree_to_message(&tree, shared.allow_typing).to_string())
+    // An older daemon has no `term.processes`; tabs then carry no agent info.
+    let procs = rpc(&shared.socket, "term.processes", json!({})).await.unwrap_or(Value::Null);
+    let tabs = Arc::new(cache.finder.detect(&procs).await);
+    let m = tree_to_message(&tree, shared.allow_typing, &tabs).to_string();
+    cache.last = Some((Instant::now(), m.clone(), tabs.clone()));
+    Ok((m, tabs))
 }
 
-/// The slim tree the page needs: workspaces with their tabs flattened.
-pub fn tree_to_message(tree: &Value, typing: bool) -> Value {
+/// A `chat` frame for the open tab when its transcript changed since `last`.
+async fn chat_message(
+    surface: &str,
+    tab: Option<&TabAgent>,
+    last: &mut Option<(std::path::PathBuf, std::time::SystemTime, u64)>,
+) -> Option<String> {
+    let (agent, path) = tab.and_then(|t| Some((t.agent?, t.transcript.clone()?)))?;
+    let meta = tokio::fs::metadata(&path).await.ok()?;
+    let stamp = (path.clone(), meta.modified().ok()?, meta.len());
+    if last.as_ref() == Some(&stamp) {
+        return None;
+    }
+    *last = Some(stamp);
+    let messages = tokio::task::spawn_blocking(move || agents::read_chat(agent, &path)).await.ok()?.ok()?;
+    Some(json!({"t":"chat","surface":surface,"agent":agent,"messages":messages}).to_string())
+}
+
+/// The slim tree the page needs: workspaces with their tabs flattened, and
+/// what is known about the agent in each terminal tab.
+pub fn tree_to_message(tree: &Value, typing: bool, agents: &HashMap<String, TabAgent>) -> Value {
     let workspaces: Vec<Value> = tree["workspaces"]
         .as_array()
         .map(|a| a.as_slice())
@@ -385,11 +447,19 @@ pub fn tree_to_message(tree: &Value, typing: bool) -> Value {
                 .unwrap_or_default()
                 .iter()
                 .flat_map(|p| p["surfaces"].as_array().cloned().unwrap_or_default())
-                .map(|s| json!({"id": s["id"], "title": s["title"], "kind": s["kind"]}))
+                .map(|s| {
+                    let a = s["id"].as_str().and_then(|id| agents.get(id));
+                    json!({
+                        "id": s["id"], "title": s["title"], "kind": s["kind"],
+                        "agent": a.and_then(|a| a.agent),
+                        "command": a.and_then(|a| a.command.clone()),
+                        "chat": a.is_some_and(|a| a.transcript.is_some()),
+                    })
+                })
                 .collect();
             json!({
                 "id": w["id"], "title": w["title"], "agent": w["agent"],
-                "summary": w["summary"], "tabs": tabs,
+                "summary": w["summary"], "cwd": w["cwd"], "git_branch": w["git_branch"], "tabs": tabs,
             })
         })
         .collect();
@@ -473,9 +543,21 @@ mod tests {
         let tree = json!({"host":"h","workspaces":[{"id":"workspace:1","title":"w","agent":"idle","summary":null,
             "panes":[{"surfaces":[{"id":"surface:1","title":"a","kind":"terminal","cols":80}]},
                      {"surfaces":[{"id":"surface:2","title":"b","kind":"browser"}]}]}]});
-        let m = tree_to_message(&tree, true);
+        let mut agents = HashMap::new();
+        agents.insert(
+            "surface:1".to_string(),
+            TabAgent { agent: Some("claude"), command: Some("2.1.296".into()), transcript: Some("/t.jsonl".into()) },
+        );
+        let m = tree_to_message(&tree, true, &agents);
         assert_eq!(m["workspaces"][0]["tabs"].as_array().unwrap().len(), 2);
         assert_eq!(m["typing"], true);
         assert!(m["workspaces"][0]["tabs"][0].get("cols").is_none());
+        let a = &m["workspaces"][0]["tabs"][0];
+        assert_eq!((&a["agent"], &a["command"], &a["chat"]), (&json!("claude"), &json!("2.1.296"), &json!(true)));
+        // Browser tabs and tabs the daemon did not describe carry no agent.
+        let b = &m["workspaces"][0]["tabs"][1];
+        assert_eq!((&b["agent"], &b["chat"]), (&Value::Null, &json!(false)));
+        // The transcript path itself never reaches the page.
+        assert!(!m.to_string().contains("t.jsonl"));
     }
 }

@@ -20,6 +20,17 @@ All notable changes to lmux are listed here, newest first. The format follows
   downloaded once. Quick Tunnel limits apply: the address changes every start,
   there is no uptime guarantee, and requests above 200 in flight get a 429.
   Sharing ends on Stop sharing, Ctrl-C, or when the app quits.
+- **The share page shows agent tabs as a chat.** Tabs running Claude Code,
+  Codex or Grok are labelled in the session list, and opening one shows its
+  transcript as readable messages (your prompts, the agent's replies with basic
+  Markdown, and one-line tool calls), with a Chat | Terminal switch and a
+  banner when the agent waits for an answer. Replies go to the tab like typed
+  text, so view-only shares stay view only. The server finds each transcript
+  from the daemon's own data (the page never sends a path), reads only the end
+  of the file, and never logs it. The page works on phones and desktops, with
+  light and dark themes. A new daemon call, `term.processes`, reports each
+  terminal's process and agent session; with an older daemon the page shows
+  terminals only.
 
 - **Terminals look like Ghostty.** Panes are drawn by a new GPU renderer
   ported from Ghostty's: its default font (JetBrains Mono, bundled) at 13pt,

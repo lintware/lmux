@@ -391,3 +391,122 @@ async fn share_serves_sessions_with_the_security_rules() {
     let _ = share.kill();
     let _ = share.wait();
 }
+
+/// `term.processes` reports each terminal's shell pid, command and agent tag,
+/// and `lmux share` turns a tagged tab's transcript into `chat` frames that
+/// follow the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn share_shows_an_agent_transcript_as_chat() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+    let Some(d) = Daemon::start() else { return };
+    d.ok(&["new-workspace", "--name", "agent", "--command", "/bin/sh"]);
+    // What the Claude SessionStart hook records.
+    d.ok(&["rpc", "agent.session", r#"{"surface":"surface:1","agent":"claude","id":"abc-123"}"#]);
+
+    let procs = d.json(&["rpc", "term.processes"]);
+    let t = &procs["terminals"][0];
+    assert_eq!(t["surface"], "surface:1", "{procs}");
+    assert_eq!(t["agent_session"], "claude:abc-123", "{procs}");
+    assert!(t["pid"].as_u64().is_some_and(|p| p > 1), "{procs}");
+    assert!(t["command"].as_str().is_some_and(|c| c.ends_with("sh")), "{procs}");
+
+    // A transcript where the share looks for it, under a scratch HOME.
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join(".claude/projects/-work");
+    std::fs::create_dir_all(&dir).unwrap();
+    let transcript = dir.join("abc-123.jsonl");
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"user","timestamp":"2026-10-11T01:00:00Z","message":{"content":"CHAT_QUESTION"}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"CHAT_ANSWER"}]}}"#, "\n",
+        ),
+    )
+    .unwrap();
+
+    let mut share = d
+        .cmd(&["--json", "share", "--no-tunnel"])
+        .env("HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(share.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let info: serde_json::Value = serde_json::from_str(&line).expect("share prints JSON");
+    let (base, code) = info["url"].as_str().unwrap().split_once("/#").unwrap();
+    let (base, code) = (base.to_string(), code.to_string());
+    let addr = base.trim_start_matches("http://").to_string();
+    let body = format!("{{\"code\":\"{code}\"}}");
+    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    s.write_all(
+        format!("POST /auth HTTP/1.1\r\nHost: {addr}\r\nOrigin: {base}\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut ok = String::new();
+    s.read_to_string(&mut ok).unwrap();
+    let cookie = ok.lines().find_map(|l| l.strip_prefix("Set-Cookie: ")).expect("cookie");
+    let cookie = cookie.split(';').next().unwrap().to_string();
+
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("Origin", base.parse().unwrap());
+    req.headers_mut().insert("Cookie", cookie.parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("upgrade");
+    let tree = loop {
+        let v: serde_json::Value = match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => serde_json::from_str(&t).unwrap(),
+            other => panic!("no frame: {other:?}"),
+        };
+        if v["t"] == "tree" {
+            break v;
+        }
+    };
+    let tab = &tree["workspaces"][0]["tabs"][0];
+    assert_eq!(tab["agent"], "claude", "{tree}");
+    assert_eq!(tab["chat"], true, "{tree}");
+    assert!(!tree.to_string().contains("abc-123.jsonl"), "no paths reach the page");
+
+    ws.send(Message::Text(r#"{"t":"open","surface":"surface:1"}"#.into())).await.unwrap();
+    let mut chat_with = async |needle: &str| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["t"] == "chat" && v.to_string().contains(needle) {
+                    return v;
+                }
+            }
+        }
+        panic!("no chat frame with {needle}");
+    };
+    let chat = chat_with("CHAT_ANSWER").await;
+    assert_eq!(chat["surface"], "surface:1");
+    assert_eq!(chat["agent"], "claude");
+    assert_eq!(chat["messages"][0]["role"], "user");
+    assert_eq!(chat["messages"][0]["text"], "CHAT_QUESTION");
+    assert_eq!(chat["messages"][1]["role"], "assistant");
+
+    // A new line in the transcript sends a fresh snapshot.
+    let mut f = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+    writeln!(f, r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"CHAT_FOLLOW_UP"}}]}}}}"#).unwrap();
+    let chat = chat_with("CHAT_FOLLOW_UP").await;
+    assert_eq!(chat["messages"].as_array().unwrap().len(), 3);
+
+    // Replying from the chat view is a `send`, still refused on a view-only share.
+    ws.send(Message::Text(r#"{"t":"send","surface":"surface:1","text":"hi","enter":true}"#.into())).await.unwrap();
+    let refused = loop {
+        match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) if t.contains(r#""t":"error""#) => break t,
+            Ok(Some(Ok(_))) => {}
+            other => panic!("no error frame: {other:?}"),
+        }
+    };
+    assert!(refused.contains("Typing is off"), "{refused}");
+
+    let _ = share.kill();
+    let _ = share.wait();
+}

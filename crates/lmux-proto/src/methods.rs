@@ -57,6 +57,7 @@ pub const TERM_SEND_KEY: &str = "term.send_key"; // {surface?, key} e.g. "enter"
 // take over from scrollback/lines.
 pub const TERM_READ_SCREEN: &str = "term.read_screen";
 pub const TERM_CLEAR_HISTORY: &str = "term.clear_history"; // {surface?}
+pub const TERM_PROCESSES: &str = "term.processes"; // {} -> {terminals: [{surface, pid, command, cwd, agent_session}]} (each terminal's shell pid, foreground command, and `<agent>:<id>` tag; nulls when unknown)
 
 // --- agent awareness ---
 pub const FILE_PUT: &str = "file.put"; // {name, data: base64} -> {path} (a pasted image, saved on the host)

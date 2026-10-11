@@ -4,38 +4,74 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="dark light">
 <title>lmux</title>
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
-<header>
-  <button id="back" hidden>‹ Sessions</button>
-  <h1 id="title">lmux</h1>
-  <span id="mode" class="badge"></span>
+<header class="top">
+  <button id="back" type="button" class="ghost">‹ Sessions</button>
+  <div class="brand">
+    <span class="mark">lmux</span>
+    <span id="host" class="host"></span>
+  </div>
+  <button id="attention" type="button" class="pill warn" hidden></button>
+  <button id="theme" type="button" class="ghost">Dark</button>
 </header>
-<main>
-  <section id="status" class="notice">Connecting…</section>
-  <section id="list" hidden></section>
-  <section id="term" hidden>
-    <pre id="screen"></pre>
-    <form id="composer" hidden autocomplete="off">
-      <div id="keys">
-        <button type="button" data-key="escape">Esc</button>
-        <button type="button" data-key="tab">Tab</button>
-        <button type="button" data-key="ctrl+c">^C</button>
-        <button type="button" data-key="up">↑</button>
-        <button type="button" data-key="down">↓</button>
-        <button type="button" data-key="left">←</button>
-        <button type="button" data-key="right">→</button>
-        <button type="button" data-key="enter">⏎</button>
+<p id="notice" class="notice" role="status" hidden></p>
+<div id="app" data-view="list">
+  <aside id="side" aria-label="Sessions">
+    <div id="list"></div>
+  </aside>
+  <main id="main">
+    <section id="view" aria-label="Session" data-mode="term">
+      <div class="viewbar">
+        <div class="titles">
+          <h1 id="vtitle"></h1>
+          <p id="vsub"></p>
+        </div>
+        <span id="vstate" class="pill" hidden></span>
       </div>
-      <div id="line">
-        <input id="text" type="text" enterkeyhint="send" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Type to the terminal">
-        <button type="submit">Send</button>
+      <div id="seg" class="seg" role="tablist" aria-label="View" hidden>
+        <button type="button" id="seg-chat" role="tab" aria-controls="chatwrap">Chat</button>
+        <button type="button" id="seg-term" role="tab" aria-controls="screen">Terminal</button>
       </div>
-    </form>
-  </section>
-</main>
+      <div id="waiting" class="waiting" role="status" hidden>
+        <span class="waiting-text">Waiting for your answer.</span>
+        <button type="button" id="to-term" class="ghost">Open terminal</button>
+      </div>
+      <div id="chatwrap" class="chatwrap" hidden>
+        <div id="chat" class="chat" tabindex="0" aria-label="Conversation">
+          <div id="chat-list" class="chat-list"></div>
+          <p id="chat-empty" class="chat-empty">Loading the conversation…</p>
+        </div>
+        <button type="button" id="latest" class="latest" hidden>Latest ↓</button>
+      </div>
+      <pre id="screen" tabindex="0" aria-label="Terminal screen"></pre>
+      <p id="viewonly" class="viewonly" hidden>View only. This share does not allow typing.</p>
+      <form id="composer" autocomplete="off" hidden>
+        <div id="keys">
+          <button type="button" data-key="escape">Esc</button>
+          <button type="button" data-key="tab">Tab</button>
+          <button type="button" data-key="ctrl+c">^C</button>
+          <button type="button" data-key="ctrl+d">^D</button>
+          <button type="button" data-key="up" aria-label="Up">↑</button>
+          <button type="button" data-key="down" aria-label="Down">↓</button>
+          <button type="button" data-key="left" aria-label="Left">←</button>
+          <button type="button" data-key="right" aria-label="Right">→</button>
+          <button type="button" data-key="enter" aria-label="Enter">⏎</button>
+        </div>
+        <div class="line">
+          <input id="text" type="text" enterkeyhint="send" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="Text to type" placeholder="Type to the terminal">
+          <button type="button" id="keys-btn" class="ghost" aria-controls="keys" aria-expanded="false" hidden>Keys</button>
+          <button type="submit" class="primary">Send</button>
+        </div>
+      </form>
+    </section>
+    <p class="empty">Pick a session to see its screen.</p>
+  </main>
+</div>
+<div id="toast" role="alert" hidden></div>
 <script src="/app.js"></script>
 </body>
 </html>
