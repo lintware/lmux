@@ -746,7 +746,27 @@ pub enum Cmd {
         /// The cloudflared binary (default: found on PATH, or downloaded once).
         #[arg(long)]
         cloudflared: Option<String>,
+        /// Also control the sessions on this server, reached over SSH (an alias
+        /// from ~/.ssh/config or user@host). Repeat for more servers. Each
+        /// server needs lmux installed (deploy/install-remote.sh).
+        #[arg(long = "server", value_name = "SSH_TARGET")]
+        servers: Vec<String>,
+        /// Run as the always-on gateway service: hand out codes through
+        /// `lmux share-code` and exit when the tunnel stops.
+        #[arg(long)]
+        service: bool,
     },
+    /// Print a new pairing code (JSON with the link and QR) from the gateway
+    /// service on this machine, or with --status, whether a code is unused.
+    #[command(hide = true)]
+    ShareCode {
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Serve this machine's sessions to a share gateway over stdin/stdout
+    /// (run by `lmux share --server` through SSH).
+    #[command(hide = true)]
+    ShareBackend,
     /// Diagnostic: connect to the websocket, subscribe, print snapshot/output.
     #[command(hide = true)]
     WsProbe {

@@ -154,9 +154,12 @@ async fn run() -> anyhow::Result<()> {
             ws_probe(&addr, &surface, timeout, resizes).await?;
             return Ok(());
         }
-        Cmd::Share { allow_typing, port, no_tunnel, cloudflared } => {
-            return share::run(share::Opts { socket, allow_typing, port, no_tunnel, cloudflared, json }).await;
+        Cmd::Share { allow_typing, port, no_tunnel, cloudflared, servers, service } => {
+            let opts = share::Opts { socket, allow_typing, port, no_tunnel, cloudflared, json, servers, service };
+            return share::run(opts).await;
         }
+        Cmd::ShareCode { status } => return share::request_code(status).await,
+        Cmd::ShareBackend => return share::backend(socket).await,
         Cmd::ImportCmux { move_, force, dry_run, only, from } => {
             let opts = import::Opts { from, move_, force, dry_run, only };
             return import::run(opts, &socket, json).await;

@@ -25,6 +25,7 @@ clap = { version = "4.5", features = ["derive"] }
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
 qrcode = { version = "0.14", default-features = false }
+base64 = "0.22"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

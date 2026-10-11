@@ -42,7 +42,12 @@ pub fn show_hosts(ui: &mut Ui, rect: Rect, hosts: &mut [Ctx], active: usize) {
     // OpenUsage's limits sit at the bottom, under the list.
     let usage_h = super::usage::height(ui.ctx(), rect.height() - strip.height());
     let usage_rect = Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - usage_h), rect.max);
-    super::usage::show(ui, usage_rect);
+    if super::usage::show(ui, usage_rect) {
+        if let Some(c) = hosts.get_mut(active) {
+            // Same as the "Show QR…" menu item; a live share shows its QR again.
+            c.state.share_draft = Some(crate::share_dialog::Draft::default());
+        }
+    }
 
     let list = Rect::from_min_max(egui::pos2(rect.min.x, strip.max.y), egui::pos2(rect.max.x, usage_rect.min.y));
     // Rows are hit-tested against the area they were drawn in, so a drop while

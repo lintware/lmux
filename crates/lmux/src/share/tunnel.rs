@@ -12,7 +12,14 @@ use tokio::process::{Child, Command};
 pub struct Tunnel {
     pub url: String,
     // Dropping the tunnel kills the child (kill_on_drop).
-    _child: Child,
+    child: Child,
+}
+
+impl Tunnel {
+    /// Resolves when cloudflared exits; the address is dead from then on.
+    pub async fn exited(&mut self) {
+        let _ = self.child.wait().await;
+    }
 }
 
 fn home() -> Option<PathBuf> {
@@ -136,7 +143,7 @@ pub async fn start(port: u16, explicit: Option<&str>, print: bool) -> anyhow::Re
     };
     // Keep draining so cloudflared never blocks on a full pipe.
     tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-    Ok(Tunnel { url, _child: child })
+    Ok(Tunnel { url, child })
 }
 
 #[cfg(test)]
