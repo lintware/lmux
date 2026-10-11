@@ -510,3 +510,123 @@ async fn share_shows_an_agent_transcript_as_chat() {
     let _ = share.kill();
     let _ = share.wait();
 }
+
+/// Gateway mode: `lmux share --server X` lists X's sessions next to this
+/// machine's, under `X/` ids, and sends screens, input and uploads to the
+/// server that owns the tab. A stand-in `ssh` runs the backend command here,
+/// against a second scratch daemon that plays the remote server.
+#[tokio::test(flavor = "multi_thread")]
+async fn share_gateway_controls_another_server() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+    let Some(local) = Daemon::start() else { return };
+    let Some(remote) = Daemon::start() else { return };
+    local.ok(&["new-workspace", "--name", "here", "--command", "/bin/sh"]);
+    remote.ok(&["new-workspace", "--name", "there", "--command", "/bin/sh"]);
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let ssh = bin_dir.path().join("ssh");
+    std::fs::write(&ssh, "#!/bin/sh\nfor a; do [ \"$a\" = gone ] && { echo 'ssh: Could not resolve hostname gone' >&2; exit 255; }; last=$a; done\nexec sh -c \"$last\"\n").unwrap();
+    std::fs::set_permissions(&ssh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin_dir.path().display(), std::env::var("PATH").unwrap_or_default());
+    let remote_bin = format!("{BIN} --socket {}", remote.socket.display());
+
+    let mut share = local
+        .cmd(&["--json", "share", "--no-tunnel", "--allow-typing", "--server", "vps1", "--server", "gone"])
+        .env("PATH", &path)
+        .env("LMUX_REMOTE_BIN", &remote_bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(share.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let info: serde_json::Value = serde_json::from_str(&line).expect("share prints JSON");
+    let url = info["url"].as_str().unwrap().to_string();
+    let (base, code) = url.split_once("/#").unwrap();
+    let addr = base.trim_start_matches("http://").to_string();
+    let body = format!("{{\"code\":\"{code}\"}}");
+    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    s.write_all(
+        format!("POST /auth HTTP/1.1\r\nHost: {addr}\r\nOrigin: {base}\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut ok = String::new();
+    s.read_to_string(&mut ok).unwrap();
+    let cookie = ok.lines().find_map(|l| l.strip_prefix("Set-Cookie: ")).expect("cookie").split(';').next().unwrap().to_string();
+
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("Origin", base.parse().unwrap());
+    req.headers_mut().insert("Cookie", cookie.parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("upgrade");
+
+    // Wait for a tree with both servers' sessions (the SSH link comes up in the background).
+    let mut tree = serde_json::Value::Null;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await else { continue };
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        let settled = |n: &str, want: &str| {
+            v["servers"].as_array().into_iter().flatten().any(|s| s["name"] == n && s["status"] == want)
+        };
+        if v["t"] == "tree" && v["workspaces"].as_array().is_some_and(|w| w.len() == 2)
+            && settled("vps1", "connected") && settled("gone", "unreachable")
+        {
+            tree = v;
+            break;
+        }
+    }
+    let ws_list = tree["workspaces"].as_array().expect("both servers' workspaces");
+    let there = ws_list.iter().find(|w| w["title"] == "there").expect("remote workspace");
+    assert_eq!(there["server"], "vps1");
+    assert_eq!(there["tabs"][0]["id"], "vps1/surface:1");
+    let here = ws_list.iter().find(|w| w["title"] == "here").expect("local workspace");
+    assert_eq!(here["tabs"][0]["id"], "surface:1");
+    let servers = tree["servers"].as_array().expect("server list");
+    let status = |n: &str| servers.iter().find(|s| s["name"] == n).map(|s| s["status"].clone());
+    assert_eq!(status("vps1"), Some(serde_json::json!("connected")));
+    assert_eq!(status("gone"), Some(serde_json::json!("unreachable")));
+    let gone = servers.iter().find(|s| s["name"] == "gone").unwrap();
+    assert!(gone["error"].as_str().unwrap_or("").contains("resolve"), "{gone}");
+
+    // Typing into the remote tab reaches the remote daemon only.
+    ws.send(Message::Text(r#"{"t":"open","surface":"vps1/surface:1"}"#.into())).await.unwrap();
+    ws.send(Message::Text(r#"{"t":"send","surface":"vps1/surface:1","text":"echo GW_$((6*7))","enter":true}"#.into()))
+        .await
+        .unwrap();
+    let mut saw = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !saw {
+        let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await else { continue };
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        saw = v["t"] == "screen" && v["surface"] == "vps1/surface:1" && v["text"].as_str().unwrap_or("").contains("GW_42");
+    }
+    assert!(saw, "the remote screen shows the typed command's output");
+    assert!(!local.ok(&["read-screen", "--surface", "surface:1"]).contains("GW_"));
+
+    // An upload lands on the server of the open tab.
+    ws.send(Message::Text(r#"{"t":"upload","id":"u1","name":"note.txt","size":5}"#.into())).await.unwrap();
+    ws.send(Message::Binary(b"hello".to_vec())).await.unwrap();
+    let mut path = None;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && path.is_none() {
+        let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await else { continue };
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        assert_ne!(v["t"], "upload_error", "{v}");
+        if v["t"] == "uploaded" {
+            path = v["path"].as_str().map(str::to_owned);
+        }
+    }
+    let path = path.expect("uploaded");
+    assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+
+    // An unknown server's tab is refused.
+    ws.send(Message::Text(r#"{"t":"send","surface":"nope/surface:1","text":"x","enter":false}"#.into())).await.unwrap();
+
+    let _ = share.kill();
+    let _ = share.wait();
+    let _ = std::fs::remove_file(&path);
+}

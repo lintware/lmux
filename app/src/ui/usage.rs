@@ -48,7 +48,8 @@ fn rows(p: &Provider) -> Vec<(&String, &Resource)> {
     v
 }
 
-pub fn show(ui: &mut Ui, rect: Rect) {
+/// Draws the section; returns true when the REMOTE button was clicked.
+pub fn show(ui: &mut Ui, rect: Rect) -> bool {
     let ctx = ui.ctx().clone();
     let p = ui.painter_at(rect);
     let u = usage::current();
@@ -57,7 +58,18 @@ pub fn show(ui: &mut Ui, rect: Rect) {
 
     p.line_segment([rect.left_top(), rect.right_top()], Stroke::new(1.0, theme::HAIRLINE));
 
-    let bar = Rect::from_min_size(egui::pos2(rect.min.x, rect.max.y - BAR_H), Vec2::new(rect.width(), BAR_H));
+    let full = Rect::from_min_size(egui::pos2(rect.min.x, rect.max.y - BAR_H), Vec2::new(rect.width(), BAR_H));
+    let label_font = theme::pixel(theme::FS_SMALL);
+    let remote_w = 2.0 * theme::SIDEBAR_PAD + 12.0 + crate::util::measure(&ctx, "REMOTE", &label_font);
+    let split = (full.max.x - remote_w).round();
+    let bar = Rect::from_min_max(full.min, egui::pos2(split, full.max.y));
+    let remote = Rect::from_min_max(egui::pos2(split, full.min.y), full.max);
+    let remote_clicked = remote_button(ui, &p, remote, &label_font);
+    p.line_segment(
+        [egui::pos2(split + 0.5, full.min.y + 9.0), egui::pos2(split + 0.5, full.max.y - 9.0)],
+        Stroke::new(1.0, theme::HAIRLINE),
+    );
+
     let resp = ui.interact(bar, Id::new("usage-bar"), Sense::click());
     if resp.hovered() {
         p.rect_filled(bar, 0.0, theme::chip_hover_bg());
@@ -79,28 +91,26 @@ pub fn show(ui: &mut Ui, rect: Rect) {
     };
     icons::dot(&p, egui::pos2(inner.min.x + 4.0, cy), 3.0, dot);
     let color = if open || resp.hovered() { theme::TEXT_SOFT } else { theme::DIM };
-    p.text(egui::pos2(inner.min.x + 16.0, cy), Align2::LEFT_CENTER, "USAGE", theme::pixel(theme::FS_SMALL), color);
+    // Narrow sidebars drop the percent first, then the label.
+    let label_end = inner.min.x + 16.0 + crate::util::measure(&ctx, "USAGE", &label_font);
+    let chevron_x = inner.max.x - 4.0;
+    if label_end + 6.0 <= chevron_x - 6.0 {
+        p.text(egui::pos2(inner.min.x + 16.0, cy), Align2::LEFT_CENTER, "USAGE", label_font, color);
+    }
     if let Some(peak) = u.peak() {
         let pct = (peak * 100.0).round() as i64;
-        p.text(
-            egui::pos2(inner.max.x - 16.0, cy),
-            Align2::RIGHT_CENTER,
-            format!("{pct}%"),
-            theme::ui(theme::FS_SMALL),
-            level_color(peak),
-        );
+        let text = format!("{pct}%");
+        let font = theme::ui(theme::FS_SMALL);
+        let right = inner.max.x - 16.0;
+        if right - crate::util::measure(&ctx, &text, &font) >= label_end + 6.0 {
+            p.text(egui::pos2(right, cy), Align2::RIGHT_CENTER, text, font, level_color(peak));
+        }
     }
-    icons::chevron(
-        &p,
-        egui::pos2(inner.max.x - 4.0, cy),
-        3.4,
-        theme::DIM,
-        if open { Arrow::Down } else { Arrow::Up },
-    );
+    icons::chevron(&p, egui::pos2(chevron_x, cy), 3.4, theme::DIM, if open { Arrow::Down } else { Arrow::Up });
     resp.on_hover_text(tip);
 
     if !open {
-        return;
+        return remote_clicked;
     }
     let panel = Rect::from_min_max(egui::pos2(rect.min.x, rect.min.y + 1.0), egui::pos2(rect.max.x, bar.min.y));
     let builder = egui::UiBuilder::new()
@@ -122,6 +132,22 @@ pub fn show(ui: &mut Ui, rect: Rect) {
                 }
             });
     });
+    remote_clicked
+}
+
+fn remote_button(ui: &mut Ui, p: &egui::Painter, rect: Rect, font: &egui::FontId) -> bool {
+    let (sharing, tip) = crate::share_dialog::remote_status();
+    let resp = ui.interact(rect, Id::new("remote-bar"), Sense::click());
+    if resp.hovered() {
+        p.rect_filled(rect, 0.0, theme::chip_hover_bg());
+    }
+    let x = rect.min.x + theme::SIDEBAR_PAD;
+    let cy = rect.center().y;
+    icons::dot(p, egui::pos2(x + 4.0, cy), 3.0, if sharing { theme::GREEN } else { theme::DIM_2 });
+    let color = if resp.hovered() { theme::TEXT_SOFT } else { theme::DIM };
+    p.text(egui::pos2(x + 12.0, cy), Align2::LEFT_CENTER, "REMOTE", font.clone(), color);
+    let resp = resp.on_hover_text(tip);
+    resp.clicked()
 }
 
 fn note(ui: &mut Ui, title: &str, body: &str) {

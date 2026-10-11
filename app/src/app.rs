@@ -62,6 +62,7 @@ impl LmuxApp {
         }
         crate::clip::watch_cmd_v();
         crate::usage::start(&cc.egui_ctx);
+        crate::share_dialog::load_gateway();
         theme::set_traffic_lights(cfg!(target_os = "macos"));
         eprintln!("[fonts] ui={ui_font} mono={mono_font}");
 

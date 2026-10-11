@@ -175,6 +175,26 @@ Side-by-side comparison with cmux (`~/Documents/cmux`): layout, spacing, colours
 **Later: mobile app.**
 A phone client for the same hosts: the sidebar of workspaces with agent status and notifications, terminals to read and type into, and browser panes as the frame stream the desktop app already gets. Everything runs on the hosts, so the phone only views and drives them, the way the laptop does for remote hosts. The daemons need a way to reach a phone without the laptop's SSH tunnel (for example over Tailscale), and push notifications when an agent needs input.
 
+**Later: share a tab to your phone (QR).**
+Right-click a tab, choose *Show QR*, scan it with the phone, and that one session opens on the phone (and optionally in a browser). The user runs no command and installs nothing besides the phone app. A prototype of the phone app and a Python bridge is in `mobile/` (see `mobile/README.md`); this feature replaces the bridge with a built-in server.
+
+- **Scope.** A QR shares one tab, never the whole machine. The phone sees that tab's live screen and can type into it; it does not see other tabs. The tab can be local or on a remote host, because the app already holds the connection to every host and forwards for the phone. Sharing ends on *Stop sharing*, when the tab closes, when the QR expires, or when the app quits.
+- **Server.** Built into the app (or `lmux server`), with no separate process to start. It serves a small WebSocket API: screen frames out, keystrokes in. A WebSocket is required, because Cloudflare Quick Tunnels do not support Server-Sent Events.
+- **Reaching the laptop, in order of preference.**
+  1. Same network or Tailscale: the QR lists the laptop's addresses and the phone tries each. Free, no third party.
+  2. Cloudflare Quick Tunnel: *Show QR* starts `cloudflared tunnel --url http://localhost:<port>` for the user and puts the printed `trycloudflare.com` URL in the QR. Free, needs no Cloudflare account or login, and traffic never passes through our infrastructure. Limits (from Cloudflare's docs): the URL changes on every start, there is no uptime guarantee, Cloudflare calls the feature test and development only, and requests above 200 in flight get a 429. `cloudflared` has to be bundled or downloaded on first use; check its licence. Test a WebSocket through a Quick Tunnel before committing to this.
+  3. Relay on `lmux.lintlabs.org` (a Worker plus a Durable Object per pairing): works from any network with no tunnel. We pay for it and carry abuse risk, so encrypt end to end with a key carried only in the QR, and use WebSocket hibernation to keep idle cost near zero. Build only if Quick Tunnels prove too fragile.
+- **Pairing and tokens.** The QR holds the addresses and a single-use code that expires in a few minutes. The phone redeems the code for a token tied to that tab and stored in the Keychain; the Mac keeps a list of paired devices with revoke. No permanent token ever goes in a QR.
+- **Browser access.** After scanning, the same session can open in a mobile browser, served by the laptop itself over the tunnel's HTTPS. Rules, because a terminal is remote code execution:
+  - The token travels in the URL fragment (`#…`), which browsers never send to a server, and the page trades it for a short-lived `HttpOnly`, `Secure`, `SameSite=Strict` cookie, then clears the fragment.
+  - The WebSocket checks its `Origin` header and the cookie, to block cross-site hijacking.
+  - View-only by default; typing is a toggle in the *Show QR* dialog.
+  - The page loads no third-party scripts, and the server sends a strict `Content-Security-Policy`.
+  - Plain-HTTP LAN addresses cannot use `Secure` cookies, so browser access needs HTTPS (a tunnel or Tailscale Serve).
+- **Phone view.** First the terminal screen. For Claude tabs the recorded session ID could allow a chat view from the transcript, with the screen as the fallback.
+- **Remote sessions appear automatically** once paired through the laptop, because the app already merges every host into its sidebar.
+- **Risks.** Anyone holding a live share link can read the tab and, if allowed, type into it, so QR codes are secrets: short expiry, one tab each, and a visible *Sharing* badge on the tab. Screens show keys and tokens, so never log frames on a relay.
+
 ## Risks to test early
 
 - **Ref collisions across hosts.** Two daemons both have `workspace:1`. Every place the app stores a ref (selection, drag state, layout, subscriptions, notifications) must carry the host too. Do this as a type (`HostRef`), not by convention.

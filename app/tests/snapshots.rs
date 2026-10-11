@@ -606,3 +606,67 @@ fn snapshot_terminal_scrollbar() {
     let mut h = harness(fx, Vec2::new(900.0, 500.0));
     h.snapshot("terminal_scrollbar");
 }
+
+/// The QR window with a phone gateway set: it asks the real gateway named in
+/// `LMUX_GATEWAY` for a code over SSH, so it only runs by hand:
+/// `LMUX_GATEWAY=lint-hqc-01 cargo test --test snapshots gateway_qr -- --ignored`.
+/// It writes `target/gateway_qr.png` for a look and checks no snapshot.
+#[test]
+#[ignore]
+fn gateway_qr_window() {
+    use egui_kittest::kittest::{NodeT, Queryable};
+    lmux_app::share_dialog::load_gateway();
+    let target = lmux_app::share_dialog::gateway().expect("set LMUX_GATEWAY").ssh_target;
+    let mut fx = fixture("workspace:1", true);
+    fx.state.share_draft = Some(Default::default());
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(900.0, 720.0))
+        .with_pixels_per_point(2.0)
+        .build_ui_state(
+            |ui, fx: &mut Fixture| {
+                if !fx.fonts_ready {
+                    fonts::install(ui.ctx());
+                    fx.fonts_ready = true;
+                    return;
+                }
+                let mut c = lmux_app::ui::Ctx { state: &mut fx.state, net: &mut fx.net };
+                app::render(ui, &mut c);
+            },
+            fx,
+        );
+    let start = std::time::Instant::now();
+    loop {
+        h.run_steps(2);
+        let label = format!("Gateway: {target}");
+        if h.query_by_label_contains(&label).is_some() && h.query_by_label_contains("Scan within").is_some() {
+            break;
+        }
+        assert!(start.elapsed().as_secs() < 30, "no QR from {target}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    h.run_steps(2);
+    let img = h.render().expect("render");
+    img.save(concat!(env!("CARGO_MANIFEST_DIR"), "/target/gateway_qr.png")).unwrap();
+
+    // Spend the code as a phone would; the window then says it was used.
+    let label = h.query_by_label_contains("trycloudflare.com").expect("link").accesskit_node().value().unwrap_or_default();
+    let url: String = label.split_whitespace().collect();
+    let (base, code) = url.split_once("/#").unwrap_or_else(|| panic!("no code in {url:?}"));
+    let out = std::process::Command::new("curl")
+        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-H"])
+        .arg(format!("Origin: {base}"))
+        .args(["-d", &format!("{{\"code\":\"{code}\"}}")])
+        .arg(format!("{base}/auth"))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "204");
+    let start = std::time::Instant::now();
+    while h.query_by_label_contains("Paired").is_none() {
+        assert!(start.elapsed().as_secs() < 20, "the window did not notice the scan");
+        h.run_steps(2);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    h.run_steps(2);
+    let img = h.render().expect("render");
+    img.save(concat!(env!("CARGO_MANIFEST_DIR"), "/target/gateway_qr_used.png")).unwrap();
+}

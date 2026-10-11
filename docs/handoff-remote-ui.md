@@ -121,6 +121,13 @@ All additions are additive. Existing messages keep their fields.
   - `summary.json` in the session directory has `session_summary`, a good subtitle.
   - **Problem:** the daemon records no Grok session ID. One `grok` process can hold several sessions' `events.jsonl` open (on this machine, pid 49632 had 3 open). A workable rule: list the files the pane's `grok` process has open (`lsof -n -P -p <pid> -F n`, as `probe::open_files` does on macOS), keep `.../sessions/<cwd>/<id>/events.jsonl` paths, and choose the session whose `chat_history.jsonl` changed most recently. This is a heuristic; see section 9.
 
+**c. Gateway mode (`lmux share --server <ssh-target>`, repeatable).** The share also controls the sessions on other servers. It runs `lmux share-backend` on each one over SSH and speaks one JSON object per line with it. Agent detection, transcripts and uploads run on the server that owns the session.
+
+- Every workspace in `tree` gets `"server":"<name>"`. This machine's ids stay bare (`surface:3`). A remote server's workspace and tab ids carry its name in front (`vps1/surface:3`), and clients send those ids back unchanged in `open`, `send` and `key`.
+- In gateway mode, `tree` also carries `"servers":[{"name","status":"connected|connecting|unreachable","error":str|null,"local":bool}]`. A remote server that drops is tried again with a growing pause (1 s up to 30 s).
+- An upload goes to the server of the open tab, so the path in `uploaded` is a path on that server.
+- `LMUX_REMOTE_BIN` names another lmux binary on the servers (for tests). Each server needs a current lmux (`deploy/install-remote.sh`); an older one shows as unreachable with "lmux on this server is too old".
+
 ## 5. Page design (built)
 
 `crates/lmux/src/share/page.html`, `app.js` and `app.css` implement the design below. The auth and connect flow is unchanged from the placeholder.
