@@ -129,18 +129,17 @@ pub fn show(ui: &mut Ui, rect: Rect, surface: &str, _focused: bool, c: &mut Ctx)
     }
     c.state.visible.insert(surface.to_owned());
 
-    let (frame_w, frame_h, has_frame, tex) = {
+    let (frame_w, frame_h, has_frame, tex, css_size) = {
         let view = c.state.browsers.get(surface).expect("browser view ensured above");
-        (view.frame_size.0, view.frame_size.1, view.have_frame, view.texture.clone())
+        (view.frame_size.0, view.frame_size.1, view.have_frame, view.texture.clone(), view.sent_size)
     };
 
     // Report the canvas size (CSS px) after it settles, before any frame has
-    // come: the size is what starts the stream. The stream is 1× by default
-    // (review #9): a Retina pixels_per_point would quadruple the bytes.
+    // come: the size is what starts the stream, at the display's scale.
     let want = (
         area.width().round().max(1.0) as u32,
         area.height().round().max(1.0) as u32,
-        c.net.browser_scale(),
+        c.net.browser_scale(ui.ctx().pixels_per_point()),
     );
     let now = Instant::now();
     let (send, schedule) = match c.state.browsers.get_mut(surface) {
@@ -187,10 +186,16 @@ pub fn show(ui: &mut Ui, rect: Rect, surface: &str, _focused: bool, c: &mut Ctx)
         );
     }
 
-    // Input mapping.
+    // Input mapping, in the page's CSS px: the frame has device pixels
+    // (2× on Retina, fewer when the daemon degrades quality), so map through
+    // the CSS size the stream was asked for.
+    let (css_w, css_h) = match css_size {
+        Some((w, h, _)) => (w as f32, h as f32),
+        None => (fw, fh),
+    };
     let to_css = |p: egui::Pos2| -> (f64, f64) {
-        let x = (p.x - image_rect.min.x) / scale;
-        let y = (p.y - image_rect.min.y) / scale;
+        let x = (p.x - image_rect.min.x) / image_rect.width().max(1.0) * css_w;
+        let y = (p.y - image_rect.min.y) / image_rect.height().max(1.0) * css_h;
         (x as f64, y as f64)
     };
     let resp = ui.interact(image_rect, Id::new(("browser", surface)), Sense::click_and_drag());
@@ -242,6 +247,18 @@ pub fn show(ui: &mut Ui, rect: Rect, surface: &str, _focused: bool, c: &mut Ctx)
             send_mouse(c, surface, MouseAction::Up, x, y, MouseButton::Left, 1, egui_mods);
         }
     }
+    // Files dropped from Finder land on the element under the pointer.
+    if resp.contains_pointer() || ui.input(|i| i.pointer.latest_pos()).is_some_and(|p| image_rect.contains(p)) {
+        let dropped: Vec<std::path::PathBuf> =
+            ui.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        if !dropped.is_empty() {
+            let p = ui.input(|i| i.pointer.latest_pos()).filter(|p| image_rect.contains(*p)).unwrap_or(image_rect.center());
+            if let Some(pane) = c.state.pane_of_surface(surface) {
+                c.state.focus_pane(&pane);
+            }
+            send_files_to_page(c, surface, &dropped, Some(to_css(p)));
+        }
+    }
     if resp.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta);
         if scroll.y.abs() > 0.5 || scroll.x.abs() > 0.5 {
@@ -260,6 +277,104 @@ pub fn show(ui: &mut Ui, rect: Rect, surface: &str, _focused: bool, c: &mut Ctx)
                 },
             });
         }
+    }
+}
+
+/// Most a single paste or drop carries into a streamed page. The files travel
+/// base64 inside one `browser.eval` message, which must stay under the
+/// daemon's 16 MB websocket frame limit.
+const MAX_PAGE_FILES_BYTES: u64 = 10 * 1024 * 1024;
+
+/// A script that hands local files to the page the way a real browser does.
+/// The page runs on the daemon's host, where these files do not exist, so
+/// their bytes travel inside the script. At `point` (viewport CSS px, a drop)
+/// the element there gets dragenter/dragover/drop; without one (Cmd+V) the
+/// focused element gets a paste event, and a drop when no handler took it.
+/// A file `<input>` gets the files set directly. Directories are skipped.
+pub fn page_files_js(paths: &[std::path::PathBuf], point: Option<(f64, f64)>) -> Result<(String, usize), String> {
+    use base64::Engine;
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    for p in paths {
+        let Ok(meta) = std::fs::metadata(p) else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        total += meta.len();
+        if total > MAX_PAGE_FILES_BYTES {
+            return Err(format!("files over {} MB can't be sent to the page", MAX_PAGE_FILES_BYTES / (1024 * 1024)));
+        }
+        let bytes = std::fs::read(p).map_err(|e| format!("reading {}: {e}", p.display()))?;
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+        files.push(serde_json::json!({
+            "n": name,
+            "t": mime_of(p),
+            "d": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }));
+    }
+    if files.is_empty() {
+        return Err("nothing to send: only files can go to a page".into());
+    }
+    let count = files.len();
+    let point = match point {
+        Some((x, y)) => serde_json::json!([x, y]),
+        None => serde_json::Value::Null,
+    };
+    let script = format!(
+        "(()=>{{const F={files};const P={point};\
+const dt=new DataTransfer();\
+for(const f of F){{const b=atob(f.d);const u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);dt.items.add(new File([u],f.n,{{type:f.t}}));}}\
+let el=P?document.elementFromPoint(P[0],P[1]):document.activeElement;\
+if(!el)el=document.body;\
+if(el.tagName==='INPUT'&&el.type==='file'){{el.files=dt.files;el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));return 'input';}}\
+const drop=(x,y)=>{{const o={{bubbles:true,cancelable:true,composed:true,dataTransfer:dt,clientX:x,clientY:y}};for(const t of['dragenter','dragover','drop'])el.dispatchEvent(new DragEvent(t,o));}};\
+if(P){{drop(P[0],P[1]);return 'drop';}}\
+const ev=new ClipboardEvent('paste',{{bubbles:true,cancelable:true,composed:true,clipboardData:dt}});\
+el.dispatchEvent(ev);\
+if(ev.defaultPrevented)return 'paste';\
+const r=el.getBoundingClientRect();drop(r.x+r.width/2,r.y+r.height/2);return 'drop';}})()",
+        files = serde_json::Value::Array(files),
+    );
+    Ok((script, count))
+}
+
+/// The MIME type pages see for a file, from its extension.
+fn mime_of(p: &std::path::Path) -> &'static str {
+    let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" | "md" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "html" | "htm" => "text/html",
+        "zip" => "application/zip",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Send local files to a streamed page (see [`page_files_js`]).
+pub fn send_files_to_page(c: &mut Ctx, surface: &str, paths: &[std::path::PathBuf], point: Option<(f64, f64)>) {
+    match page_files_js(paths, point) {
+        Ok((script, count)) => c.state.browser_request(
+            m::BROWSER_EVAL,
+            serde_json::json!({ "surface": surface, "script": script }),
+            crate::state::BrowserReply::Files { count },
+        ),
+        Err(why) => c.state.banner = Some((why, true)),
     }
 }
 
@@ -507,5 +622,26 @@ mod tests {
     fn blank_input_goes_nowhere() {
         assert_eq!(u(""), None);
         assert_eq!(u("   "), None);
+    }
+}
+
+#[cfg(test)]
+mod page_files_tests {
+    use super::page_files_js;
+
+    #[test]
+    fn files_become_a_page_script() {
+        let dir = std::env::temp_dir().join(format!("lmux-pf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("My Doc.pdf");
+        std::fs::write(&f, b"%PDF-1.4 hi").unwrap();
+        let (js, n) = page_files_js(&[f, dir.clone()], Some((10.0, 20.0))).unwrap();
+        assert_eq!(n, 1, "the directory is skipped");
+        assert!(js.contains("\"n\":\"My Doc.pdf\"") && js.contains("application/pdf"));
+        if let Ok(out) = std::env::var("LMUX_PAGE_FILES_JS") {
+            std::fs::write(out, &js).unwrap();
+        }
+        assert!(page_files_js(&[dir.clone()], None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

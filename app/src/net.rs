@@ -45,6 +45,10 @@ pub struct HostConfig {
     /// a fast link; `LMUX_BROWSER_SCALE` overrides for a run.
     #[serde(default)]
     pub browser_scale: Option<f32>,
+    /// Stream this host's browser tabs from its Chromium, instead of running
+    /// them in the app (see [`Net::draws_browsers`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream_browsers: bool,
     /// Set for a cloud box lmux created, so the app can delete it again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud: Option<CloudBox>,
@@ -86,6 +90,7 @@ fn local_host() -> HostConfig {
         ssh_target: None,
         remote_port: DEFAULT_REMOTE_PORT,
         browser_scale: None,
+        stream_browsers: false,
         cloud: None,
     }
 }
@@ -404,6 +409,7 @@ pub fn ssh_host(target: &str) -> HostConfig {
         ssh_target: Some(target.to_owned()),
         remote_port: DEFAULT_REMOTE_PORT,
         browser_scale: None,
+        stream_browsers: false,
         cloud: None,
     }
 }
@@ -434,6 +440,7 @@ pub fn load_hosts() -> Vec<HostConfig> {
             ssh_target: None,
             remote_port: DEFAULT_REMOTE_PORT,
             browser_scale: None,
+            stream_browsers: false,
             cloud: None,
         }];
     }
@@ -463,6 +470,9 @@ pub fn load_hosts() -> Vec<HostConfig> {
 pub struct Tunnel {
     child: Child,
     pub port: u16,
+    /// The host's network as a SOCKS5 proxy (`ssh -D`), for browser pages
+    /// this app runs on the host's behalf.
+    pub socks_port: Option<u16>,
 }
 
 impl Drop for Tunnel {
@@ -497,10 +507,26 @@ fn wait_port(port: u16, timeout: Duration) -> bool {
 
 /// A stable control socket per ssh target, so forwards (and reconnects) to the
 /// same host multiplex over one transport (review #14).
-fn control_path(target: &str) -> PathBuf {
+pub fn control_path(target: &str) -> PathBuf {
     let mut h = DefaultHasher::new();
     target.hash(&mut h);
     std::env::temp_dir().join(format!("lmux-ssh-{:016x}", h.finish()))
+}
+
+/// Whether the master behind `sock` still answers (`ssh -O check`).
+fn master_alive(target: &str, sock: &std::path::Path) -> bool {
+    Command::new("ssh")
+        .args(["-O", "check"])
+        .arg("-o")
+        .arg(format!("ControlPath={}", sock.display()))
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .arg(target)
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Make sure a background SSH master exists for `target`. `ControlPersist`
@@ -509,10 +535,17 @@ fn control_path(target: &str) -> PathBuf {
 fn ensure_master(target: &str) -> Result<PathBuf, String> {
     let sock = control_path(target);
     if sock.exists() {
-        return Ok(sock);
+        // A socket file outlives a dead connection (network change, sleep),
+        // and every tunnel through it would fail until ControlPersist ran out.
+        if master_alive(target, &sock) {
+            return Ok(sock);
+        }
+        let _ = std::fs::remove_file(&sock);
     }
     let status = Command::new("ssh")
         .args(["-fN", "-M"])
+        .arg("-o")
+        .arg("ConnectTimeout=8")
         .arg("-o")
         .arg(format!("ControlPath={}", sock.display()))
         .arg("-o")
@@ -566,7 +599,12 @@ pub fn open_tunnel(host: &HostConfig) -> Result<(String, Option<Tunnel>), String
     let sock = ensure_master(&target)?;
     let port = free_port()?;
     let forward = format!("127.0.0.1:{port}:127.0.0.1:{}", host.remote_port);
-    let mut child = Command::new("ssh")
+    let socks_port = free_port().ok();
+    let mut cmd = Command::new("ssh");
+    if let Some(s) = socks_port {
+        cmd.arg("-D").arg(format!("127.0.0.1:{s}"));
+    }
+    let mut child = cmd
         .arg("-N")
         .arg("-o")
         .arg(format!("ControlPath={}", sock.display()))
@@ -613,7 +651,7 @@ pub fn open_tunnel(host: &HostConfig) -> Result<(String, Option<Tunnel>), String
             }
         });
     }
-    Ok((format!("ws://127.0.0.1:{port}"), Some(Tunnel { child, port })))
+    Ok((format!("ws://127.0.0.1:{port}"), Some(Tunnel { child, port, socks_port })))
 }
 
 // --- connection ------------------------------------------------------------
@@ -783,10 +821,12 @@ impl Net {
             .is_some_and(|h| h.name == LOCAL_HOST_NAME)
     }
 
-    /// Device scale factor for the browser stream. Defaults to 1.0 over the
-    /// network (a Retina 2.0 would cost 4× the pixels); `LMUX_BROWSER_SCALE`
-    /// or the host's `browser_scale` opts into more (review #9).
-    pub fn browser_scale(&self) -> f32 {
+    /// Device scale factor for the browser stream: the display's own
+    /// (`pixels_per_point`, 2.0 on Retina), so text is as sharp as in a real
+    /// browser. A 1.0 stream looked pixelated once stretched onto a Retina
+    /// pane. The daemon's adaptive quality still drops resolution on a slow
+    /// link. `LMUX_BROWSER_SCALE` or the host's `browser_scale` overrides it.
+    pub fn browser_scale(&self, pixels_per_point: f32) -> f32 {
         if let Ok(v) = std::env::var("LMUX_BROWSER_SCALE") {
             if let Ok(v) = v.parse::<f32>() {
                 return v.clamp(1.0, 3.0);
@@ -794,8 +834,8 @@ impl Net {
         }
         self.current_host()
             .and_then(|h| h.browser_scale)
-            .unwrap_or(1.0)
-            .clamp(1.0, 3.0)
+            .unwrap_or(pixels_per_point)
+            .clamp(1.0, 2.0)
     }
 
     pub fn select_host(&mut self, index: usize, ctx: &egui::Context) {
@@ -866,8 +906,29 @@ impl Net {
         let msg = ClientMsg::Hello {
             protocol_version: PROTOCOL_VERSION,
             client_name: format!("lmux-app/{}", env!("CARGO_PKG_VERSION")),
+            draws_browsers: self.draws_browsers(),
         };
         self.send(&msg);
+    }
+
+    /// This app runs the host's new browser tabs itself, in WebKit with the
+    /// host's network (see `crate::socks`): pages react at local speed and
+    /// look as sharp as any Mac browser. Needs an ssh host (for the SOCKS
+    /// forward) and macOS 14 (per-host WebKit data stores with a proxy).
+    /// `"stream_browsers": true` in hosts.json, or `LMUX_STREAM_BROWSERS=1`,
+    /// keeps the host's Chromium and its frame stream instead.
+    pub fn draws_browsers(&self) -> bool {
+        if std::env::var("LMUX_STREAM_BROWSERS").is_ok_and(|v| v == "1") {
+            return false;
+        }
+        self.current_host().is_some_and(|h| h.kind == "ssh" && !h.stream_browsers)
+            && self.socks_port().is_some()
+            && crate::webview::proxies_supported()
+    }
+
+    /// The host's SOCKS proxy port while its tunnel is up.
+    pub fn socks_port(&self) -> Option<u16> {
+        self.tunnel.as_ref().and_then(|t| t.socks_port)
     }
 
     pub fn send(&mut self, msg: &ClientMsg) {
@@ -892,8 +953,38 @@ impl Net {
         self.receiver = None;
     }
 
+    /// Reconnect now, whatever the state: an attempt in flight is abandoned,
+    /// the backoff starts over, and a dead ssh master is dropped so the new
+    /// attempt builds a fresh one. The sidebar's "Refresh Connection".
+    pub fn reconnect_now(&mut self, ctx: &egui::Context) {
+        if let Some(host) = self.current_host() {
+            if host.kind == "ssh" {
+                let target = host.ssh_target.clone().unwrap_or_else(|| host.name.clone());
+                close_master(&target);
+                let _ = std::fs::remove_file(control_path(&target));
+            }
+        }
+        self.tunnel = None;
+        self.drop_connection();
+        // A resolve still running keeps its thread but its answer is dropped.
+        self.resolve = Resolve::Idle;
+        self.state = ConnState::Disconnected;
+        self.attempt = 0;
+        self.retry_at = None;
+        self.begin_connect(ctx);
+    }
+
+    /// Skip the rest of a backoff wait, as when the window comes back into
+    /// focus after the Mac slept or changed network.
+    pub fn retry_soon(&mut self) {
+        if self.state == ConnState::Disconnected && self.retry_at.is_some() {
+            self.retry_at = Some(Instant::now());
+            self.wake();
+        }
+    }
+
     fn schedule_retry(&mut self) {
-        let secs = [0.5f64, 1.0, 2.0, 4.0, 8.0, 15.0][(self.attempt as usize).min(5)];
+        let secs = [0.3f64, 0.6, 1.0, 2.0, 3.0, 5.0][(self.attempt as usize).min(5)];
         self.attempt = self.attempt.saturating_add(1);
         self.retry_at = Some(Instant::now() + Duration::from_secs_f64(secs));
     }

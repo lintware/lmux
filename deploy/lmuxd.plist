@@ -28,6 +28,8 @@
     <string>@PATH@</string>
     <key>RUST_LOG</key>
     <string>info</string>
+    <key>LMUX_REMOTE</key>
+    <string>1</string>
     <key>LANG</key>
     <string>en_US.UTF-8</string>
   </dict>

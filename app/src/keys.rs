@@ -169,6 +169,14 @@ pub fn text_input(text: &str, mods: Modifiers) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Whether a key press goes to a streamed page as a raw key event. Cmd+V, C
+/// and X do not: the clipboard goes through the paste and copy actions, and
+/// a Meta+V key next to them makes headless Chromium run its own paste
+/// and hang.
+pub fn browser_key_event(key: Key, command: bool) -> bool {
+    !(command && matches!(key, Key::V | Key::C | Key::X))
+}
+
 /// DOM `KeyboardEvent.key` and `.code` for a browser surface.
 pub fn dom_key(key: Key) -> Option<(&'static str, &'static str)> {
     Some(match key {
@@ -232,6 +240,16 @@ mod tests {
 
     fn m() -> Modifiers {
         Modifiers::default()
+    }
+
+    #[test]
+    fn clipboard_chords_are_not_raw_browser_keys() {
+        for k in [Key::V, Key::C, Key::X] {
+            assert!(!browser_key_event(k, true));
+            assert!(browser_key_event(k, false));
+        }
+        assert!(browser_key_event(Key::A, true));
+        assert!(browser_key_event(Key::Enter, true));
     }
 
     #[test]

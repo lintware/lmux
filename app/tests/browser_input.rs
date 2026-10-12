@@ -66,6 +66,7 @@ fn browser_fixture() -> (AppState, Net) {
         ssh_target: None,
         remote_port: 7878,
         browser_scale: None,
+        stream_browsers: false,
         cloud: None,
     }]);
     (st, net)
@@ -422,4 +423,54 @@ fn a_new_browser_tab_opens_blank_with_the_address_bar_focused() {
     assert!(h.state().state.browsers["surface:9"].focus_url);
     h.run();
     assert!(h.ctx.memory(|m| m.focused().is_some()), "the address bar takes the keyboard");
+}
+
+#[test]
+fn cmd_v_pastes_text_without_a_raw_meta_v_key() {
+    let (state, net) = browser_fixture();
+    let fx = Fx { state, net, ready: false };
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(900.0, 600.0))
+        .with_pixels_per_point(1.0)
+        .build_ui_state(
+            |ui, fx: &mut Fx| {
+                if !fx.ready {
+                    lmux_app::fonts::install(ui.ctx());
+                    fx.ready = true;
+                    return;
+                }
+                let mut c = lmux_app::ui::Ctx { state: &mut fx.state, net: &mut fx.net };
+                lmux_app::app::render(ui, &mut c);
+                lmux_app::app::route_input(ui.ctx(), &mut c);
+            },
+            fx,
+        );
+    h.run();
+    h.run();
+    h.state_mut().state.pending.clear();
+
+    let command = egui::Modifiers::COMMAND;
+    h.input_mut().events.push(egui::Event::Key {
+        key: egui::Key::V,
+        physical_key: Some(egui::Key::V),
+        pressed: true,
+        repeat: false,
+        modifiers: command,
+    });
+    h.input_mut().events.push(egui::Event::Paste("hello".into()));
+    h.run();
+
+    let events: Vec<&wire::BrowserInputEvent> = h
+        .state()
+        .state
+        .pending
+        .iter()
+        .filter_map(|m| match m {
+            ClientMsg::BrowserInput { event, .. } => Some(event),
+            _ => None,
+        })
+        .collect();
+    let inserts = events.iter().filter(|e| matches!(e, wire::BrowserInputEvent::InsertText { text } if text == "hello")).count();
+    let keys = events.iter().filter(|e| matches!(e, wire::BrowserInputEvent::Key { .. })).count();
+    assert_eq!((inserts, keys), (1, 0), "events: {events:?}");
 }

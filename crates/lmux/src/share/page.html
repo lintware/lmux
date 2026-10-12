@@ -16,6 +16,7 @@
     <span id="host" class="host"></span>
   </div>
   <button id="attention" type="button" class="pill warn" hidden></button>
+  <button id="talk" type="button" class="ghost talk" hidden>Talk</button>
   <button id="theme" type="button" class="ghost">Dark</button>
 </header>
 <p id="notice" class="notice" role="status" hidden></p>
@@ -70,6 +71,13 @@
     </section>
     <p class="empty">Pick a session to see its screen.</p>
   </main>
+</div>
+<div id="call" class="call" data-state="idle" hidden>
+  <p id="call-status" class="call-status" role="status" aria-live="polite"></p>
+  <div class="call-row">
+    <button id="hold" type="button" class="hold" disabled>Hold to talk</button>
+    <button id="hangup" type="button" class="ghost">End call</button>
+  </div>
 </div>
 <div id="toast" role="alert" hidden></div>
 <script src="/app.js"></script>

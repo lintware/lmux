@@ -100,6 +100,13 @@ const SHUTDOWN_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Within this window a shell foreground does not mean "Claude exited".
 const RESUME_GRACE: Duration = Duration::from_secs(30);
 
+/// How long a host with Chromium waits after its last browser-drawing app
+/// leaves before it moves that app's tabs to Chromium.
+#[cfg(not(test))]
+const BROWSER_HANDOFF_DELAY: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const BROWSER_HANDOFF_DELAY: Duration = Duration::from_millis(150);
+
 /// Pause between resumed agents, so ten panes do not start Claude at once.
 const RESUME_STAGGER: Duration = Duration::from_millis(750);
 
@@ -218,6 +225,9 @@ struct Clients {
     /// Connections that are lmux apps (they said so in `hello`), oldest
     /// first: they draw in-app browsers and run steps in them.
     apps: Vec<u64>,
+    /// Apps that also run a remote host's browser pages themselves (they
+    /// said `draws_browsers` in `hello`).
+    browser_apps: HashSet<u64>,
     /// surface -> connection ids subscribed.
     subs: HashMap<Ref, HashSet<u64>>,
     next_id: u64,
@@ -365,11 +375,13 @@ impl Inner {
     /// Forget a client. A browser it was the last viewer of stops streaming,
     /// as on `Unsubscribe`: its last frame was never acked, so a stream left
     /// running would stay stalled for the next viewer.
-    async fn unregister(&self, id: u64) {
+    async fn unregister(self: &Arc<Self>, id: u64) {
+        let was_browser_app;
         let orphaned: Vec<Ref> = {
             let mut c = self.clients.lock().await;
             c.conns.remove(&id);
             c.apps.retain(|a| *a != id);
+            was_browser_app = c.browser_apps.remove(&id);
             c.subs
                 .iter_mut()
                 .filter_map(|(surface, set)| (set.remove(&id) && set.is_empty()).then(|| surface.clone()))
@@ -382,6 +394,15 @@ impl Inner {
                     let _ = b.stop_screencast(&surface).await;
                 }
             }
+        }
+        if was_browser_app && self.browser.is_some() {
+            // Give the app a moment to come back (a reconnect) before the
+            // tabs are handed to Chromium.
+            let me = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(BROWSER_HANDOFF_DELAY).await;
+                me.settle_browsers().await;
+            });
         }
     }
 
@@ -713,6 +734,12 @@ impl Inner {
         self.browser_streaming.lock().await.remove(surface);
     }
 
+    /// Whether a connected app runs this host's browser pages itself. A new
+    /// browser tab then lives in the app, with no Chromium page and no stream.
+    pub(crate) async fn app_draws_browsers(&self) -> bool {
+        !self.clients.lock().await.browser_apps.is_empty()
+    }
+
     /// Reconcile the loaded state with the still-running tmux server. Takes only
     /// the single state lock.
     async fn reconcile(self: &Arc<Self>) {
@@ -879,6 +906,63 @@ impl Inner {
             tokio::spawn(async move { me.respawn_terminals(respawn).await });
         }
         self.mark_dirty();
+    }
+
+    /// On a host with Chromium, make browser tabs follow who can draw them:
+    /// while an app that runs pages itself (`draws_browsers`) is connected,
+    /// tabs are the app's (`in_app`) and their Chromium pages are closed; with
+    /// none, in-app tabs get a Chromium page at their saved URL so agents keep
+    /// working. Idempotent, so a quick disconnect and reconnect changes nothing.
+    pub(crate) async fn settle_browsers(self: &Arc<Self>) {
+        let Some(b) = self.browser.clone() else {
+            return;
+        };
+        let to_app = self.app_draws_browsers().await;
+        let moving: Vec<(Ref, String)> = {
+            let state = self.state.lock().await;
+            state
+                .all_surface_refs()
+                .into_iter()
+                .filter_map(|surf| match state.surface(&surf).map(|s| &s.kind) {
+                    Some(SurfaceKind::Browser { url, in_app, .. }) if *in_app != to_app => Some((surf, url.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut changed = false;
+        for (surf, url) in moving {
+            if to_app {
+                if self.is_streaming(&surf).await {
+                    self.clear_streaming(&surf).await;
+                    let _ = b.stop_screencast(&surf).await;
+                }
+                let _ = b.close_surface(&surf).await;
+            } else if let Err(e) = b.create_surface(&surf, Some(&url)).await {
+                tracing::warn!(surface = %surf, "moving browser to Chromium failed: {e}");
+                continue;
+            }
+            // The app may have come or gone while the page was made.
+            if self.app_draws_browsers().await != to_app {
+                if !to_app {
+                    let _ = b.close_surface(&surf).await;
+                }
+                continue;
+            }
+            let mut state = self.state.lock().await;
+            if let Some(SurfaceKind::Browser { in_app, .. }) = state.surface_mut(&surf).map(|s| &mut s.kind) {
+                *in_app = to_app;
+                changed = true;
+            }
+            drop(state);
+            if !to_app && self.has_subscribers(&surf).await {
+                self.clear_streaming(&surf).await;
+                self.maybe_start_fallback_screencast(surf);
+            }
+        }
+        if changed {
+            self.tree_changed();
+            self.mark_dirty();
+        }
     }
 
     /// Open the browser tabs the state file kept, at their saved URLs. The
@@ -1855,9 +1939,17 @@ impl Inner {
         outbox: &Arc<ClientSink>,
     ) {
         match msg {
-            ClientMsg::Hello { client_name, .. } => {
+            ClientMsg::Hello { client_name, draws_browsers, .. } => {
                 if client_name.starts_with("lmux-app") {
-                    self.clients.lock().await.apps.push(id);
+                    let mut c = self.clients.lock().await;
+                    c.apps.push(id);
+                    if draws_browsers {
+                        c.browser_apps.insert(id);
+                    }
+                    drop(c);
+                    if draws_browsers {
+                        self.settle_browsers().await;
+                    }
                 }
             }
             ClientMsg::AppBrowserResult { id: call, value, error } => {
@@ -2464,6 +2556,86 @@ mod tests {
         });
         tokio::spawn(browser_event_loop(inner.clone(), rx));
         Some((inner, fake, pane, surf, scratch, state_dir))
+    }
+
+    /// A host with Chromium still lets an app that runs pages itself
+    /// (`draws_browsers`) own its new browser tabs: no Chromium page is made,
+    /// and agents' steps go to the app. Once that app leaves, Chromium is
+    /// used again.
+    #[tokio::test]
+    async fn an_app_that_draws_browsers_owns_new_tabs_on_a_chromium_host() {
+        let Some((inner, fake, pane, _surf, _scratch, _dir)) = browser_daemon("draws").await else { return };
+        let call = |params: serde_json::Value| RpcRequest { id: 1, method: methods::SURFACE_NEW.into(), params };
+        let in_app = |inner: Arc<Inner>, s: String| async move {
+            matches!(inner.state.lock().await.surface(&s).map(|x| x.kind.clone()), Some(SurfaceKind::Browser { in_app: true, .. }))
+        };
+
+        let sink = ClientSink::new(64);
+        let id = inner.register(sink.clone()).await;
+        inner
+            .handle_client_msg(
+                id,
+                ClientMsg::Hello { protocol_version: 1, client_name: "lmux-app/test".into(), draws_browsers: true },
+                &sink,
+            )
+            .await;
+        let r = crate::rpc::dispatch(&inner, &call(json!({"pane": pane, "type": "browser", "url": "https://news.ycombinator.com"}))).await;
+        let s = r.result.unwrap()["surface"].as_str().unwrap().to_owned();
+        assert!(in_app(inner.clone(), s.clone()).await, "the app draws the new tab");
+        assert!(
+            !fake.calls.lock().unwrap().iter().any(|c| c.contains(&s)),
+            "no Chromium page for an app-drawn tab: {:?}",
+            fake.calls.lock().unwrap()
+        );
+
+        inner.unregister(id).await;
+        let r = crate::rpc::dispatch(&inner, &call(json!({"pane": pane, "type": "browser", "url": "https://example.com"}))).await;
+        let s = r.result.unwrap()["surface"].as_str().unwrap().to_owned();
+        assert!(!in_app(inner.clone(), s.clone()).await, "Chromium again once the app is gone");
+    }
+
+    /// A host with Chromium hands an app's tabs to Chromium once the last
+    /// browser-drawing app is gone (after a short delay), and takes them back
+    /// when an app returns. A quick reconnect moves nothing.
+    #[tokio::test]
+    async fn tabs_follow_the_browser_drawing_app_on_a_chromium_host() {
+        let Some((inner, fake, _pane, surf, _scratch, _dir)) = browser_daemon("handoff").await else { return };
+        let in_app = |inner: Arc<Inner>, s: String| async move {
+            matches!(inner.state.lock().await.surface(&s).map(|x| x.kind.clone()), Some(SurfaceKind::Browser { in_app: true, .. }))
+        };
+        let hello = |name: &str, draws: bool| ClientMsg::Hello { protocol_version: 1, client_name: name.into(), draws_browsers: draws };
+
+        // An old app (no draws_browsers) changes nothing.
+        let old_sink = ClientSink::new(64);
+        let old = inner.register(old_sink.clone()).await;
+        inner.handle_client_msg(old, hello("lmux-app/old", false), &old_sink).await;
+        assert!(!in_app(inner.clone(), surf.clone()).await);
+        inner.unregister(old).await;
+        tokio::time::sleep(BROWSER_HANDOFF_DELAY * 3).await;
+        assert!(!in_app(inner.clone(), surf.clone()).await);
+        assert_eq!(fake.calls.lock().unwrap().len(), 0, "{:?}", fake.calls.lock().unwrap());
+
+        // A new app takes the Chromium tab: its page closes.
+        let sink = ClientSink::new(64);
+        let id = inner.register(sink.clone()).await;
+        inner.handle_client_msg(id, hello("lmux-app/new", true), &sink).await;
+        assert!(in_app(inner.clone(), surf.clone()).await, "the app owns the tab");
+        assert!(fake.calls.lock().unwrap().contains(&format!("close {surf}")));
+
+        // A quick reconnect keeps the tab in the app.
+        inner.unregister(id).await;
+        let sink2 = ClientSink::new(64);
+        let id2 = inner.register(sink2.clone()).await;
+        inner.handle_client_msg(id2, hello("lmux-app/new", true), &sink2).await;
+        tokio::time::sleep(BROWSER_HANDOFF_DELAY * 3).await;
+        assert!(in_app(inner.clone(), surf.clone()).await, "a reconnect moves nothing");
+        assert!(!fake.calls.lock().unwrap().iter().any(|c| c.starts_with("create")));
+
+        // The app leaves for good: Chromium gets a page at the saved URL.
+        inner.unregister(id2).await;
+        let moved = wait_for(5, || async { !in_app(inner.clone(), surf.clone()).await }).await;
+        assert!(moved, "tab went back to Chromium");
+        assert!(fake.calls.lock().unwrap().contains(&format!("create {surf} Some(\"https://a.test\")")));
     }
 
     /// A window a page opened becomes a tab beside its opener, selected so it

@@ -191,7 +191,7 @@ impl Tmux {
             shell_quote(&sanitize_window_name(title)),
             shell_quote(cwd),
         );
-        for (k, v) in PANE_ENV.iter().map(|(k, v)| (k.to_string(), v.to_string())).chain(env.iter().cloned()) {
+        for (k, v) in pane_env().into_iter().chain(env.iter().cloned()) {
             line.push_str(&format!(" -e {}", shell_quote(&format!("{k}={v}"))));
         }
         if let Some(cmd) = command {
@@ -757,6 +757,40 @@ async fn ensure_session(cfg: &TmuxConfig) -> anyhow::Result<()> {
 /// Ghostty does, so panes say Ghostty, and `TMUX` is left empty (programs
 /// test it for being non-empty). `TMUX_PANE` and tmux itself still work.
 pub const PANE_ENV: &[(&str, &str)] = &[("TERM_PROGRAM", "ghostty"), ("TERM_PROGRAM_VERSION", "1.3.1"), ("TMUX", "")];
+
+/// Set in the environment of a daemon that serves the app over SSH (the
+/// service files of `deploy/` do). Its panes then look like an SSH session
+/// to the programs in them.
+pub const REMOTE_ENV: &str = "LMUX_REMOTE";
+
+/// The pane variables for this daemon: [`PANE_ENV`], plus SSH markers on a
+/// remote host. Without them Grok Build sees a local desktop and copies to
+/// the host's own clipboard (`pbcopy`); with them it sends OSC 52, which
+/// tmux and the daemon carry to the app and this Mac's clipboard.
+pub fn pane_env() -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = PANE_ENV.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    if std::env::var_os(REMOTE_ENV).is_some_and(|v| !v.is_empty() && v != "0") {
+        env.push(("SSH_CONNECTION".into(), "127.0.0.1 0 127.0.0.1 22".into()));
+        env.push(("SSH_TTY".into(), "/dev/tty".into()));
+    }
+    env
+}
+
+#[cfg(test)]
+mod pane_env_tests {
+    use super::*;
+
+    #[test]
+    fn remote_daemons_mark_panes_as_ssh() {
+        std::env::remove_var(REMOTE_ENV);
+        assert!(!pane_env().iter().any(|(k, _)| k == "SSH_CONNECTION"));
+        std::env::set_var(REMOTE_ENV, "1");
+        let env = pane_env();
+        std::env::remove_var(REMOTE_ENV);
+        assert!(env.iter().any(|(k, _)| k == "SSH_CONNECTION"));
+        assert!(env.iter().any(|(k, v)| k == "TERM_PROGRAM" && v == "ghostty"));
+    }
+}
 
 /// tmux reads its own command syntax; wrap a value in double quotes and escape.
 pub fn shell_quote(s: &str) -> String {

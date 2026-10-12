@@ -50,7 +50,7 @@ pub fn workspace_header(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
     icons::folder(
         &p,
         Rect::from_center_size(egui::pos2(rect.min.x + lead + 18.0, cy), Vec2::splat(15.0)),
-        theme::FLAME,
+        theme::FOLDER,
     );
 
     let title = c
@@ -60,11 +60,30 @@ pub fn workspace_header(ui: &mut Ui, rect: Rect, c: &mut Ctx) {
         .unwrap_or_else(|| "lmux".to_owned());
     let font = theme::ui(theme::FS_SMALL);
     // Clear of the notifications bell in the right corner.
-    let max_w = (rect.width() - 80.0 - lead).max(20.0);
+    let mut x = rect.min.x + lead + 32.0;
+    let end = rect.max.x - 48.0;
+    // With several hosts, the row says which one the workspace runs on, with
+    // that host's connection dot: `● my-server / claude · server`.
+    if !c.state.host_salt.is_empty() {
+        let dot = match c.net.state {
+            crate::net::ConnState::Connected => theme::GREEN,
+            crate::net::ConnState::Connecting => theme::AMBER,
+            crate::net::ConnState::Disconnected => theme::RED,
+        };
+        icons::dot(&p, egui::pos2(x + 3.0, cy), 3.0, dot);
+        x += 11.0;
+        let host_font = theme::ui_semibold(theme::FS_SMALL);
+        let host = ellipsize(ui.ctx(), &c.net.host_name(), &host_font, ((end - x) * 0.4).max(20.0), false);
+        let hw = measure(ui.ctx(), &host, &host_font);
+        p.text(egui::pos2(x, cy), Align2::LEFT_CENTER, host, host_font, theme::TEXT_SOFT);
+        x += hw + 6.0;
+        p.text(egui::pos2(x, cy), Align2::LEFT_CENTER, "/", font.clone(), theme::DIM_2);
+        x += measure(ui.ctx(), "/", &font) + 6.0;
+    }
     p.text(
-        egui::pos2(rect.min.x + lead + 32.0, cy),
+        egui::pos2(x, cy),
         Align2::LEFT_CENTER,
-        ellipsize(ui.ctx(), &title, &font, max_w, false),
+        ellipsize(ui.ctx(), &title, &font, (end - x).max(20.0), false),
         font,
         theme::DIM,
     );
@@ -393,8 +412,7 @@ fn run_tab_action(action: TabAction, surface: &Surface, pane: &Pane, c: &mut Ctx
         TabAction::CopyIds => {
             // The refs an agent passes to `lmux … --workspace/--pane/--surface`.
             // A tab on screen is in the selected workspace.
-            let ws = c.state.selected.clone().map(|w| format!("{w} ")).unwrap_or_default();
-            c.state.clipboard_out = Some(format!("{ws}{} {}", pane.id, surface.id));
+            c.state.clipboard_out = Some(crate::ui::ids_text(c, Some(&pane.id), &surface.id));
         }
     }
 }

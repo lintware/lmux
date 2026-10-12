@@ -17,6 +17,8 @@ const LOCAL_PTY_RETRY: Duration = Duration::from_secs(1);
 /// How long a hidden streamed terminal keeps its view. Showing it again
 /// within this is instant; later, it comes back from a fresh snapshot.
 const HIDDEN_VIEW_TTL: Duration = Duration::from_secs(60);
+/// How long a tree's pane size may lag behind a resize this app just sent.
+const RESIZE_SETTLE: Duration = Duration::from_secs(2);
 
 /// What to do with the reply to a browser request.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +29,8 @@ pub enum BrowserReply {
     Copy,
     /// `browser.link_at`: open the link, if any, as a new tab in `pane`.
     OpenLink { pane: Ref },
+    /// Files pasted or dropped into a streamed page: report how it went.
+    Files { count: usize },
 }
 
 pub struct BrowserView {
@@ -233,6 +237,9 @@ pub struct AppState {
     image_reads: Vec<(Ref, std::sync::mpsc::Receiver<Option<std::path::PathBuf>>)>,
     /// Images uploaded to the host for a paste, by RPC id: the surface.
     pending_uploads: HashMap<u64, Ref>,
+    /// Files being copied to this host after a drop: the pane's surface and
+    /// the copy's result once it finishes.
+    file_copies: Vec<(Ref, std::sync::mpsc::Receiver<crate::transfer::Outcome>)>,
     /// Animate (the running-agent spinner). The app turns it on; tests keep
     /// still frames.
     pub animate: bool,
@@ -612,6 +619,7 @@ impl AppState {
             confirm_close: None,
             image_reads: Vec::new(),
             pending_uploads: HashMap::new(),
+            file_copies: Vec::new(),
             term_font: crate::theme::FS_TERM,
             folder_toggle: None,
             folder_rename_pending: None,
@@ -1325,6 +1333,14 @@ impl AppState {
                     self.open_browser_tab(&pane, href);
                 }
             }
+            BrowserReply::Files { count } => {
+                let how = match result.get("value").and_then(|v| v.as_str()) {
+                    Some("input") => "attached",
+                    Some("paste") => "pasted",
+                    _ => "dropped",
+                };
+                self.banner = Some((format!("{how} {count} file(s) into the page"), false));
+            }
         }
     }
 
@@ -1443,6 +1459,7 @@ impl AppState {
                     .entry(surface.clone())
                     .or_insert_with(|| TermView::new(cols, rows));
                 tv.apply_snapshot(cols, rows, &data);
+                self.resync_if_mismatched(&surface, (cols, rows));
             }
             ServerMsg::TermExited { surface } => {
                 if let Some(t) = self.terms.get_mut(&surface) {
@@ -1613,8 +1630,53 @@ impl AppState {
         self.local_wanted.retain(|k| live.contains(k));
         self.local_retry.retain(|k, _| live.contains(k));
 
+        // Another viewer may have resized a pane since: its tree size then
+        // differs from the one this app asked for.
+        if !self.local_mode {
+            let sizes: Vec<(Ref, (u16, u16))> = self
+                .tree
+                .workspaces
+                .iter()
+                .flat_map(|w| w.panes.iter())
+                .flat_map(|p| p.surfaces.iter())
+                .filter_map(|s| match s.kind {
+                    SurfaceKind::Terminal { cols, rows, .. } => Some((s.id.clone(), (cols, rows))),
+                    _ => None,
+                })
+                .collect();
+            for (id, size) in sizes {
+                let settled = self
+                    .terms
+                    .get(&id)
+                    .is_some_and(|t| t.resized_at.is_none_or(|at| at.elapsed() >= RESIZE_SETTLE));
+                if settled {
+                    self.resync_if_mismatched(&id, size);
+                }
+            }
+        }
+
         // A create aimed at this host can go out now.
         self.fire_pending_create();
+    }
+
+    /// The pane has `actual` cols and rows. If this app wants another size for
+    /// a subscribed view, ask for it again and fetch a fresh snapshot, once
+    /// until a snapshot comes in right: output must not be drawn into a grid
+    /// of another size than the pane's.
+    fn resync_if_mismatched(&mut self, surface: &str, actual: (u16, u16)) {
+        let Some(want) = self.desired_sizes.get(surface).copied() else { return };
+        let Some(t) = self.terms.get_mut(surface) else { return };
+        if actual == want {
+            t.resync_sent = false;
+            return;
+        }
+        if !t.subscribed || t.resync_sent || self.local_mode {
+            return;
+        }
+        t.resync_sent = true;
+        t.resized_at = Some(Instant::now());
+        self.pending.push(ClientMsg::TermResize { surface: surface.to_owned(), cols: want.0, rows: want.1 });
+        self.pending.push(ClientMsg::Subscribe { surface: surface.to_owned(), history: None });
     }
 
     pub fn handle_frame(&mut self, buf: &[u8]) {
@@ -1717,16 +1779,28 @@ impl AppState {
             let Some(t) = self.terms.get_mut(id) else { continue };
             t.wants_visible = visible_now;
             t.hidden_since = if visible_now { None } else { t.hidden_since.or(Some(now)) };
+            let desired = self.desired_sizes.get(id).copied();
             if visible_now && !t.subscribed {
                 t.subscribed = true;
+                // The resize goes first: the daemon answers in order, so the
+                // snapshot is taken at the size the pane will have and no
+                // output lands in a grid of the old size. Sent even when the
+                // view already has that size, as another viewer may have
+                // resized the pane since.
+                if let Some(size) = desired {
+                    t.resize(size.0, size.1);
+                    t.resized_at = Some(now);
+                    self.pending.push(ClientMsg::TermResize { surface: id.clone(), cols: size.0, rows: size.1 });
+                }
                 self.pending.push(ClientMsg::Subscribe { surface: id.clone(), history: None });
             } else if !visible_now && t.subscribed {
                 t.subscribed = false;
                 self.pending.push(ClientMsg::Unsubscribe { surface: id.clone() });
             }
-            if let (true, Some(size)) = (t.subscribed, self.desired_sizes.get(id).copied()) {
+            if let (true, Some(size)) = (t.subscribed, desired) {
                 if (t.cols(), t.rows()) != size && t.size() != crate::term::TermSize::new(size.0 as usize, size.1 as usize) {
                     t.resize(size.0, size.1);
+                    t.resized_at = Some(now);
                     self.pending.push(ClientMsg::TermResize {
                         surface: id.clone(),
                         cols: size.0,
@@ -1899,6 +1973,46 @@ impl AppState {
             let Ok(bytes) = std::fs::read(&path) else { continue };
             self.upload_and_paste(&surface, "pasted-image.png", &bytes);
             let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// The working directory of the workspace that owns `surface`.
+    pub fn workspace_cwd_of(&self, surface: &str) -> Option<String> {
+        self.tree
+            .workspaces
+            .iter()
+            .find(|w| w.panes.iter().any(|p| p.surfaces.iter().any(|s| s.id == surface)))
+            .map(|w| w.cwd.clone())
+            .filter(|c| !c.is_empty())
+    }
+
+    /// Files dropped on a pane of a remote host are copied there; track the job.
+    pub fn track_file_copy(&mut self, surface: &str, rx: std::sync::mpsc::Receiver<crate::transfer::Outcome>) {
+        self.banner = Some(("copying to the host…".into(), false));
+        self.file_copies.push((surface.to_owned(), rx));
+    }
+
+    /// Finish copies that are done: paste the remote paths into the pane they
+    /// were dropped on, or report the failure.
+    pub fn poll_file_copies(&mut self) {
+        let mut done = Vec::new();
+        self.file_copies.retain(|(surface, rx)| match rx.try_recv() {
+            Ok(outcome) => {
+                done.push((surface.clone(), outcome));
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        });
+        for (surface, outcome) in done {
+            match outcome {
+                Ok(paths) => {
+                    let words: Vec<String> = paths.iter().map(|p| crate::ui::terminal::shell_quote(p)).collect();
+                    self.paste_text(&surface, &format!("{} ", words.join(" ")));
+                    self.banner = Some((format!("copied {} item(s) to the host", paths.len()), false));
+                }
+                Err(why) => self.banner = Some((format!("copy to the host failed: {why}"), true)),
+            }
         }
     }
 
@@ -2119,6 +2233,69 @@ mod tests {
         s.ensure_term("a");
         s.sync_streamed_terms(&HashSet::from(["a".to_owned()]));
         assert!(s.pending.iter().any(|m| matches!(m, ClientMsg::Subscribe { surface, .. } if surface == "a")));
+    }
+
+    /// The resize goes out before the subscribe, so the daemon's snapshot has
+    /// the size the pane will have and no output lands in a grid of the old one.
+    #[test]
+    fn a_newly_shown_streamed_term_resizes_before_it_subscribes() {
+        let mut s = AppState::new();
+        s.ensure_term("a");
+        s.desired_sizes.insert("a".into(), (131, 38));
+        s.sync_streamed_terms(&HashSet::from(["a".to_owned()]));
+        let kinds: Vec<&str> = s
+            .pending
+            .iter()
+            .map(|m| match m {
+                ClientMsg::TermResize { cols: 131, rows: 38, .. } => "resize",
+                ClientMsg::Subscribe { .. } => "subscribe",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["resize", "subscribe"]);
+        assert_eq!((s.terms["a"].cols(), s.terms["a"].rows()), (131, 38));
+    }
+
+    /// A snapshot of another size than this app wants (another viewer resized
+    /// the pane) is answered with a resize and a fresh snapshot, once.
+    #[test]
+    fn a_snapshot_of_the_wrong_size_asks_for_a_fresh_one() {
+        let mut s = AppState::new();
+        s.ensure_term("a");
+        s.desired_sizes.insert("a".into(), (20, 6));
+        s.sync_streamed_terms(&HashSet::from(["a".to_owned()]));
+        s.pending.clear();
+        let snap = |rows| ServerMsg::TermSnapshot { surface: "a".into(), cols: 20, rows, data: "x".into() };
+        s.handle_server_msg(snap(5));
+        assert!(matches!(s.pending[0], ClientMsg::TermResize { cols: 20, rows: 6, .. }));
+        assert!(matches!(s.pending[1], ClientMsg::Subscribe { .. }));
+        s.pending.clear();
+        s.handle_server_msg(snap(5));
+        assert!(s.pending.is_empty(), "asked once");
+        s.handle_server_msg(snap(6));
+        assert!(s.pending.is_empty(), "a right-sized snapshot needs nothing");
+        assert!(!s.terms["a"].resync_sent);
+    }
+
+    /// The tree names the pane's real size: a mismatch with the wanted size,
+    /// once the app's own resize has had time to land, is repaired.
+    #[test]
+    fn a_tree_size_that_differs_is_repaired() {
+        let mut s = state_with(&["a"], "a");
+        s.ensure_term("a");
+        s.desired_sizes.insert("a".into(), (20, 6));
+        s.sync_streamed_terms(&HashSet::from(["a".to_owned()]));
+        s.pending.clear();
+        let mut tree = s.tree.clone();
+        if let SurfaceKind::Terminal { cols, rows, .. } = &mut tree.workspaces[0].panes[0].surfaces[0].kind {
+            (*cols, *rows) = (20, 5);
+        }
+        s.apply_tree(tree.clone());
+        assert!(s.pending.is_empty(), "our resize is still in flight");
+        s.terms.get_mut("a").unwrap().resized_at = Some(Instant::now() - RESIZE_SETTLE - Duration::from_secs(1));
+        s.apply_tree(tree);
+        assert!(s.pending.iter().any(|m| matches!(m, ClientMsg::TermResize { cols: 20, rows: 6, .. })));
+        assert!(s.pending.iter().any(|m| matches!(m, ClientMsg::Subscribe { .. })));
     }
 
     /// Terminals that asked for focus events hear when they gain or lose the

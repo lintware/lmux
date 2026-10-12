@@ -222,6 +222,7 @@ enum MenuAction {
     Copy,
     Paste,
     ClearScrollback,
+    CopyIds,
     Split(&'static str),
 }
 
@@ -250,6 +251,8 @@ fn context_menu(ui: &egui::Ui, resp: &egui::Response, surface: &str, c: &mut Ctx
         item(ui, "Split Down", true, MenuAction::Split("down"));
         ui.separator();
         item(ui, "Clear Scrollback", true, MenuAction::ClearScrollback);
+        ui.separator();
+        item(ui, "Copy IDs", true, MenuAction::CopyIds);
     });
     let Some(action) = action else { return };
     match action {
@@ -264,6 +267,10 @@ fn context_menu(ui: &egui::Ui, resp: &egui::Response, surface: &str, c: &mut Ctx
             if let Some(tv) = c.state.terms.get_mut(surface) {
                 tv.clear_scrollback();
             }
+        }
+        MenuAction::CopyIds => {
+            let pane = c.state.pane_of_surface(surface);
+            c.state.clipboard_out = Some(crate::ui::ids_text(c, pane.as_deref(), surface));
         }
         MenuAction::Split(side) => {
             let pane = c.state.pane_of_surface(surface);
@@ -460,14 +467,30 @@ fn interact(ui: &mut egui::Ui, rect: Rect, surface: &str, grid: &Grid, c: &mut C
     context_menu(ui, &resp, surface, c);
 
     // Files dropped on the terminal paste their paths, shell-quoted and
-    // space-separated, as in cmux.
+    // space-separated, as in cmux. On a remote host the Mac's paths mean
+    // nothing there, so the files are copied to the workspace's directory
+    // first and the remote paths are pasted once they arrive.
     if resp.contains_pointer() {
-        let dropped: Vec<String> = ui.input(|i| {
-            i.raw.dropped_files.iter().map(|f| shell_quote(&f.path().to_string_lossy())).collect()
-        });
+        let dropped: Vec<std::path::PathBuf> =
+            ui.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         if !dropped.is_empty() {
-            let text = format!("{} ", dropped.join(" "));
-            c.state.send_term_input(surface, text.as_bytes());
+            let remote = if c.net.is_local_host() {
+                None
+            } else {
+                c.net.current_host().map(|h| h.ssh_target.clone().unwrap_or_else(|| h.name.clone()))
+            };
+            match remote {
+                Some(target) => {
+                    let dir = c.state.workspace_cwd_of(surface);
+                    let rx = crate::transfer::start(target, dropped, dir, Some(ui.ctx().clone()));
+                    c.state.track_file_copy(surface, rx);
+                }
+                None => {
+                    let words: Vec<String> = dropped.iter().map(|p| shell_quote(&p.to_string_lossy())).collect();
+                    let text = format!("{} ", words.join(" "));
+                    c.state.send_term_input(surface, text.as_bytes());
+                }
+            }
             if let Some(pane) = c.state.pane_of_surface(surface) {
                 c.state.focus_pane(&pane);
             }
@@ -832,7 +855,7 @@ mod tests {
 }
 
 /// Quote a path for a POSIX shell when it needs it: `'it'\''s here'`.
-fn shell_quote(path: &str) -> String {
+pub fn shell_quote(path: &str) -> String {
     let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+,:@%=~".contains(c);
     if !path.is_empty() && path.chars().all(safe) {
         path.to_owned()

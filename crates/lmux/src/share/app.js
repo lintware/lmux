@@ -482,6 +482,8 @@
     if (m.t === "tree") {
       tree = m;
       typing = !!m.typing;
+      voiceOn = !!m.voice;
+      $("talk").hidden = !voiceOn;
       $("host").textContent = m.host || "";
       var key = JSON.stringify(m);
       if (key !== treeKey) {
@@ -612,6 +614,188 @@
   Array.prototype.forEach.call(document.querySelectorAll("#keys button"), function (b) {
     b.addEventListener("click", function () { sendKey(b.getAttribute("data-key")); });
   });
+
+  // ---- Voice call: audio goes to OpenAI over WebRTC; the server only swaps the SDP ----
+
+  var voiceOn = false, call = null, talkSeq = 0, endedTimer = null;
+
+  function callStatus(state, text) {
+    $("call").setAttribute("data-state", state);
+    $("call-status").textContent = text;
+  }
+
+  function callDead() {
+    return !call || call.over;
+  }
+
+  function post(path, body) {
+    return fetch(path, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}), credentials: "same-origin"
+    });
+  }
+
+  function setHold(on) {
+    if (callDead() || !call.ready || call.held === on) return;
+    call.held = on;
+    talkSeq++;
+    call.track.enabled = on;
+    $("hold").classList.toggle("down", on);
+    $("hold").textContent = on ? "Listening… let go to send" : "Hold to talk";
+    post("/voice/talk", { on: on, seq: talkSeq }).catch(function () {});
+    if (on) { call.speaking = false; callStatus("listening", "Listening…"); }
+    else callStatus("thinking", "Thinking…");
+  }
+
+  function endCall(text, state) {
+    if (!call || call.over) return;
+    var c = call;
+    c.over = true;
+    clearTimeout(c.speakTimer);
+    clearTimeout(c.closeTimer);
+    if (c.track) c.track.stop();
+    if (c.stream) c.stream.getTracks().forEach(function (t) { t.stop(); });
+    if (c.dc) try { c.dc.close(); } catch (e) { /* already closed */ }
+    if (c.pc) c.pc.close();
+    c.audio.srcObject = null;
+    $("hold").disabled = true;
+    $("hold").classList.remove("down");
+    $("hold").textContent = "Hold to talk";
+    $("hangup").textContent = "Close";
+    $("talk").disabled = false;
+    callStatus(state || "ended", text || "Call ended.");
+  }
+
+  // The server owns mute and close on its sideband; the page only asks and waits for session.closed.
+  function hangUp() {
+    if (!call) { $("call").hidden = true; return; }
+    if (call.over) { $("call").hidden = true; call = null; return; }
+    call.userEnded = true;
+    callStatus("ending", "Ending the call…");
+    $("hold").disabled = true;
+    post("/voice/end").catch(function () {});
+    // If the final event never comes, release everything anyway.
+    call.closeTimer = setTimeout(function () { endCall("Call ended."); }, 8000);
+  }
+
+  function onCallEvent(ev) {
+    var m;
+    try { m = JSON.parse(ev.data); } catch (e) { return; }
+    var c = call;
+    if (callDead()) return;
+    var t = m.type || "";
+    if (t === "session.started") {
+      c.ready = true;
+      $("hold").disabled = false;
+      callStatus("ready", "Connected. Hold the button and ask about your sessions.");
+    } else if (t === "session.closed") {
+      var idle = !c.userEnded && m.reason === "close_requested";
+      endCall(idle ? "Call ended after 90 seconds of quiet." : "Call ended.");
+    } else if (t === "session.output_transcript.delta") {
+      c.speaking = true;
+      callStatus("speaking", "Speaking…");
+      clearTimeout(c.speakTimer);
+      c.speakTimer = setTimeout(function () {
+        c.speaking = false;
+        if (!c.held && !c.over) callStatus("ready", "Hold the button to ask something.");
+      }, 2500);
+    } else if (t === "response.event" && m.event && m.event.type === "response.output_item.done" &&
+               m.event.item && m.event.item.type === "function_call") {
+      if (!c.speaking && !c.held) callStatus("thinking", "Looking at your sessions…");
+    }
+  }
+
+  function waitIce(pc) {
+    return new Promise(function (resolve, reject) {
+      if (pc.iceGatheringState === "complete") { resolve(); return; }
+      var timer = setTimeout(function () { pc.removeEventListener("icegatheringstatechange", on); reject(new Error("Network setup timed out.")); }, 10000);
+      function on() {
+        if (pc.iceGatheringState !== "complete") return;
+        clearTimeout(timer);
+        pc.removeEventListener("icegatheringstatechange", on);
+        resolve();
+      }
+      pc.addEventListener("icegatheringstatechange", on);
+    });
+  }
+
+  function failCall(msg) {
+    if (call) endCall(msg, "ended");
+    else callStatus("ended", msg);
+    $("talk").disabled = false;
+  }
+
+  function startCall() {
+    if (call && !call.over) return;
+    clearTimeout(endedTimer);
+    $("call").hidden = false;
+    $("hangup").textContent = "End call";
+    $("hold").disabled = true;
+    $("hold").textContent = "Hold to talk";
+    $("talk").disabled = true;
+    callStatus("connecting", "Connecting…");
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.RTCPeerConnection) {
+      callStatus("ended", "This browser cannot make calls here. Use HTTPS or localhost.");
+      $("talk").disabled = false;
+      return;
+    }
+    var c = call = { over: false, ready: false, held: false, userEnded: false, speaking: false, audio: new Audio() };
+    c.audio.autoplay = true;
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+      if (c.over) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
+      c.stream = stream;
+      c.track = stream.getAudioTracks()[0];
+      c.track.enabled = false; // hold to talk: silent until the button is down
+      var pc = c.pc = new RTCPeerConnection();
+      pc.addEventListener("track", function (e) {
+        c.audio.srcObject = new MediaStream([e.track]);
+        var p = c.audio.play();
+        if (p && p.catch) p.catch(function () { toast("Tap the page to hear the answer."); });
+      });
+      pc.addEventListener("connectionstatechange", function () {
+        if (!c.over && (pc.connectionState === "failed" || pc.connectionState === "closed")) endCall("The call dropped.");
+      });
+      pc.addTrack(c.track, stream);
+      c.dc = pc.createDataChannel("oai-events");
+      c.dc.addEventListener("message", onCallEvent);
+      c.dc.addEventListener("close", function () { if (!c.over && c.ready) endCall("Call ended."); });
+      return pc.createOffer().then(function (offer) { return pc.setLocalDescription(offer); })
+        .then(function () { return waitIce(pc); })
+        .then(function () { return post("/voice/offer", { sdp: pc.localDescription.sdp }); })
+        .then(function (r) {
+          return r.json().catch(function () { return {}; }).then(function (b) {
+            if (!r.ok) throw new Error(b.error || "The call could not start.");
+            return pc.setRemoteDescription({ type: "answer", sdp: b.sdp });
+          });
+        });
+    }).catch(function (e) {
+      var denied = e && (e.name === "NotAllowedError" || e.name === "SecurityError");
+      failCall(denied ? "Microphone blocked. Allow it for this page and try again." : (e && e.message) || "The call could not start.");
+    });
+  }
+
+  $("talk").addEventListener("click", startCall);
+  $("hangup").addEventListener("click", hangUp);
+  (function () {
+    var hold = $("hold");
+    hold.addEventListener("pointerdown", function (e) {
+      e.preventDefault();
+      try { hold.setPointerCapture(e.pointerId); } catch (x) { /* not capturable */ }
+      setHold(true);
+    });
+    ["pointerup", "pointercancel", "lostpointercapture"].forEach(function (n) {
+      hold.addEventListener(n, function () { setHold(false); });
+    });
+    hold.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+    hold.addEventListener("keydown", function (e) {
+      if ((e.key === " " || e.key === "Enter") && !e.repeat) { e.preventDefault(); setHold(true); }
+    });
+    hold.addEventListener("keyup", function (e) {
+      if (e.key === " " || e.key === "Enter") setHold(false);
+    });
+    window.addEventListener("blur", function () { setHold(false); });
+  })();
+  window.addEventListener("pagehide", function () { if (call && !call.over) { post("/voice/end").catch(function () {}); } });
 
   applyTheme(storedTheme());
   start();

@@ -78,6 +78,12 @@ pub struct TermView {
     pub hidden_since: Option<std::time::Instant>,
     /// True once a `term_snapshot` has been written.
     pub have_snapshot: bool,
+    /// A snapshot of another size than the pane's was answered with a resize
+    /// and a fresh subscribe; not repeated until a snapshot comes in right.
+    pub resync_sent: bool,
+    /// When this app last asked the daemon to resize the pane; tree sizes that
+    /// lag behind a drag are not a mismatch (see `AppState::apply_tree`).
+    pub resized_at: Option<std::time::Instant>,
     /// The surface reported exit.
     pub exited: bool,
     /// Pointer gesture in progress over this terminal (see `ui::terminal`).
@@ -122,6 +128,8 @@ impl TermView {
             subscribed: false,
             hidden_since: None,
             have_snapshot: false,
+            resync_sent: false,
+            resized_at: None,
             exited: false,
             pointer: PointerState::default(),
             grid_origin: egui::Pos2::ZERO,
@@ -162,6 +170,10 @@ impl TermView {
         self.term = new_term(size, self.listener.clone());
         self.processor = Processor::new();
         self.size = size;
+        // The grid is new and empty: an erase-screen here would push a blank
+        // line into history, which a later shrink and grow pulls back, moving
+        // the screen (and the cursor) down a row.
+        let data = data.strip_prefix("\x1b[2J").unwrap_or(data);
         self.feed(data.as_bytes());
         self.have_snapshot = true;
         if let Some(lines) = self.history_scroll.take() {
@@ -452,6 +464,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn osc52_copy_reaches_the_clipboard_queue() {
+        let mut t = TermView::new(20, 4);
+        // As tmux relays it: `c` selection, BEL terminator.
+        t.feed(b"\x1b]52;c;UkVNT1RFX0NPUFlfT0s=\x07");
+        assert_eq!(t.take_clipboard(), vec!["REMOTE_COPY_OK".to_string()]);
+        // The `ST` terminator and an empty selection field are valid too.
+        t.feed(b"\x1b]52;;aGk=\x1b\\");
+        assert_eq!(t.take_clipboard(), vec!["hi".to_string()]);
+    }
+
+    #[test]
     fn feeds_and_reads_grid() {
         let mut t = TermView::new(20, 4);
         t.feed(b"hello\r\nworld");
@@ -477,6 +500,42 @@ mod tests {
             .collect();
         assert!(line0.starts_with("fresh"));
         assert!(t.have_snapshot);
+    }
+
+    /// A main-screen snapshot as the daemon writes it: a 6-row pane with the
+    /// input box's border, `❯` line and footer at the bottom, cursor on `❯`.
+    const INPUT_BOX: &str =
+        "\x1b[2J\x1b[Hout 1\r\nout 2\r\n────────\r\n❯ hint\r\n────────\r\n? help\x1b[0J\x1b[4;3H";
+    /// A keystroke as Claude Code's inline renderer draws it: cursor-relative
+    /// moves only, so the cursor's row decides where the letter lands.
+    const KEYSTROKE: &[u8] = b"\x1b[1B\r\x1b[1A\x1b[2Cx\r\x1b[1B\x1b[1A";
+
+    fn text(t: &TermView, row: usize) -> String {
+        t.row_chars(row).into_iter().collect::<String>().trim_end().to_owned()
+    }
+
+    #[test]
+    fn a_keystroke_lands_on_the_prompt_row() {
+        let mut t = TermView::new(8, 6);
+        t.apply_snapshot(8, 6, INPUT_BOX);
+        t.feed(KEYSTROKE);
+        assert_eq!(text(&t, 3), "❯ xint");
+        assert_eq!(text(&t, 2), "────────");
+    }
+
+    /// The snapshot's erase-screen must leave no blank line in history: after
+    /// a shrink and grow the screen would come back a row lower than tmux's.
+    #[test]
+    fn snapshot_then_shrink_and_grow_keeps_the_rows() {
+        let mut t = TermView::new(8, 6);
+        t.apply_snapshot(8, 6, INPUT_BOX);
+        t.resize(8, 5);
+        t.resize(8, 6);
+        assert_eq!(t.cursor().point.line.0, 3);
+        assert_eq!(text(&t, 3), "❯ hint");
+        t.feed(KEYSTROKE);
+        assert_eq!(text(&t, 3), "❯ xint");
+        assert_eq!(text(&t, 2), "────────");
     }
 
     #[test]
