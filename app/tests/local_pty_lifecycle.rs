@@ -81,12 +81,7 @@ fn tree(pane: &str) -> Tree {
 /// The visible grid as text, the same way the painter reads it.
 fn screen(state: &AppState) -> String {
     let Some(tv) = state.terms.get(SURFACE) else { return String::new() };
-    tv.term()
-        .renderable_content()
-        .display_iter
-        .filter(|c| c.point.line.0 == 0)
-        .map(|c| c.cell.c)
-        .collect()
+    tv.row_chars(0).into_iter().collect()
 }
 
 /// Pump the way the app's frame loop does until the pane's screen shows `needle`.

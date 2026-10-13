@@ -1706,6 +1706,9 @@ impl AppState {
                 if let Some(t) = self.terms.get_mut(surface) {
                     t.feed(data);
                     t.exited = false;
+                    // The pane's own tmux answers the program's queries; a
+                    // second answer from here would arrive as typed input.
+                    t.take_pty_writes();
                 }
             }
             Ok(wire::Frame::BrowserFrame { surface, seq, jpeg, .. }) => {
@@ -1943,11 +1946,15 @@ impl AppState {
             if chunks.is_empty() {
                 continue;
             }
-            let tv = self.terms.entry(id).or_insert_with(|| TermView::new(80, 24));
+            let tv = self.terms.entry(id.clone()).or_insert_with(|| TermView::new(80, 24));
             for chunk in &chunks {
                 tv.feed(chunk);
             }
             tv.exited = false;
+            // What tmux's client asks its terminal (device attributes,
+            // colours, cursor position) is answered like a keystroke.
+            let reply = tv.take_pty_writes();
+            self.write_local(&id, &reply);
         }
     }
 
@@ -2055,7 +2062,7 @@ impl AppState {
     /// Paste text into a terminal as the keyboard would (bracketed when the
     /// program asked for it).
     pub fn paste_text(&mut self, surface: &str, text: &str) {
-        let bracketed = self.term_mode(surface).contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+        let bracketed = self.term_mode(surface).bracketed_paste;
         let bytes = crate::termio::paste_bytes(text, bracketed);
         self.send_term_input(surface, &bytes);
     }
@@ -2134,7 +2141,7 @@ impl AppState {
                 }
                 continue;
             }
-            if !self.term_mode(&id).contains(alacritty_terminal::term::TermMode::FOCUS_IN_OUT) {
+            if !self.term_mode(&id).focus_events {
                 continue;
             }
             let want = focused.as_deref() == Some(id.as_str());
@@ -2156,8 +2163,8 @@ impl AppState {
     }
 
     /// The terminal modes the program in `surface` has set (empty if unknown).
-    pub fn term_mode(&self, surface: &str) -> alacritty_terminal::term::TermMode {
-        self.terms.get(surface).map(|t| t.mode()).unwrap_or_else(alacritty_terminal::term::TermMode::empty)
+    pub fn term_mode(&self, surface: &str) -> crate::term::Modes {
+        self.terms.get(surface).map(|t| t.mode()).unwrap_or_default()
     }
 
     /// Unsubscribe everything (window minimised/occluded): hidden panes must

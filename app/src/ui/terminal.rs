@@ -1,4 +1,4 @@
-//! Paint an `alacritty_terminal` grid into an egui rect.
+//! Paint a terminal grid into an egui rect.
 //!
 //! Costs are kept down for the 60 fps repaint path (review #13): the cell buffer
 //! and font metrics are reused between frames, adjacent cells that share a
@@ -13,12 +13,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
-use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::TermMode;
-use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
-
 use super::Ctx;
-use crate::term::{cell_colors, is_wide_spacer, viewport_point, SelectionType};
+use crate::term::{cell_colors, CursorShape, Flags, SelectionType, Underline, Wide};
 use crate::termio::{self, MouseAction, MouseButton};
 use crate::theme;
 
@@ -38,12 +34,15 @@ struct CellInfo {
     ch: char,
     fg: Color32,
     bg: Color32,
-    underline: bool,
+    underline: Underline,
+    underline_color: Color32,
+    strike: bool,
+    overline: bool,
     /// Leading half of a double-width character; the next cell is its spacer.
     wide: bool,
     /// Trailing half of a wide character: occupies a cell but draws no glyph.
     spacer: bool,
-    /// Combining marks that belong to `ch`.
+    /// Combining marks that draw over `ch` (see `Cell::overlay_marks`).
     zw: Vec<char>,
     /// Inside the mouse selection.
     selected: bool,
@@ -55,7 +54,10 @@ impl CellInfo {
             ch: ' ',
             fg: Color32::TRANSPARENT,
             bg: Color32::TRANSPARENT,
-            underline: false,
+            underline: Underline::None,
+            underline_color: Color32::TRANSPARENT,
+            strike: false,
+            overline: false,
             wide: false,
             spacer: false,
             zw: Vec::new(),
@@ -185,7 +187,7 @@ fn pointer_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Gri
                         let hover = over && grid_contains(grid, pos);
                         if hover
                             && !mods_now.shift
-                            && mode.contains(TermMode::MOUSE_MOTION)
+                            && mode.mouse_motion
                             && p.last_cell != Some((row, col))
                         {
                             p.last_cell = Some((row, col));
@@ -300,12 +302,12 @@ fn wheel_input(ui: &egui::Ui, resp: &egui::Response, surface: &str, grid: &Grid,
         return;
     }
     let pty_attached = c.state.local_ptys.contains_key(surface);
-    if pty_attached && mode.contains(TermMode::ALT_SCREEN) {
+    if pty_attached && mode.alt_screen {
         // tmux drives this PTY through the alternate screen, which keeps no
         // history, so the local grid has nothing to scroll: arrow keys are
         // what the pane's application (and tmux's own copy-mode) understands.
         let key = if lines > 0 { egui::Key::ArrowUp } else { egui::Key::ArrowDown };
-        let app_cursor = mode.contains(TermMode::APP_CURSOR);
+        let app_cursor = mode.app_cursor;
         let seq = crate::keys::terminal_key_mode(key, egui::Modifiers::default(), app_cursor).unwrap_or_default();
         c.state.write_local(surface, &seq.repeat(count));
     } else if pty_attached {
@@ -426,8 +428,46 @@ fn paint_block(painter: &egui::Painter, cell: Rect, ch: char, fg: Color32, ppp: 
     true
 }
 
-fn color32(rgb: Rgb) -> Color32 {
-    Color32::from_rgb(rgb.r, rgb.g, rgb.b)
+fn color32(rgb: [u8; 3]) -> Color32 {
+    Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+}
+
+/// Draw an underline of `style` across `x0..x1` with its bottom edge at `y`.
+fn paint_underline(painter: &egui::Painter, x0: f32, x1: f32, y: f32, style: Underline, color: Color32) {
+    let line = |a: Pos2, b: Pos2| {
+        painter.line_segment([a, b], Stroke::new(1.0, color));
+    };
+    match style {
+        Underline::None => {}
+        Underline::Single => line(Pos2::new(x0, y), Pos2::new(x1, y)),
+        Underline::Double => {
+            line(Pos2::new(x0, y), Pos2::new(x1, y));
+            line(Pos2::new(x0, y - 2.0), Pos2::new(x1, y - 2.0));
+        }
+        Underline::Curly => {
+            let points: Vec<Pos2> = {
+                let mut v = Vec::new();
+                let mut x = x0;
+                let mut up = false;
+                while x < x1 {
+                    v.push(Pos2::new(x, if up { y - 2.0 } else { y }));
+                    x += 2.0;
+                    up = !up;
+                }
+                v.push(Pos2::new(x1, if up { y - 2.0 } else { y }));
+                v
+            };
+            painter.add(egui::Shape::line(points, Stroke::new(1.0, color)));
+        }
+        Underline::Dotted | Underline::Dashed => {
+            let (on, off) = if style == Underline::Dotted { (1.0, 2.0) } else { (4.0, 2.0) };
+            let mut x = x0;
+            while x < x1 {
+                line(Pos2::new(x, y), Pos2::new((x + on).min(x1), y));
+                x += on + off;
+            }
+        }
+    }
 }
 
 /// Call `f(start_column, length, bg)` for each run of cells in `row` that share
@@ -546,8 +586,7 @@ fn interact(ui: &mut egui::Ui, rect: Rect, surface: &str, grid: &Grid, c: &mut C
 /// brighter while scrolled back or hovered, as in cmux.
 fn scrollbar(painter: &egui::Painter, rect: Rect, surface: &str, rows: u16, resp: &egui::Response, c: &Ctx) {
     if let Some(tv) = c.state.terms.get(surface) {
-        use alacritty_terminal::grid::Dimensions;
-        let history = tv.term().grid().history_size();
+        let history = tv.history_rows();
         if history > 0 {
             let offset = tv.display_offset();
             let total = (history + rows as usize) as f32;
@@ -587,8 +626,8 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, focused: bool, c: &mu
     let origin = Pos2::new(rect.min.x + PAD, rect.min.y + PAD);
     let grid = Grid { origin, w: metrics.w, h: metrics.h, cols: cols as usize, rows: rows as usize };
     let (resp, hover_link) = interact(ui, rect, surface, &grid, c);
-    let default_fg = Rgb { r: theme::TERM_FG.r(), g: theme::TERM_FG.g(), b: theme::TERM_FG.b() };
-    let default_bg = Rgb { r: theme::TERM_BG.r(), g: theme::TERM_BG.g(), b: theme::TERM_BG.b() };
+    let default_fg = [theme::TERM_FG.r(), theme::TERM_FG.g(), theme::TERM_FG.b()];
+    let default_bg = [theme::TERM_BG.r(), theme::TERM_BG.g(), theme::TERM_BG.b()];
     let bg_default = color32(default_bg);
 
     let (cols_usize, rows_usize) = (cols as usize, rows as usize);
@@ -606,9 +645,8 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, focused: bool, c: &mu
             SCRATCH.with(|s| s.borrow_mut().cells = cells);
             return;
         };
-        let content = tv.term().renderable_content();
-        let display_offset = content.display_offset;
-        let selection = content.selection;
+        let term_grid = tv.grid();
+        let term_grid = &*term_grid;
 
         // A grid smaller than the pane (another viewer sized the pane) leaves
         // cells it does not cover: blank them, the scratch holds old frames.
@@ -616,42 +654,35 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, focused: bool, c: &mu
             cells[..n].fill(CellInfo::blank());
         }
 
-        for cell in content.display_iter {
-            // Grid lines run negative into history; the viewport row adds back
-            // how far the view is scrolled.
-            let row = cell.point.line.0 + display_offset as i32;
-            if row < 0 || row as usize >= rows_usize {
-                continue;
-            }
-            let col = cell.point.column.0;
-            if col >= cols_usize {
-                continue;
-            }
-            let info = &cell.cell;
-            let (fg, bg) = cell_colors(info.fg, info.bg, info.flags, default_fg, default_bg);
-            let spacer = is_wide_spacer(info.flags);
-            let hidden = info.flags.contains(Flags::HIDDEN);
-            let ch = if spacer || hidden { ' ' } else { info.c };
-            let dst = &mut cells[row as usize * cols_usize + col];
-            dst.ch = ch;
-            dst.fg = color32(fg);
-            dst.bg = color32(bg);
-            dst.underline = info.flags.intersects(Flags::ALL_UNDERLINES);
-            dst.wide = info.flags.contains(Flags::WIDE_CHAR);
-            dst.spacer = spacer;
-            dst.selected = selection.is_some_and(|s| s.contains(cell.point));
-            dst.zw.clear();
-            if !spacer && !hidden {
-                if let Some(zw) = info.zerowidth() {
-                    dst.zw.extend_from_slice(zw);
+        for r in 0..rows_usize.min(term_grid.rows) {
+            for (col, info) in term_grid.row(r).iter().enumerate().take(cols_usize) {
+                let (fg, bg) = cell_colors(info, term_grid, default_fg, default_bg);
+                let spacer = info.is_spacer();
+                let hidden = info.flags.contains(Flags::INVISIBLE);
+                let ch = if spacer || hidden { ' ' } else { info.ch };
+                let dst = &mut cells[r * cols_usize + col];
+                dst.ch = ch;
+                dst.fg = color32(fg);
+                dst.bg = color32(bg);
+                dst.underline = info.underline;
+                dst.underline_color = match info.underline_color {
+                    crate::term::Color::Default => dst.fg,
+                    u => color32(crate::term::resolve(u, term_grid, default_fg)),
+                };
+                dst.strike = info.flags.contains(Flags::STRIKE);
+                dst.overline = info.flags.contains(Flags::OVERLINE);
+                dst.wide = info.wide == Wide::Head;
+                dst.spacer = spacer;
+                dst.selected = term_grid.selected(r, col);
+                dst.zw.clear();
+                if !spacer && !hidden {
+                    dst.zw.extend(info.overlay_marks());
                 }
             }
         }
-        if content.mode.contains(TermMode::SHOW_CURSOR) {
-            if let Some((r, col)) = viewport_point(display_offset, content.cursor.point) {
-                if r < rows_usize && col < cols_usize {
-                    cursor = Some((r, col, content.cursor.shape));
-                }
+        if let (true, Some((r, col))) = (term_grid.cursor.visible, term_grid.cursor.pos) {
+            if r < rows_usize && col < cols_usize {
+                cursor = Some((r, col, term_grid.cursor.shape));
             }
         }
     }
@@ -686,7 +717,7 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, focused: bool, c: &mu
         }
     }
 
-    let draw_run = |run: &mut String, col: usize, y: f32, fg: Color32, underline: bool, len: usize| {
+    let draw_run = |run: &mut String, col: usize, y: f32, fg: Color32| {
         let text = run.trim_end();
         if text.is_empty() {
             run.clear();
@@ -694,14 +725,6 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, focused: bool, c: &mu
         }
         let x = origin.x + col as f32 * metrics.w;
         painter.text(Pos2::new(x, y), Align2::LEFT_TOP, text, metrics.font.clone(), fg);
-        if underline {
-            // Character count × cell width (review #13): no text layout needed.
-            let w = len as f32 * metrics.w;
-            painter.line_segment(
-                [Pos2::new(x, y + metrics.h - 1.0), Pos2::new(x + w, y + metrics.h - 1.0)],
-                Stroke::new(1.0, fg),
-            );
-        }
         run.clear();
     };
 
@@ -715,30 +738,23 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, focused: bool, c: &mu
         let mut run = String::new();
         let mut run_col = 0usize;
         let mut run_fg = Color32::TRANSPARENT;
-        let mut run_underline = false;
-        let mut run_len = 0usize;
 
         for (col, info) in row.iter().enumerate() {
             if info.spacer {
-                draw_run(&mut run, run_col, y, run_fg, run_underline, run_len);
-                run_len = 0;
+                draw_run(&mut run, run_col, y, run_fg);
                 continue;
             }
             if info.ch.is_ascii() {
-                if !run.is_empty() && (info.fg != run_fg || info.underline != run_underline) {
-                    draw_run(&mut run, run_col, y, run_fg, run_underline, run_len);
-                    run_len = 0;
+                if !run.is_empty() && info.fg != run_fg {
+                    draw_run(&mut run, run_col, y, run_fg);
                 }
                 if run.is_empty() {
                     run_col = col;
                     run_fg = info.fg;
-                    run_underline = info.underline;
                 }
                 run.push(info.ch);
-                run_len += 1;
             } else {
-                draw_run(&mut run, run_col, y, run_fg, run_underline, run_len);
-                run_len = 0;
+                draw_run(&mut run, run_col, y, run_fg);
                 let x = origin.x + col as f32 * metrics.w;
                 let cell = Rect::from_min_size(Pos2::new(x, y), Vec2::new(metrics.w, metrics.h));
                 if paint_block(&painter, cell, info.ch, info.fg, ppp) {
@@ -755,16 +771,39 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, focused: bool, c: &mu
                         info.fg,
                     );
                 }
-                if info.underline {
-                    let w = if info.wide { 2.0 } else { 1.0 } * metrics.w;
-                    painter.line_segment(
-                        [Pos2::new(x, y + metrics.h - 1.0), Pos2::new(x + w, y + metrics.h - 1.0)],
-                        Stroke::new(1.0, info.fg),
-                    );
-                }
             }
         }
-        draw_run(&mut run, run_col, y, run_fg, run_underline, run_len);
+        draw_run(&mut run, run_col, y, run_fg);
+
+        // Underlines, strikethrough and overline: one line per run of cells
+        // that share the decoration and its colour.
+        let mut col = 0;
+        while col < cols_usize {
+            let info = &row[col];
+            if info.underline == Underline::None && !info.strike && !info.overline {
+                col += 1;
+                continue;
+            }
+            let start = col;
+            while col < cols_usize
+                && row[col].underline == info.underline
+                && row[col].underline_color == info.underline_color
+                && row[col].strike == info.strike
+                && row[col].overline == info.overline
+                && row[col].fg == info.fg
+            {
+                col += 1;
+            }
+            let (x0, x1) = (origin.x + start as f32 * metrics.w, origin.x + col as f32 * metrics.w);
+            paint_underline(&painter, x0, x1, y + metrics.h - 1.0, info.underline, info.underline_color);
+            if info.strike {
+                let sy = y + (metrics.h * 0.5).floor();
+                painter.line_segment([Pos2::new(x0, sy), Pos2::new(x1, sy)], Stroke::new(1.0, info.fg));
+            }
+            if info.overline {
+                painter.line_segment([Pos2::new(x0, y + 0.5), Pos2::new(x1, y + 0.5)], Stroke::new(1.0, info.fg));
+            }
+        }
     }
 
     if let Some((r, link)) = &hover_link {
@@ -793,7 +832,7 @@ pub fn paint(ui: &mut egui::Ui, rect: Rect, surface: &str, focused: bool, c: &mu
                 );
                 painter.rect_filled(line, 0.0, cursor_color);
             }
-            CursorShape::HollowBlock => {
+            CursorShape::Hollow => {
                 painter.rect_stroke(cell_rect, 0.0, Stroke::new(1.0, cursor_color), egui::StrokeKind::Inside);
             }
             _ => {

@@ -1114,8 +1114,8 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
     match kind {
         Some(SurfaceKind::Terminal { .. }) => {
             let mode = c.state.term_mode(&sid);
-            let bracketed = mode.contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
-            let app_cursor = mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR);
+            let bracketed = mode.bracketed_paste;
+            let app_cursor = mode.app_cursor;
             let mut bytes: Vec<u8> = Vec::new();
             let mut copy = false;
             // Cmd+V with an image (no text) on the clipboard: egui reports
