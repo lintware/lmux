@@ -1,0 +1,28 @@
+# lmux-gateway: the always-on phone gateway as a systemd --user service.
+#
+# Serves this server's sessions, and those of the servers listed in
+# ~/.config/lmux/gateway.env, to a phone through a Cloudflare Quick Tunnel.
+# The laptop app asks it for pairing codes over SSH (`lmux share-code`).
+# Installed by deploy/install-gateway.sh.
+#
+# When cloudflared exits the address is dead, so the share exits and systemd
+# starts it again with a new address (written to ~/.local/state/lmux/share.json).
+
+[Unit]
+Description=lmux phone gateway (Cloudflare Quick Tunnel)
+After=network-online.target lmuxd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# LMUX_GATEWAY_ARGS holds the --server flags and --allow-typing.
+EnvironmentFile=-%h/.config/lmux/gateway.env
+ExecStart=/bin/sh -c 'exec "$HOME/.local/bin/lmux" share --service $LMUX_GATEWAY_ARGS'
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
