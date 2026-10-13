@@ -2308,6 +2308,7 @@ dependencies = [
  "portable-pty",
  "serde",
  "serde_json",
+ "tempfile",
  "tiny-skia",
  "wry",
  "zune-jpeg",

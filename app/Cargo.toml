@@ -45,6 +45,7 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["snapshot", "wgpu"] }
+tempfile = "3"
 
 [profile.dev]
 opt-level = 1
