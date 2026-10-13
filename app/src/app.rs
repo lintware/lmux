@@ -792,6 +792,9 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
                 Color32::from_rgb(0x2C, 0x1C, 0x18),
                 Color32::from_rgb(0xE0, 0xA8, 0x96),
                 match c.net.last_error.as_deref() {
+                    Some(err) if c.net.needs_update() => {
+                        format!("{err} · right-click the host in the sidebar › Install or Update lmux on Host")
+                    }
                     Some(err) => format!("disconnected · {err}"),
                     None => "disconnected — reconnecting…".to_owned(),
                 },

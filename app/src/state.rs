@@ -1489,6 +1489,8 @@ impl AppState {
                 }
             }
             ServerMsg::Log { .. } => {}
+            // `Net` stops the connection on this; nothing is left to show here.
+            ServerMsg::Incompatible { .. } => {}
             ServerMsg::AppBrowserCall { id, surface, op } => {
                 self.app_calls.push(AppCall { id, surface, op, since: Instant::now() });
             }
