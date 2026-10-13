@@ -292,7 +292,7 @@ pub fn badge(p: &Painter, center: Pos2, count: u32) {
     let w = (7.0 + text.len() as f32 * 6.0).max(14.0);
     let r = Rect::from_center_size(center, Vec2::new(w, 14.0));
     p.rect_filled(r, egui::CornerRadius::same(7), crate::theme::BADGE);
-    p.text(center, egui::Align2::CENTER_CENTER, text, crate::theme::ui_semibold(9.5), crate::theme::MAIN_BG);
+    p.text(center, egui::Align2::CENTER_CENTER, text, crate::theme::ui_semibold(9.5), Color32::WHITE);
 }
 
 /// The app icon's pixel flame, one string per row (`deploy/macos/make-icon.swift`

@@ -262,6 +262,11 @@ pub enum ClientMsg {
     Hello {
         protocol_version: u32,
         client_name: String,
+        /// The app runs this host's browser pages itself (in WebKit, with the
+        /// network sent through the host). New browser tabs become `in_app`
+        /// while such an app is connected.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        draws_browsers: bool,
     },
     Rpc {
         request: RpcRequest,

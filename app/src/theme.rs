@@ -1,40 +1,44 @@
-//! Colours, metrics and font ids. The palette is the pixel-fire look of the
-//! app icon and https://lmux.lintlabs.org: warm ink, cream text, flame accents.
+//! Colours, metrics and font ids. A quiet graphite palette: near-neutral
+//! ink, soft off-white text, and one muted terracotta accent (the app icon's
+//! flame, toned down) kept for the few things that are "current".
 
 use egui::{Color32, FontFamily, FontId, Vec2};
 
 // --- colours ---------------------------------------------------------------
 
-/// The site's ink (`#12110e`) for the terminal area, a step lighter for chrome.
-pub const SIDEBAR_BG: Color32 = Color32::from_rgb(0x1A, 0x18, 0x14);
-pub const MAIN_BG: Color32 = Color32::from_rgb(0x12, 0x11, 0x0E);
-pub const HAIRLINE: Color32 = Color32::from_rgb(0x2E, 0x2A, 0x23);
-pub const HAIRLINE_SOFT: Color32 = Color32::from_rgb(0x25, 0x22, 0x1C);
+/// Near-neutral ink for the terminal area, a step lighter for chrome.
+pub const SIDEBAR_BG: Color32 = Color32::from_rgb(0x18, 0x17, 0x15);
+pub const MAIN_BG: Color32 = Color32::from_rgb(0x11, 0x11, 0x10);
+pub const HAIRLINE: Color32 = Color32::from_rgb(0x2A, 0x29, 0x26);
+pub const HAIRLINE_SOFT: Color32 = Color32::from_rgb(0x22, 0x21, 0x1F);
 
 /// Top strip, tab strip and status bar sit a touch lighter than the main area.
-pub const STRIP_BG: Color32 = Color32::from_rgb(0x1A, 0x18, 0x14);
-pub const STATUS_BG: Color32 = Color32::from_rgb(0x1A, 0x18, 0x14);
+pub const STRIP_BG: Color32 = Color32::from_rgb(0x18, 0x17, 0x15);
+pub const STATUS_BG: Color32 = Color32::from_rgb(0x18, 0x17, 0x15);
 
-pub const TEXT: Color32 = Color32::from_rgb(0xF3, 0xF0, 0xE7);
-pub const TEXT_SOFT: Color32 = Color32::from_rgb(0xD8, 0xD4, 0xC9);
-pub const DIM: Color32 = Color32::from_rgb(0xA3, 0x9E, 0x90);
-pub const DIM_2: Color32 = Color32::from_rgb(0x74, 0x72, 0x68);
+pub const TEXT: Color32 = Color32::from_rgb(0xE2, 0xDF, 0xD8);
+pub const TEXT_SOFT: Color32 = Color32::from_rgb(0xBF, 0xBB, 0xB2);
+pub const DIM: Color32 = Color32::from_rgb(0x8C, 0x88, 0x80);
+pub const DIM_2: Color32 = Color32::from_rgb(0x64, 0x61, 0x5B);
 
-/// lmux orange-red, the flame's body.
-pub const ACCENT: Color32 = Color32::from_rgb(0xD9, 0x43, 0x20);
-pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0xF0, 0x7A, 0x3C);
-/// The flame's lighter orange.
-pub const FLAME: Color32 = Color32::from_rgb(0xF0, 0x7A, 0x3C);
-pub const GREEN: Color32 = Color32::from_rgb(0x3D, 0xE0, 0x7A);
-pub const RED: Color32 = Color32::from_rgb(0xF0, 0x56, 0x3C);
-pub const AMBER: Color32 = Color32::from_rgb(0xFF, 0xC2, 0x7A);
+/// Muted terracotta: the selected card's edge, the active tab, drop targets.
+pub const ACCENT: Color32 = Color32::from_rgb(0xC2, 0x6B, 0x48);
+pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0xD4, 0x85, 0x62);
+/// A softer, lighter accent for small marks.
+pub const FLAME: Color32 = Color32::from_rgb(0xC9, 0x8A, 0x68);
+pub const GREEN: Color32 = Color32::from_rgb(0x82, 0xB5, 0x8E);
+pub const RED: Color32 = Color32::from_rgb(0xD0, 0x6E, 0x5A);
+pub const AMBER: Color32 = Color32::from_rgb(0xD6, 0xAA, 0x68);
 
-pub const TERM_FG: Color32 = Color32::from_rgb(0xEA, 0xE6, 0xDC);
-pub const TERM_BG: Color32 = Color32::from_rgb(0x12, 0x11, 0x0E);
-pub const TERM_CURSOR: Color32 = Color32::from_rgb(0xF0, 0x7A, 0x3C);
+pub const TERM_FG: Color32 = Color32::from_rgb(0xDE, 0xDB, 0xD3);
+pub const TERM_BG: Color32 = Color32::from_rgb(0x11, 0x11, 0x10);
+pub const TERM_CURSOR: Color32 = Color32::from_rgb(0xC9, 0x8A, 0x68);
 
-pub const CARD_SELECTED: Color32 = Color32::from_rgb(0xD9, 0x43, 0x20);
-pub const BADGE: Color32 = Color32::from_rgb(0xF0, 0x7A, 0x3C);
+/// The selected card: a raised neutral plate, not a coloured one.
+pub const CARD_SELECTED: Color32 = Color32::from_rgb(0x2B, 0x29, 0x26);
+pub const BADGE: Color32 = Color32::from_rgb(0xB0, 0x64, 0x46);
+/// Folder icons: present, not shouting.
+pub const FOLDER: Color32 = Color32::from_rgb(0x8C, 0x7F, 0x72);
 
 // --- metrics ---------------------------------------------------------------
 
@@ -58,6 +62,12 @@ pub fn chip_active_bg() -> Color32 {
 
 pub fn chip_hover_bg() -> Color32 {
     Color32::from_white_alpha(7)
+}
+
+/// A faint amber wash behind whatever waits for the user: a card whose agent
+/// needs input, and the host header's "waiting" count.
+pub fn attention_bg() -> Color32 {
+    Color32::from_rgba_unmultiplied(0xD6, 0xAA, 0x68, 16)
 }
 
 /// macOS keeps its traffic lights visible over the full-size content view;
