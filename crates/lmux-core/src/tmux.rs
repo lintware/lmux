@@ -1214,6 +1214,57 @@ mod tests {
         assert!(alive, "control client should still accept commands");
     }
 
+    /// The server tells the app's client terminal what it can pass through,
+    /// and styled output survives a capture.
+    #[tokio::test]
+    async fn the_server_passes_styles_through() {
+        if !tmux_available().await {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        let socket = format!("lmux-test-features-{}", std::process::id());
+        let _scratch = ScratchServer(socket.clone());
+        let cfg = TmuxConfig { socket: socket.clone(), session: "lmux".into() };
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let tmux = match Tmux::spawn(cfg, ev_tx).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping: could not start tmux ({e})");
+                return;
+            }
+        };
+        let show = |args: &[&str]| {
+            let out = std::process::Command::new("tmux").args(["-L", &socket]).args(args).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let features = show(&["show", "-s", "terminal-features"]);
+        for f in TERMINAL_FEATURES {
+            assert!(features.contains(&format!("xterm*:{f}")), "{f} missing in {features}");
+        }
+        let term = show(&["show", "-g", "default-terminal"]);
+        assert!(term.contains("tmux-256color") || term.contains("screen-256color"), "{term}");
+
+        tmux.new_terminal(
+            "/tmp",
+            Some("printf '\\033[4:3;58;2;255;0;0mcurly\\033[0m \\033[3mital\\033[0m \\033]8;;http://x.test\\033\\\\link\\033]8;;\\033\\\\\\n'; sleep 30"),
+            &[],
+            80,
+            24,
+            "t",
+            "surface:1",
+            "workspace:1",
+        )
+        .await
+        .expect("new_terminal");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let panes = show(&["list-panes", "-a", "-F", "#{pane_id}"]);
+        let pane = panes.lines().last().unwrap_or("%1");
+        let cap = show(&["capture-pane", "-p", "-e", "-t", pane]);
+        assert!(cap.contains("\x1b[4:3m") && cap.contains("58;2;255;0;0"), "{cap:?}");
+        assert!(cap.contains("\x1b[3m"), "{cap:?}");
+        assert!(cap.contains("\x1b]8;;http://x.test"), "{cap:?}");
+    }
+
     /// A paused pane sends no `%output` but keeps running (tmux still reads
     /// it, so `window_activity` moves); continued, it streams again.
     #[tokio::test]
