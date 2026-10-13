@@ -235,7 +235,10 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool, first: bool) -> bool {
     let (dot, mut status, mut status_color) = match c.net.state {
         ConnState::Connected => (theme::GREEN, String::new(), theme::DIM_2),
         ConnState::Connecting => (theme::AMBER, "connecting…".to_owned(), theme::AMBER),
-        ConnState::Disconnected => (theme::RED, "offline".to_owned(), theme::RED),
+        ConnState::Disconnected => {
+            let label = c.net.attention.map_or("offline", |a| a.status());
+            (theme::RED, label.to_owned(), if c.net.attention.is_some() { theme::AMBER } else { theme::RED })
+        }
     };
     // An install in progress (or failed) says so instead.
     // A cloud box being deleted says that instead.
@@ -311,7 +314,8 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool, first: bool) -> bool {
         resp.clone().on_hover_text(format!("{why}\n(full log in ~/.local/state/lmux/{log}.log)"));
     } else if let (ConnState::Disconnected, Some(err)) = (c.net.state, c.net.last_error.as_deref()) {
         // Why the host is offline, without opening it.
-        resp.clone().on_hover_text(err.to_owned());
+        let hint = if c.net.needs_update() { "\nRight-click › Install or Update lmux on Host" } else { "" };
+        resp.clone().on_hover_text(format!("{err}{hint}"));
     }
 
     if resp.clicked() {

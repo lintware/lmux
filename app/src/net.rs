@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use ewebsock::{Options, WsEvent, WsMessage, WsReceiver, WsSender};
@@ -587,6 +587,10 @@ fn ensure_master(target: &str) -> Result<PathBuf, String> {
         }
         let _ = std::fs::remove_file(&sock);
     }
+    // ssh forks into the background and keeps its stderr, so a pipe would
+    // never reach EOF; a file holds what it said before it forked.
+    let err_path = sock.with_extension("err");
+    let err_file = std::fs::File::create(&err_path).map(Stdio::from).unwrap_or_else(|_| Stdio::null());
     let status = Command::new("ssh")
         .args(["-fN", "-M"])
         .arg("-o")
@@ -603,12 +607,19 @@ fn ensure_master(target: &str) -> Result<PathBuf, String> {
         .arg("ServerAliveCountMax=3")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(err_file)
         .arg(target)
         .status()
         .map_err(|e| format!("spawn ssh master: {e}"))?;
+    let said = std::fs::read_to_string(&err_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&err_path);
     if !status.success() {
-        return Err(format!("ssh master to {target} failed ({status})"));
+        let said = said.trim();
+        return Err(if said.is_empty() {
+            format!("ssh master to {target} failed ({status})")
+        } else {
+            format!("ssh master to {target} failed ({status}): {said}")
+        });
     }
     mark_master_owned(target);
     let start = Instant::now();
@@ -756,9 +767,159 @@ impl ConnState {
     }
 }
 
-enum Resolve {
-    Idle,
-    Pending(Receiver<Result<(String, Option<Tunnel>), String>>),
+/// Why a connection was lost, as far as it decides what to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// The network, the tunnel or the daemon is down or slow: retry with backoff.
+    Transient,
+    /// ssh refused the login. Retrying cannot help until the user acts.
+    Auth,
+    /// ssh does not trust the host's key.
+    HostKey,
+    /// The daemon and the app speak different protocol versions.
+    Version,
+}
+
+impl ErrorClass {
+    /// Errors that stop the retries and wait for the user.
+    pub fn needs_attention(self) -> bool {
+        self != ErrorClass::Transient
+    }
+
+    /// The sidebar's one- or two-word status.
+    pub fn status(self) -> &'static str {
+        match self {
+            ErrorClass::Transient => "offline",
+            ErrorClass::Auth => "ssh login refused",
+            ErrorClass::HostKey => "host key rejected",
+            ErrorClass::Version => "needs update",
+        }
+    }
+}
+
+/// Sort an error message (ssh's own words, or ewebsock's) into what to do next.
+pub fn classify_error(raw: &str) -> ErrorClass {
+    let t = raw.to_lowercase();
+    const HOST_KEY: [&str; 4] = [
+        "host key verification failed",
+        "remote host identification has changed",
+        "no matching host key type",
+        "offending key",
+    ];
+    const AUTH: [&str; 4] = [
+        "permission denied",
+        "too many authentication failures",
+        "no supported authentication methods",
+        "authentication failed",
+    ];
+    if HOST_KEY.iter().any(|p| t.contains(p)) {
+        ErrorClass::HostKey
+    } else if AUTH.iter().any(|p| t.contains(p)) {
+        ErrorClass::Auth
+    } else {
+        ErrorClass::Transient
+    }
+}
+
+/// A short sentence for the sidebar tooltip and the banner.
+pub fn humanize_error(class: ErrorClass, raw: &str) -> String {
+    match class {
+        ErrorClass::Auth => "ssh login refused (permission denied): check the key or ssh-agent for this host".to_owned(),
+        ErrorClass::HostKey => "ssh host key check failed: fix ~/.ssh/known_hosts, then Refresh Connection".to_owned(),
+        ErrorClass::Version => raw.to_owned(),
+        ErrorClass::Transient => {
+            let line = raw.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" · ");
+            match line.char_indices().nth(160) {
+                Some((i, _)) => format!("{}…", &line[..i]),
+                None if line.is_empty() => "connection failed".to_owned(),
+                None => line,
+            }
+        }
+    }
+}
+
+/// Retry delays: quick at first (a blip, a wake from sleep), then doubling to
+/// a minute so a host that is really gone is not hammered.
+const BACKOFF_FIRST: [f64; 4] = [0.3, 0.6, 1.0, 2.0];
+const BACKOFF_CAP_SECS: f64 = 60.0;
+const BACKOFF_JITTER: f64 = 0.1;
+/// A connection must stay healthy this long before the delays start over;
+/// one that dies sooner (a daemon that accepts and drops) keeps them growing.
+pub const BACKOFF_STABLE: Duration = Duration::from_secs(60);
+/// A websocket that has not opened by now is given up on (a stopped daemon
+/// still accepts TCP connections, so nothing else would end the wait).
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The whole attempt, tunnel included.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// The delay before retry number `attempt` (0 is the first), without jitter.
+pub fn backoff_base(attempt: u32) -> f64 {
+    match BACKOFF_FIRST.get(attempt as usize) {
+        Some(s) => *s,
+        None => (2.0 * 2f64.powi((attempt - 4).min(10) as i32)).min(BACKOFF_CAP_SECS),
+    }
+}
+
+/// `base` spread by ±10 % with `unit` in `[0, 1]`, never above the cap.
+pub fn jittered(base: f64, unit: f64) -> f64 {
+    (base * (1.0 + BACKOFF_JITTER * (2.0 * unit.clamp(0.0, 1.0) - 1.0))).min(BACKOFF_CAP_SECS)
+}
+
+fn jitter_unit() -> f64 {
+    let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    (n % 1000) as f64 / 999.0
+}
+
+#[derive(Debug, Default)]
+pub struct Backoff {
+    attempt: u32,
+    /// When the current connection became usable.
+    healthy_since: Option<Instant>,
+}
+
+impl Backoff {
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// Start over (a manual refresh, a host switch).
+    pub fn reset(&mut self) {
+        *self = Backoff::default();
+    }
+
+    /// The connection is usable from `now` (the daemon said hello).
+    pub fn healthy(&mut self, now: Instant) {
+        self.healthy_since = Some(now);
+    }
+
+    /// Forget past failures once the connection has been healthy long enough.
+    pub fn settle(&mut self, now: Instant) {
+        if self.healthy_since.is_some_and(|s| now.saturating_duration_since(s) >= BACKOFF_STABLE) {
+            self.attempt = 0;
+        }
+    }
+
+    /// The connection is lost at `now`: how long to wait before the next try.
+    pub fn next_delay(&mut self, now: Instant, unit: f64) -> Duration {
+        self.settle(now);
+        self.healthy_since = None;
+        let secs = jittered(backoff_base(self.attempt), unit);
+        self.attempt = self.attempt.saturating_add(1);
+        Duration::from_secs_f64(secs)
+    }
+}
+
+/// Whether an event tagged `event` still belongs to the connection attempt
+/// `current`. Every attempt (tunnel resolve plus websocket) has its own
+/// number, and anything older is a late answer from one that was given up.
+pub fn is_current(event: u64, current: u64) -> bool {
+    event == current
+}
+
+/// The outcome of a tunnel resolve, tagged with the attempt that asked.
+struct Resolved {
+    generation: u64,
+    result: Result<(String, Option<Tunnel>), String>,
 }
 
 pub struct Net {
@@ -767,13 +928,24 @@ pub struct Net {
     pub state: ConnState,
     pub server_version: String,
     pub url: Option<String>,
+    /// A short human-readable reason the host is down.
     pub last_error: Option<String>,
-    pub attempt: u32,
+    /// Set when retrying cannot help until the user acts (login refused, host
+    /// key rejected, version mismatch). Cleared by the next connect attempt.
+    pub attention: Option<ErrorClass>,
+    backoff: Backoff,
+    /// Number of the current connect attempt; see [`is_current`].
+    generation: u64,
+    /// The attempt the open websocket belongs to.
+    ws_generation: u64,
+    resolve_tx: mpsc::Sender<Resolved>,
+    resolve_rx: Receiver<Resolved>,
+    /// When the attempt in flight is given up.
+    connect_deadline: Option<Instant>,
 
     sender: Option<WsSender>,
     receiver: Option<WsReceiver>,
     tunnel: Option<Tunnel>,
-    resolve: Resolve,
     retry_at: Option<Instant>,
     /// Outstanding app-level ping: `(rpc id, sent at)`. `None` when none pending.
     ping: Option<(u64, Instant)>,
@@ -839,6 +1011,7 @@ impl Net {
             .iter()
             .position(|h| h.kind != "direct")
             .unwrap_or(0);
+        let (resolve_tx, resolve_rx) = mpsc::channel();
         Self {
             hosts,
             host_index,
@@ -846,11 +1019,16 @@ impl Net {
             server_version: String::new(),
             url: None,
             last_error: None,
-            attempt: 0,
+            attention: None,
+            backoff: Backoff::default(),
+            generation: 0,
+            ws_generation: 0,
+            resolve_tx,
+            resolve_rx,
+            connect_deadline: None,
             sender: None,
             receiver: None,
             tunnel: None,
-            resolve: Resolve::Idle,
             retry_at: None,
             ping: None,
             last_ping: Instant::now(),
@@ -938,7 +1116,7 @@ impl Net {
         self.tunnel = None;
         self.drop_connection();
         self.host_index = index;
-        self.attempt = 0;
+        self.backoff.reset();
         self.retry_at = None;
         self.begin_connect(ctx);
     }
@@ -952,20 +1130,25 @@ impl Net {
         };
         self.state = ConnState::Connecting;
         self.last_error = None;
+        self.attention = None;
         self.retry_at = None;
         self.tunnel = None;
+        // Retires a socket that is still open (a reinstall reconnects a live host).
+        self.drop_connection();
+        self.generation += 1;
+        let generation = self.generation;
+        self.connect_deadline = Some(Instant::now() + CONNECT_TIMEOUT);
 
         if host.kind == "direct" {
             let url = host.url.clone().unwrap_or_else(|| MOCK_URL.to_owned());
-            self.open_ws(url);
+            self.open_ws(generation, url);
         } else {
-            let (tx, rx) = mpsc::channel();
-            self.resolve = Resolve::Pending(rx);
+            let tx = self.resolve_tx.clone();
             // The tunnel resolves on this thread, so it must wake the UI when it
             // is done: `poll` only runs during a repaint.
             let wake = self.wake.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(open_tunnel(&host));
+                let _ = tx.send(Resolved { generation, result: open_tunnel(&host) });
                 if let Some(ctx) = wake {
                     ctx.request_repaint();
                 }
@@ -974,9 +1157,10 @@ impl Net {
         self.wake();
     }
 
-    fn open_ws(&mut self, url: String) {
+    fn open_ws(&mut self, generation: u64, url: String) {
         let ctx = self.wake.clone();
-        match ewebsock::connect_with_wakeup(url.clone(), Options::default(), move || {
+        self.url = Some(url.clone());
+        match ewebsock::connect_with_wakeup(url, Options::default(), move || {
             if let Some(ctx) = &ctx {
                 ctx.request_repaint();
             }
@@ -984,14 +1168,10 @@ impl Net {
             Ok((sender, receiver)) => {
                 self.sender = Some(sender);
                 self.receiver = Some(receiver);
-                self.url = Some(url);
+                self.ws_generation = generation;
+                self.connect_deadline = Some(Instant::now() + WS_CONNECT_TIMEOUT);
             }
-            Err(e) => {
-                self.last_error = Some(e);
-                self.state = ConnState::Disconnected;
-                self.url = Some(url);
-                self.schedule_retry();
-            }
+            Err(e) => self.fail(Some(e)),
         }
     }
 
@@ -1068,9 +1248,13 @@ impl Net {
         self.send(&msg);
     }
 
+    /// Forget the websocket. The attempt number moves on, so a tunnel resolve
+    /// or socket event still on its way is ignored when it arrives.
     fn drop_connection(&mut self) {
         self.sender = None;
         self.receiver = None;
+        self.connect_deadline = None;
+        self.generation += 1;
     }
 
     /// Reconnect now, whatever the state: an attempt in flight is abandoned,
@@ -1086,17 +1270,18 @@ impl Net {
                 refresh_master(&target);
             }
         }
+        // A resolve still running keeps its thread but its answer is ignored.
         self.drop_connection();
-        // A resolve still running keeps its thread but its answer is dropped.
-        self.resolve = Resolve::Idle;
+        self.ping = None;
         self.state = ConnState::Disconnected;
-        self.attempt = 0;
+        self.backoff.reset();
         self.retry_at = None;
         self.begin_connect(ctx);
     }
 
     /// Skip the rest of a backoff wait, as when the window comes back into
-    /// focus after the Mac slept or changed network.
+    /// focus after the Mac slept or changed network. Does nothing for a host
+    /// that waits on the user (see [`Net::attention`]).
     pub fn retry_soon(&mut self) {
         if self.state == ConnState::Disconnected && self.retry_at.is_some() {
             self.retry_at = Some(Instant::now());
@@ -1105,71 +1290,128 @@ impl Net {
     }
 
     fn schedule_retry(&mut self) {
-        let secs = [0.3f64, 0.6, 1.0, 2.0, 3.0, 5.0][(self.attempt as usize).min(5)];
-        self.attempt = self.attempt.saturating_add(1);
-        self.retry_at = Some(Instant::now() + Duration::from_secs_f64(secs));
+        let delay = self.backoff.next_delay(Instant::now(), jitter_unit());
+        self.retry_at = Some(Instant::now() + delay);
+    }
+
+    /// The connection is lost or could not be made. Transient errors retry
+    /// after the backoff; the rest wait for the user.
+    fn fail(&mut self, raw: Option<String>) {
+        let class = raw.as_deref().map_or(ErrorClass::Transient, classify_error);
+        let message = raw.map(|r| humanize_error(class, &r));
+        self.fail_with(class, message);
+    }
+
+    fn fail_with(&mut self, class: ErrorClass, message: Option<String>) {
+        self.drop_connection();
+        self.ping = None;
+        self.state = ConnState::Disconnected;
+        if message.is_some() {
+            self.last_error = message;
+        }
+        if class.needs_attention() {
+            self.attention = Some(class);
+            self.retry_at = None;
+            self.tunnel = None;
+        } else {
+            self.schedule_retry();
+        }
+    }
+
+    /// A tunnel resolve finished. A late answer from an abandoned attempt is
+    /// dropped, which closes its tunnel.
+    fn on_resolved(&mut self, r: Resolved) {
+        if !is_current(r.generation, self.generation) {
+            return;
+        }
+        match r.result {
+            Ok((url, tunnel)) => {
+                self.tunnel = tunnel;
+                self.open_ws(r.generation, url);
+            }
+            Err(e) => self.fail(Some(e)),
+        }
+    }
+
+    /// One websocket event. Returns the message to hand on, if it is one.
+    fn on_ws_event(&mut self, generation: u64, ev: WsEvent) -> Option<WsMessage> {
+        if !is_current(generation, self.generation) {
+            return None;
+        }
+        match ev {
+            WsEvent::Opened => {
+                self.state = ConnState::Connected;
+                self.last_error = None;
+                self.connect_deadline = None;
+                self.ping = None;
+                self.last_ping = Instant::now();
+                self.send_hello();
+                None
+            }
+            WsEvent::Message(m) => {
+                if let WsMessage::Text(t) = &m {
+                    match wire::decode_server(t) {
+                        Some(ServerMsg::Welcome { protocol_version, .. }) if protocol_version != PROTOCOL_VERSION => {
+                            self.version_mismatch(protocol_version);
+                            return None;
+                        }
+                        Some(ServerMsg::Welcome { .. }) => self.backoff.healthy(Instant::now()),
+                        Some(ServerMsg::Incompatible { protocol_version, message, .. }) => {
+                            self.version_mismatch_msg(protocol_version, Some(message));
+                            return None;
+                        }
+                        // Any matching RpcResult answers the outstanding ping.
+                        Some(ServerMsg::RpcResult { response }) => {
+                            if self.ping.is_some_and(|(id, _)| id == response.id) {
+                                self.ping = None;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some(m)
+            }
+            WsEvent::Error(e) => {
+                self.fail(Some(e));
+                None
+            }
+            WsEvent::Closed => {
+                self.fail(None);
+                None
+            }
+        }
+    }
+
+    fn version_mismatch(&mut self, daemon: u32) {
+        self.version_mismatch_msg(daemon, None);
+    }
+
+    fn version_mismatch_msg(&mut self, daemon: u32, detail: Option<String>) {
+        let text = detail.unwrap_or_else(|| format!("lmux on this host speaks protocol v{daemon}, this app v{PROTOCOL_VERSION}"));
+        self.fail_with(ErrorClass::Version, Some(format!("needs update: {text}")));
     }
 
     /// Drive timers/reconnects and return the messages received this frame.
     pub fn poll(&mut self, ctx: &egui::Context) -> Vec<WsMessage> {
         let state_before = self.state;
         let error_before = self.last_error.clone();
-        // Tunnel resolution finished?
-        if let Resolve::Pending(rx) = &self.resolve {
-            match rx.try_recv() {
-                Ok(Ok((url, tunnel))) => {
-                    self.tunnel = tunnel;
-                    self.open_ws(url);
-                    self.resolve = Resolve::Idle;
-                }
-                Ok(Err(e)) => {
-                    self.last_error = Some(e);
-                    self.state = ConnState::Disconnected;
-                    self.schedule_retry();
-                    self.resolve = Resolve::Idle;
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    self.resolve = Resolve::Idle;
-                }
-            }
+        while let Ok(r) = self.resolve_rx.try_recv() {
+            self.on_resolved(r);
         }
 
         let mut out = Vec::new();
         while let Some(ev) = self.receiver.as_ref().and_then(|r| r.try_recv()) {
-            match ev {
-                WsEvent::Opened => {
-                    self.state = ConnState::Connected;
-                    self.attempt = 0;
-                    self.last_error = None;
-                    self.ping = None;
-                    self.last_ping = Instant::now();
-                    self.send_hello();
-                }
-                WsEvent::Message(m) => {
-                    // Any matching RpcResult answers the outstanding ping.
-                    if let WsMessage::Text(t) = &m {
-                        if let Some((id, _)) = self.ping {
-                            if let Some(ServerMsg::RpcResult { response }) = wire::decode_server(t) {
-                                if response.id == id {
-                                    self.ping = None;
-                                }
-                            }
-                        }
-                    }
-                    out.push(m)
-                }
-                WsEvent::Error(e) => {
-                    self.last_error = Some(e);
-                    self.drop_connection();
-                    self.state = ConnState::Disconnected;
-                    self.schedule_retry();
-                }
-                WsEvent::Closed => {
-                    self.drop_connection();
-                    self.state = ConnState::Disconnected;
-                    self.schedule_retry();
-                }
+            if let Some(m) = self.on_ws_event(self.ws_generation, ev) {
+                out.push(m);
+            }
+        }
+
+        if self.state == ConnState::Connecting && self.connect_deadline.is_some_and(|d| Instant::now() >= d) {
+            self.fail(Some("connect timed out".to_owned()));
+        }
+        if self.state == ConnState::Connecting {
+            if let Some(d) = self.connect_deadline {
+                ctx.request_repaint_after(d.saturating_duration_since(Instant::now()));
             }
         }
 
@@ -1191,13 +1433,10 @@ impl Net {
         // pong never arrives (review #14).
         if self.state == ConnState::Connected {
             let now = Instant::now();
+            self.backoff.settle(now);
             if let Some((_, sent)) = self.ping {
                 if now.duration_since(sent) >= PING_TIMEOUT {
-                    self.last_error = Some(format!("link timed out (no ping reply in {}s)", PING_TIMEOUT.as_secs()));
-                    self.ping = None;
-                    self.drop_connection();
-                    self.state = ConnState::Disconnected;
-                    self.schedule_retry();
+                    self.fail(Some(format!("link timed out (no ping reply in {}s)", PING_TIMEOUT.as_secs())));
                 }
             }
             if self.state == ConnState::Connected {
@@ -1219,6 +1458,17 @@ impl Net {
             self.wake();
         }
         out
+    }
+
+    /// How many retries in a row have failed since the connection was last
+    /// healthy for a stable period.
+    pub fn attempt(&self) -> u32 {
+        self.backoff.attempt()
+    }
+
+    /// The daemon on this host speaks another protocol version than the app.
+    pub fn needs_update(&self) -> bool {
+        self.attention == Some(ErrorClass::Version)
     }
 }
 
@@ -1256,5 +1506,243 @@ mod tunnel_cancel_tests {
         );
         let a = cancel_args("box", std::path::Path::new("/s"), "f", None);
         assert!(!a.contains(&"-D".to_owned()));
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    fn direct() -> HostConfig {
+        HostConfig {
+            name: "t".into(),
+            label: "t".into(),
+            kind: "direct".into(),
+            url: Some("ws://127.0.0.1:9".into()),
+            ssh_target: None,
+            remote_port: DEFAULT_REMOTE_PORT,
+            browser_scale: None,
+            stream_browsers: false,
+            cloud: None,
+        }
+    }
+
+    fn net() -> Net {
+        Net::with_hosts(vec![direct()])
+    }
+
+    #[test]
+    fn schedule_is_fast_first_then_doubles_to_the_cap() {
+        let got: Vec<f64> = (0..12).map(backoff_base).collect();
+        assert_eq!(got, [0.3, 0.6, 1.0, 2.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 60.0]);
+        assert_eq!(backoff_base(u32::MAX), 60.0);
+    }
+
+    #[test]
+    fn jitter_stays_within_ten_percent_and_under_the_cap() {
+        assert_eq!(jittered(10.0, 0.5), 10.0);
+        assert!((jittered(10.0, 0.0) - 9.0).abs() < 1e-9);
+        assert!((jittered(10.0, 1.0) - 11.0).abs() < 1e-9);
+        assert_eq!(jittered(60.0, 1.0), 60.0);
+        assert_eq!(jittered(10.0, 7.0), jittered(10.0, 1.0));
+    }
+
+    #[test]
+    fn delays_keep_growing_after_brief_connects() {
+        let t0 = Instant::now();
+        let mut b = Backoff::default();
+        let mut delays = Vec::new();
+        for i in 0..6u32 {
+            // Connected for a moment each time, then lost again.
+            let up = t0 + Duration::from_secs(u64::from(i) * 10);
+            b.healthy(up);
+            delays.push(b.next_delay(up + Duration::from_secs(5), 0.5).as_secs_f64());
+        }
+        assert_eq!(delays, [0.3, 0.6, 1.0, 2.0, 2.0, 4.0]);
+        assert_eq!(b.attempt(), 6);
+    }
+
+    #[test]
+    fn a_stable_connection_resets_the_delays() {
+        let t0 = Instant::now();
+        let mut b = Backoff::default();
+        for _ in 0..5 {
+            b.next_delay(t0, 0.5);
+        }
+        b.healthy(t0);
+        b.settle(t0 + BACKOFF_STABLE - Duration::from_secs(1));
+        assert_eq!(b.attempt(), 5, "not stable yet");
+        b.settle(t0 + BACKOFF_STABLE);
+        assert_eq!(b.attempt(), 0);
+        // The loss itself also settles first.
+        let mut b = Backoff::default();
+        for _ in 0..5 {
+            b.next_delay(t0, 0.5);
+        }
+        b.healthy(t0);
+        let d = b.next_delay(t0 + BACKOFF_STABLE + Duration::from_secs(1), 0.5);
+        assert_eq!(d, Duration::from_secs_f64(0.3));
+    }
+
+    #[test]
+    fn a_failure_without_a_healthy_connection_never_resets() {
+        let t0 = Instant::now();
+        let mut b = Backoff::default();
+        for _ in 0..3 {
+            b.next_delay(t0, 0.5);
+        }
+        b.settle(t0 + Duration::from_secs(3600));
+        assert_eq!(b.attempt(), 3);
+    }
+
+    #[test]
+    fn manual_reset_starts_over() {
+        let mut b = Backoff::default();
+        b.next_delay(Instant::now(), 0.5);
+        b.reset();
+        assert_eq!(b.attempt(), 0);
+    }
+
+    #[test]
+    fn only_the_current_generation_is_accepted() {
+        assert!(is_current(4, 4));
+        assert!(!is_current(3, 4));
+        assert!(!is_current(5, 4));
+    }
+
+    #[test]
+    fn a_stale_resolve_is_ignored() {
+        let mut n = net();
+        n.generation = 7;
+        n.state = ConnState::Connecting;
+        n.on_resolved(Resolved { generation: 6, result: Err("old failure".into()) });
+        assert_eq!(n.state, ConnState::Connecting);
+        assert!(n.last_error.is_none() && n.retry_at.is_none());
+        n.on_resolved(Resolved { generation: 7, result: Err("tunnel to box did not open port 1".into()) });
+        assert_eq!(n.state, ConnState::Disconnected);
+        assert!(n.last_error.as_deref().unwrap().contains("did not open"));
+        assert!(n.retry_at.is_some());
+    }
+
+    #[test]
+    fn stale_socket_events_do_not_touch_the_current_connection() {
+        let mut n = net();
+        n.generation = 3;
+        n.state = ConnState::Connected;
+        assert!(n.on_ws_event(2, WsEvent::Closed).is_none());
+        assert!(n.on_ws_event(2, WsEvent::Error("boom".into())).is_none());
+        assert!(n.on_ws_event(2, WsEvent::Message(WsMessage::Text("{}".into()))).is_none());
+        assert_eq!(n.state, ConnState::Connected);
+        assert!(n.last_error.is_none());
+        assert_eq!(n.generation, 3, "a stale event must not supersede the current attempt");
+        n.on_ws_event(3, WsEvent::Closed);
+        assert_eq!(n.state, ConnState::Disconnected);
+        assert_eq!(n.generation, 4, "losing a connection retires it");
+    }
+
+    #[test]
+    fn dropping_a_connection_retires_events_in_flight() {
+        let mut n = net();
+        n.generation = 1;
+        n.ws_generation = 1;
+        n.drop_connection();
+        assert!(!is_current(n.ws_generation, n.generation));
+    }
+
+    #[test]
+    fn a_transient_error_retries() {
+        let mut n = net();
+        n.generation = 1;
+        n.state = ConnState::Connected;
+        n.on_ws_event(1, WsEvent::Error("connection refused".into()));
+        assert_eq!(n.state, ConnState::Disconnected);
+        assert!(n.retry_at.is_some());
+        assert_eq!(n.attention, None);
+        assert_eq!(n.attempt(), 1);
+    }
+
+    #[test]
+    fn a_newer_protocol_stops_the_retries() {
+        let mut n = net();
+        n.generation = 1;
+        n.state = ConnState::Connected;
+        let welcome = format!(
+            r#"{{"type":"welcome","protocol_version":{},"server_version":"9.9","host":"h"}}"#,
+            PROTOCOL_VERSION + 1
+        );
+        assert!(n.on_ws_event(1, WsEvent::Message(WsMessage::Text(welcome))).is_none());
+        assert_eq!(n.state, ConnState::Disconnected);
+        assert_eq!(n.attention, Some(ErrorClass::Version));
+        assert!(n.needs_update());
+        assert!(n.retry_at.is_none(), "no retry loop");
+        assert!(n.last_error.as_deref().unwrap().starts_with("needs update"));
+        n.retry_soon();
+        assert!(n.retry_at.is_none());
+    }
+
+    #[test]
+    fn an_incompatible_reply_stops_the_retries() {
+        let mut n = net();
+        n.generation = 1;
+        n.state = ConnState::Connected;
+        let msg = r#"{"type":"incompatible","protocol_version":3,"server_version":"2.0","message":"daemon speaks v3"}"#;
+        n.on_ws_event(1, WsEvent::Message(WsMessage::Text(msg.into())));
+        assert_eq!(n.attention, Some(ErrorClass::Version));
+        assert!(n.last_error.as_deref().unwrap().contains("daemon speaks v3"));
+        assert!(n.retry_at.is_none());
+    }
+
+    #[test]
+    fn a_matching_welcome_is_passed_on() {
+        let mut n = net();
+        n.generation = 1;
+        n.state = ConnState::Connected;
+        let welcome = format!(r#"{{"type":"welcome","protocol_version":{PROTOCOL_VERSION},"server_version":"1","host":"h"}}"#);
+        assert!(n.on_ws_event(1, WsEvent::Message(WsMessage::Text(welcome))).is_some());
+        assert_eq!(n.state, ConnState::Connected);
+        assert_eq!(n.attention, None);
+    }
+
+    #[test]
+    fn errors_are_classified() {
+        use ErrorClass::*;
+        let c = classify_error;
+        assert_eq!(c("ssh master to box failed (exit status: 255): user@box: Permission denied (publickey)."), Auth);
+        assert_eq!(c("Received disconnect: Too many authentication failures"), Auth);
+        assert_eq!(c("Host key verification failed."), HostKey);
+        assert_eq!(
+            c("@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\nHost key verification failed."),
+            HostKey
+        );
+        assert_eq!(c("ssh: connect to host box port 22: Connection refused"), Transient);
+        assert_eq!(c("ssh: Could not resolve hostname box"), Transient);
+        assert_eq!(c("tunnel to box did not open port 5000"), Transient);
+        assert_eq!(c("link timed out (no ping reply in 3s)"), Transient);
+        assert_eq!(c(""), Transient);
+        assert!(Auth.needs_attention() && HostKey.needs_attention() && Version.needs_attention());
+        assert!(!Transient.needs_attention());
+    }
+
+    #[test]
+    fn an_auth_failure_waits_for_the_user() {
+        let mut n = net();
+        n.generation = 1;
+        n.state = ConnState::Connecting;
+        n.on_resolved(Resolved {
+            generation: 1,
+            result: Err("ssh master to box failed (exit status: 255): box: Permission denied (publickey).".into()),
+        });
+        assert_eq!(n.attention, Some(ErrorClass::Auth));
+        assert!(n.retry_at.is_none());
+        assert!(n.last_error.as_deref().unwrap().contains("login refused"));
+    }
+
+    #[test]
+    fn humanized_errors_are_one_short_line() {
+        let long = format!("first\n\n{}", "x".repeat(400));
+        let h = humanize_error(ErrorClass::Transient, &long);
+        assert!(!h.contains('\n'));
+        assert!(h.chars().count() <= 161);
+        assert_eq!(humanize_error(ErrorClass::Transient, "  "), "connection failed");
     }
 }
