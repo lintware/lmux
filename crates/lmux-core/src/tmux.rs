@@ -634,6 +634,13 @@ fn keep_env(name: &str) -> bool {
 /// with no terminal leaves focus to the app, which reports it per pane.
 const IDLE_WINDOW: &str = "_lmux_idle";
 
+/// Features tmux assumes for clients with `TERM=xterm*` (the app attaches
+/// its local panes with `xterm-256color`, see `app/src/pty.rs`).
+const TERMINAL_FEATURES: &[&str] = &[
+    "RGB", "usstyle", "strikethrough", "hyperlinks", "sync", "extkeys", "ccolour", "cstyle", "focus",
+    "overline", "clipboard",
+];
+
 /// Server-wide settings, applied to new servers and to ones an older daemon
 /// made.
 async fn server_defaults(cfg: &TmuxConfig) {
@@ -654,10 +661,22 @@ async fn server_defaults(cfg: &TmuxConfig) {
     // clients, so a copy in a local pane reaches the app and this Mac's
     // clipboard. With the default (`external`) tmux ignores them.
     tmux(v(&["set-option", "-s", "set-clipboard", "on"])).await;
-    // 256 colours in panes, and truecolor passed through to the app's
-    // clients (local panes attach with TERM=xterm-256color).
-    tmux(v(&["set-option", "-g", "default-terminal", "screen-256color"])).await;
-    tmux(v(&["set-option", "-s", "terminal-features[90]", "xterm*:RGB"])).await;
+    // Panes get `tmux-256color` (italics, strikethrough, ...) where its
+    // terminfo exists, else `screen-256color`.
+    let has_tmux_terminfo = Command::new("infocmp")
+        .arg("tmux-256color")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|s| s.success());
+    let term = if has_tmux_terminfo { "tmux-256color" } else { "screen-256color" };
+    tmux(v(&["set-option", "-g", "default-terminal", term])).await;
+    // What tmux passes on to the app's client (`TERMINAL_FEATURES`).
+    for (i, feature) in TERMINAL_FEATURES.iter().enumerate() {
+        let opt = format!("terminal-features[{}]", 90 + i);
+        tmux(v(&["set-option", "-s", &opt, &format!("xterm*:{feature}")])).await;
+    }
     if let Ok(out) = Command::new("tmux")
         .args(["-L", &cfg.socket, "show-environment", "-g"])
         .stderr(Stdio::null())
