@@ -2,7 +2,7 @@
 name = "lmux-app"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.90"
 description = "lmux native macOS client (egui/eframe)"
 license = "MIT"
 
@@ -13,7 +13,8 @@ license = "MIT"
 lmux-proto = { path = "../crates/lmux-proto" }
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "persistence"] }
 egui = "0.36"
-alacritty_terminal = "0.26"
+# Ghostty's terminal emulator. Pinned to a git rev: crates.io 0.2.2 needs Zig 0.15.2, which does not build on current macOS SDKs (this rev builds with Zig 0.16.0).
+libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "d2036baeb605d31d09a9e2ba6d0c923e04c34d54" }
 ewebsock = "0.8"
 portable-pty = "0.9"
 zune-jpeg = "0.5"

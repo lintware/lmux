@@ -82,7 +82,7 @@ impl Rig {
             .state
             .terms
             .get(sid)
-            .is_some_and(|t| t.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE));
+            .is_some_and(|t| t.mode().bracketed_paste);
         let bytes = lmux_app::termio::paste_bytes(text, bracketed);
         self.state.send_term_input(sid, &bytes);
         self.pump();
@@ -173,7 +173,7 @@ fn main() {
     // 2. Bracketed paste at a bash prompt: nothing runs before Enter.
     rig.pump_for(Duration::from_millis(500));
     rig.wait("bracketed paste mode at the prompt", Duration::from_secs(5), |r| {
-        r.state.terms.get(&sid).is_some_and(|t| t.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE))
+        r.state.terms.get(&sid).is_some_and(|t| t.mode().bracketed_paste)
     });
     rig.paste(&sid, "echo PASTE_ONE\necho PASTE_TWO");
     rig.pump_for(Duration::from_millis(1200));
@@ -208,7 +208,7 @@ fn main() {
     let row = rig.screen(&sid).lines().position(|l| l == "SELECT_ME_PLEASE");
     let selected = row.and_then(|r| {
         let tv = rig.state.terms.get_mut(&sid)?;
-        tv.start_selection(alacritty_terminal::selection::SelectionType::Simple, r, 0, false);
+        tv.start_selection(lmux_app::term::SelectionType::Simple, r, 0, false);
         tv.update_selection(r, "SELECT_ME_PLEASE".len() - 1, true);
         tv.selection_text()
     });

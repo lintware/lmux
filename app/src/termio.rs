@@ -2,7 +2,7 @@
 //! bracketed paste and mouse reports (SGR / UTF-8 / X10). Pure functions,
 //! unit-tested here; the UI decides when to call them.
 
-use alacritty_terminal::term::TermMode;
+use crate::term::Modes;
 
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
@@ -71,16 +71,16 @@ pub enum MouseAction {
 }
 
 /// True when the program asked for mouse reports of any kind.
-pub fn mouse_reporting(mode: TermMode) -> bool {
-    mode.intersects(TermMode::MOUSE_MODE)
+pub fn mouse_reporting(mode: Modes) -> bool {
+    mode.mouse_reporting()
 }
 
 /// Whether the program wants this kind of event at all.
-pub fn wants(mode: TermMode, action: MouseAction, button: MouseButton) -> bool {
+pub fn wants(mode: Modes, action: MouseAction, button: MouseButton) -> bool {
     match action {
         MouseAction::Press | MouseAction::Release => mouse_reporting(mode),
-        MouseAction::Motion if button == MouseButton::None => mode.contains(TermMode::MOUSE_MOTION),
-        MouseAction::Motion => mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION),
+        MouseAction::Motion if button == MouseButton::None => mode.mouse_motion,
+        MouseAction::Motion => mode.mouse_drag || mode.mouse_motion,
     }
 }
 
@@ -90,7 +90,7 @@ pub fn wants(mode: TermMode, action: MouseAction, button: MouseButton) -> bool {
 /// when it asked for those, else classic X10 (`ESC[M` + three bytes), whose
 /// coordinates stop at 223: an event past that is dropped, as xterm does.
 pub fn mouse_report(
-    mode: TermMode,
+    mode: Modes,
     action: MouseAction,
     button: MouseButton,
     col: usize,
@@ -115,7 +115,7 @@ pub fn mouse_report(
     }
     let (x, y) = (col as u32 + 1, row as u32 + 1);
 
-    if mode.contains(TermMode::SGR_MOUSE) {
+    if mode.sgr_mouse {
         let fin = if action == MouseAction::Release { 'm' } else { 'M' };
         return Some(format!("\x1b[<{b};{x};{y}{fin}").into_bytes());
     }
@@ -128,7 +128,7 @@ pub fn mouse_report(
         b = (b & !0b11) | 3;
     }
     let mut out = b"\x1b[M".to_vec();
-    if mode.contains(TermMode::UTF8_MOUSE) {
+    if mode.utf8_mouse {
         for v in [b + 32, x + 32, y + 32] {
             let ch = char::from_u32(v)?;
             let mut buf = [0u8; 4];
@@ -267,8 +267,8 @@ mod tests {
         assert_eq!(paste_bytes("a\nb\r\nc", false), b"a\rb\rc".to_vec());
     }
 
-    fn sgr() -> TermMode {
-        TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE
+    fn sgr() -> Modes {
+        Modes { mouse_click: true, sgr_mouse: true, ..Modes::default() }
     }
 
     #[test]
@@ -305,13 +305,13 @@ mod tests {
     fn motion_needs_drag_or_motion_mode() {
         let m = egui::Modifiers::default();
         assert_eq!(mouse_report(sgr(), MouseAction::Motion, MouseButton::Left, 1, 1, m), None);
-        let drag = sgr() | TermMode::MOUSE_DRAG;
+        let drag = Modes { mouse_drag: true, ..sgr() };
         assert_eq!(
             mouse_report(drag, MouseAction::Motion, MouseButton::Left, 1, 1, m),
             Some(b"\x1b[<32;2;2M".to_vec())
         );
         assert_eq!(mouse_report(drag, MouseAction::Motion, MouseButton::None, 1, 1, m), None);
-        let motion = sgr() | TermMode::MOUSE_MOTION;
+        let motion = Modes { mouse_motion: true, ..sgr() };
         assert_eq!(
             mouse_report(motion, MouseAction::Motion, MouseButton::None, 1, 1, m),
             Some(b"\x1b[<35;2;2M".to_vec())
@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn x10_encoding() {
-        let mode = TermMode::MOUSE_REPORT_CLICK;
+        let mode = Modes { mouse_click: true, ..Modes::default() };
         let m = egui::Modifiers::default();
         assert_eq!(
             mouse_report(mode, MouseAction::Press, MouseButton::Left, 0, 0, m),
@@ -337,12 +337,12 @@ mod tests {
         );
         assert_eq!(mouse_report(mode, MouseAction::Release, MouseButton::WheelDown, 0, 0, m), None);
         assert_eq!(mouse_report(mode, MouseAction::Press, MouseButton::Left, 300, 0, m), None);
-        assert_eq!(mouse_report(TermMode::empty(), MouseAction::Press, MouseButton::Left, 0, 0, m), None);
+        assert_eq!(mouse_report(Modes::default(), MouseAction::Press, MouseButton::Left, 0, 0, m), None);
     }
 
     #[test]
     fn utf8_mouse_encodes_large_columns() {
-        let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::UTF8_MOUSE;
+        let mode = Modes { mouse_click: true, utf8_mouse: true, ..Modes::default() };
         let out = mouse_report(mode, MouseAction::Press, MouseButton::Left, 299, 0, egui::Modifiers::default())
             .unwrap();
         let s = String::from_utf8(out).unwrap();
