@@ -346,6 +346,17 @@ pub enum ServerMsg {
         server_version: String,
         host: String,
     },
+    /// The reply to a [`ClientMsg::Hello`] whose `protocol_version` this daemon
+    /// does not speak. The daemon does not treat the sender as an app; the
+    /// client should stop retrying and tell the user which side to update.
+    /// Older daemons never send this, so a client also compares the version in
+    /// [`ServerMsg::Welcome`].
+    Incompatible {
+        /// The version the daemon speaks.
+        protocol_version: u32,
+        server_version: String,
+        message: String,
+    },
     RpcResult {
         response: RpcResponse,
     },
