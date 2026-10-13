@@ -223,6 +223,7 @@ export type ClientMsg =
 
 export type ServerMsg =
   | { type: "welcome"; protocol_version: number; server_version: string; host: string }
+  | { type: "incompatible"; protocol_version: number; server_version: string; message: string }
   | { type: "rpc_result"; response: RpcResponse }
   | { type: "tree"; tree: Tree }
   | { type: "term_snapshot"; surface: Ref; cols: number; rows: number; data: string }

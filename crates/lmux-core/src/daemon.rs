@@ -1997,7 +1997,18 @@ impl Inner {
         outbox: &Arc<ClientSink>,
     ) {
         match msg {
-            ClientMsg::Hello { client_name, draws_browsers, .. } => {
+            ClientMsg::Hello { protocol_version, client_name, draws_browsers } => {
+                if protocol_version != PROTOCOL_VERSION {
+                    tracing::warn!(id, %client_name, protocol_version, "client speaks another protocol version");
+                    outbox.push(Out::Msg(ServerMsg::Incompatible {
+                        protocol_version: PROTOCOL_VERSION,
+                        server_version: env!("CARGO_PKG_VERSION").to_string(),
+                        message: format!(
+                            "this daemon speaks protocol v{PROTOCOL_VERSION}, the client v{protocol_version}"
+                        ),
+                    }));
+                    return;
+                }
                 if client_name.starts_with("lmux-app") {
                     let mut c = self.clients.lock().await;
                     if !c.apps.contains(&id) {
@@ -2666,6 +2677,28 @@ mod tests {
     /// only new tabs go to the app. An app's tabs move to Chromium lazily,
     /// when an agent asks for one and no drawing app is connected, and a quick
     /// reconnect moves nothing.
+    /// A hello with another protocol version is answered with `Incompatible`
+    /// and does not make the sender an app; the same version is not answered.
+    #[tokio::test]
+    async fn hello_with_another_protocol_version_is_refused() {
+        let Some((inner, _fake, _pane, _surf, _scratch, _dir)) = browser_daemon("protover").await else { return };
+        let hello = |v: u32| ClientMsg::Hello { protocol_version: v, client_name: "lmux-app/t".into(), draws_browsers: true };
+
+        let sink = ClientSink::new(64);
+        let id = inner.register(sink.clone()).await;
+        inner.handle_client_msg(id, hello(PROTOCOL_VERSION + 1), &sink).await;
+        match sink.take_all().as_slice() {
+            [Out::Msg(ServerMsg::Incompatible { protocol_version, .. })] => assert_eq!(*protocol_version, PROTOCOL_VERSION),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(!inner.clients.lock().await.apps.contains(&id));
+
+        inner.handle_client_msg(id, hello(PROTOCOL_VERSION), &sink).await;
+        assert!(sink.take_all().is_empty());
+        assert!(inner.clients.lock().await.apps.contains(&id));
+        inner.unregister(id).await;
+    }
+
     #[tokio::test]
     async fn tabs_move_to_chromium_only_when_an_agent_needs_them() {
         let Some((inner, fake, pane, surf, _scratch, _dir)) = browser_daemon("handoff").await else { return };
