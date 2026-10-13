@@ -19,7 +19,20 @@ app="$build/lmux.app"
 
 echo "==> building release binaries"
 (cd "$repo" && cargo build --release -p lmux 2>&1 | tail -1)
-(cd "$repo/app" && cargo build --release 2>&1 | tail -1)
+# The app's terminal emulator (libghostty-vt) builds Ghostty from source with
+# Zig 0.16.0: $ZIG (a zig binary or its directory), else the default install.
+zig_dir=""
+if [ -n "${ZIG:-}" ]; then
+  if [ -d "$ZIG" ]; then zig_dir=$ZIG; else zig_dir=$(dirname "$ZIG"); fi
+elif [ -x "$HOME/.local/share/zig/zig-aarch64-macos-0.16.0/zig" ]; then
+  zig_dir="$HOME/.local/share/zig/zig-aarch64-macos-0.16.0"
+fi
+if [ -z "$zig_dir" ] || [ "$("$zig_dir/zig" version 2>/dev/null)" != "0.16.0" ]; then
+  echo "error: building the app needs Zig 0.16.0 (looked in: ${zig_dir:-no ZIG set and no default install})." >&2
+  echo "Install it from https://ziglang.org/download/ and set ZIG to the zig binary or its directory." >&2
+  exit 1
+fi
+(cd "$repo/app" && PATH="$zig_dir:$PATH" cargo build --release 2>&1 | tail -1)
 
 echo "==> assembling lmux.app"
 rm -rf "$app"
