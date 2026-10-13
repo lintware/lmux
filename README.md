@@ -111,6 +111,8 @@ cargo test --workspace          # daemon, CLI and protocol (needs tmux)
 (cd app && cargo test)          # the app, including UI tests
 ```
 
+The app's terminal emulator is Ghostty's own (libghostty-vt, through the [libghostty-rs](https://github.com/Uzaaft/libghostty-rs) bindings). Cargo builds it from source, which needs **Zig 0.16.0** on `PATH` (Homebrew's `zig` is 0.15 and fails) and Rust 1.90 or newer for the app. `deploy/macos/bundle.sh` looks for Zig in `$ZIG` (the binary or its directory) or `~/.local/share/zig/zig-aarch64-macos-0.16.0` and stops with a message if it is missing. The daemon and CLI don't need Zig.
+
 Work happens on `dev`, and `main` follows it once it's stable.
 
 ## Status and roadmap
