@@ -429,6 +429,25 @@ fn snapshot_terminal_glyphs() {
     h.snapshot("terminal_glyphs");
 }
 
+/// Underline styles and colour, strikethrough, overline, italic, faint, and
+/// emoji clusters, as a program using Ghostty's terminal features draws them.
+#[test]
+fn snapshot_terminal_styles() {
+    let mut fx = fixture("workspace:1", false);
+    {
+        let ws = &mut fx.state.tree.workspaces[0];
+        ws.panes[0].active_surface = Some("surface:1".into());
+    }
+    let mut t = TermView::new(80, 24);
+    t.feed(b"\x1b[4mstraight\x1b[0m \x1b[4:2mdouble\x1b[0m \x1b[4:3mcurly\x1b[0m \x1b[4:4mdotted\x1b[0m \x1b[4:5mdashed\x1b[0m\r\n");
+    t.feed(b"\x1b[4:3;58;2;255;60;60mred curly\x1b[0m \x1b[9mstrike\x1b[0m \x1b[53moverline\x1b[0m \x1b[3mitalic\x1b[0m \x1b[2mfaint\x1b[0m \x1b[1mbold\x1b[0m\r\n");
+    t.feed(b"\x1b]8;;https://example.com/\x1b\\hyperlink\x1b]8;;\x1b\\ plain\r\n");
+    t.feed("\u{1F44D}\u{1F3FD}|\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}|\u{1F680}|x\r\n".as_bytes());
+    fx.state.terms.insert("surface:1".into(), t);
+    let mut h = harness(fx, Vec2::new(760.0, 340.0));
+    h.snapshot("terminal_styles");
+}
+
 /// A browser pane showing a decoded frame, scaled up to the pane (review #9:
 /// the stream is 1×, so the frame is stretched to the pane's CSS size).
 #[test]
