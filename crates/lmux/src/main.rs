@@ -12,6 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 mod browser_adapter;
 mod cli;
 mod commands;
+mod cp;
 mod import;
 mod share;
 mod wait;
@@ -154,8 +155,23 @@ async fn run() -> anyhow::Result<()> {
             ws_probe(&addr, &surface, timeout, resizes).await?;
             return Ok(());
         }
-        Cmd::Share { allow_typing, port, no_tunnel, cloudflared } => {
-            return share::run(share::Opts { socket, allow_typing, port, no_tunnel, cloudflared, json }).await;
+        Cmd::Share { allow_typing, port, no_tunnel, cloudflared, servers, service } => {
+            let opts = share::Opts { socket, allow_typing, port, no_tunnel, cloudflared, json, servers, service };
+            return share::run(opts).await;
+        }
+        Cmd::Cp { sources, dest, tell } => return cp::run(cp::Opts { sources, dest, tell }).await,
+        Cmd::ShareCode { status } => return share::request_code(status).await,
+        Cmd::ShareBackend => return share::backend(socket).await,
+        Cmd::ShareConnect { gateway } => {
+            share::connect_gateway(socket, gateway).await?;
+            // A signal may end the connector while its stdin worker is blocked.
+            std::process::exit(0);
+        }
+        Cmd::ShareAttach { name } => {
+            share::attach(name).await?;
+            // Tokio's stdin worker cannot be cancelled while SSH still holds
+            // stdin open. Do not wait for it when the gateway socket closes.
+            std::process::exit(0);
         }
         Cmd::ImportCmux { move_, force, dry_run, only, from } => {
             let opts = import::Opts { from, move_, force, dry_run, only };
@@ -404,6 +420,7 @@ async fn ws_probe(addr: &str, surface: &str, timeout_secs: u64, resizes: u64) ->
     let hello = ClientMsg::Hello {
         protocol_version: lmux_proto::PROTOCOL_VERSION,
         client_name: "lmux-ws-probe".into(),
+        draws_browsers: false,
     };
     sink.send(Message::Text(serde_json::to_string(&hello)?)).await?;
     let sub = ClientMsg::Subscribe {

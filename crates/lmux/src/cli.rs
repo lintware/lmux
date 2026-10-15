@@ -70,8 +70,10 @@ Browser:
   browser                    Drive a browser pane: lmux browser --help
 
 Other:
+  cp                         Copy files or folders to a host: cp FILE... HOST[:WORKSPACE|/PATH] (--tell)
   import-cmux                Bring cmux's workspaces over (--move hands over their Claude sessions)
   share                      Share sessions to a phone or browser through a Cloudflare Quick Tunnel
+  share-connect              Register this machine with a phone gateway over outbound SSH
   rpc                        Call a daemon method: rpc <method> [json-params]
   ping                       Check the daemon answers
   hooks                      Claude Code hooks
@@ -695,6 +697,22 @@ pub enum Cmd {
     },
 
     // ----- other -------------------------------------------------------------
+    /// Copy files or folders to a host, into a workspace's working directory
+    /// (HOST:WORKSPACE, a title, fragment or ref), a path (HOST:/dir) or the
+    /// home directory (HOST). Prints where each item landed. With --tell, the
+    /// paths are also pasted into that workspace's terminal, so the chat
+    /// running there can read them. Uses scp over your ssh config.
+    Cp {
+        /// Files or folders on this machine.
+        #[arg(required = true, num_args = 1.., value_name = "SOURCE")]
+        sources: Vec<PathBuf>,
+        /// HOST[:WORKSPACE|/PATH]; HOST is a name from hosts.json or an ssh target.
+        #[arg(value_name = "DEST")]
+        dest: String,
+        /// Paste the remote paths into the workspace's terminal (no Enter).
+        #[arg(long)]
+        tell: bool,
+    },
     /// Rebuild cmux's workspaces in lmux: folders, splits, tabs, directories,
     /// browser URLs and Claude sessions. With --move, each workspace is closed
     /// in cmux and its Claude resumed in lmux; a Claude mid-turn is left alone.
@@ -746,7 +764,31 @@ pub enum Cmd {
         /// The cloudflared binary (default: found on PATH, or downloaded once).
         #[arg(long)]
         cloudflared: Option<String>,
+        /// Also control the sessions on this server, reached over SSH (an alias
+        /// from ~/.ssh/config or user@host). Repeat for more servers. Each
+        /// server needs lmux installed (deploy/install-remote.sh).
+        #[arg(long = "server", value_name = "SSH_TARGET")]
+        servers: Vec<String>,
+        /// Run as the always-on gateway service: hand out codes through
+        /// `lmux share-code` and exit when the tunnel stops.
+        #[arg(long)]
+        service: bool,
     },
+    /// Print a new pairing code (JSON with the link and QR) from the gateway
+    /// service on this machine, or with --status, whether a code is unused.
+    #[command(hide = true)]
+    ShareCode {
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Serve this machine's sessions to a share gateway over stdin/stdout
+    /// (run by `lmux share --server` through SSH).
+    #[command(hide = true)]
+    ShareBackend,
+    /// Register this machine with an always-on gateway over outbound SSH.
+    ShareConnect { gateway: String },
+    #[command(hide = true)]
+    ShareAttach { #[arg(long)] name: String },
     /// Diagnostic: connect to the websocket, subscribe, print snapshot/output.
     #[command(hide = true)]
     WsProbe {

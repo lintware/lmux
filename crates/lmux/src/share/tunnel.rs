@@ -12,7 +12,14 @@ use tokio::process::{Child, Command};
 pub struct Tunnel {
     pub url: String,
     // Dropping the tunnel kills the child (kill_on_drop).
-    _child: Child,
+    child: Child,
+}
+
+impl Tunnel {
+    /// Resolves when cloudflared exits; the address is dead from then on.
+    pub async fn exited(&mut self) {
+        let _ = self.child.wait().await;
+    }
 }
 
 fn home() -> Option<PathBuf> {
@@ -69,13 +76,13 @@ async fn download(print: bool) -> anyhow::Result<PathBuf> {
     }
     let url = format!("https://github.com/cloudflare/cloudflared/releases/latest/download/{asset}");
     let tmp = dest.with_extension("download");
-    let st = Command::new("curl").args(["-fsSL", "-o"]).arg(&tmp).arg(&url).status().await?;
+    let st = Command::new("curl").env_remove("OPENAI_API_KEY").args(["-fsSL", "-o"]).arg(&tmp).arg(&url).status().await?;
     if !st.success() {
         bail!("downloading {url} failed");
     }
     if tgz {
         let dir = dest.parent().unwrap();
-        let st = Command::new("tar").arg("-xzf").arg(&tmp).arg("-C").arg(dir).status().await?;
+        let st = Command::new("tar").env_remove("OPENAI_API_KEY").arg("-xzf").arg(&tmp).arg("-C").arg(dir).status().await?;
         let _ = std::fs::remove_file(&tmp);
         if !st.success() {
             bail!("unpacking cloudflared failed");
@@ -100,12 +107,15 @@ pub fn parse_url(line: &str) -> Option<String> {
     ok.then(|| url.to_string())
 }
 
-pub async fn start(port: u16, explicit: Option<&str>, print: bool) -> anyhow::Result<Tunnel> {
+/// With `log`, cloudflared's own lines are copied to stderr (the gateway
+/// service's journal), so a dropped tunnel leaves a reason behind.
+pub async fn start(port: u16, explicit: Option<&str>, print: bool, log: bool) -> anyhow::Result<Tunnel> {
     let bin = match find_binary(explicit) {
         Some(b) => b,
         None => download(print).await?,
     };
     let mut child = Command::new(&bin)
+        .env_remove("OPENAI_API_KEY")
         .args(["tunnel", "--no-autoupdate", "--url"])
         .arg(format!("http://127.0.0.1:{port}"))
         .stdin(Stdio::null())
@@ -120,6 +130,9 @@ pub async fn start(port: u16, explicit: Option<&str>, print: bool) -> anyhow::Re
     let mut url: Option<String> = None;
     let wait = async {
         while let Some(line) = lines.next_line().await? {
+            if log {
+                eprintln!("cloudflared: {line}");
+            }
             if url.is_none() {
                 url = parse_url(&line);
             }
@@ -135,8 +148,14 @@ pub async fn start(port: u16, explicit: Option<&str>, print: bool) -> anyhow::Re
         bail!("cloudflared did not print a trycloudflare.com address{}", if timed.is_err() { " in 45 s" } else { "" });
     };
     // Keep draining so cloudflared never blocks on a full pipe.
-    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-    Ok(Tunnel { url, _child: child })
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            if log {
+                eprintln!("cloudflared: {line}");
+            }
+        }
+    });
+    Ok(Tunnel { url, child })
 }
 
 #[cfg(test)]
