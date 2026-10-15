@@ -223,7 +223,7 @@ pub fn show(ui: &mut Ui, area: Rect, hosts: &mut [&mut Ctx], active: usize) -> O
                 if row == pal.index {
                     p.rect_filled(r, CornerRadius::same(6), theme::CARD_SELECTED);
                 }
-                let fg = if row == pal.index { Color32::WHITE } else { theme::TEXT };
+                let fg = theme::TEXT;
                 let detail_w = crate::util::measure(ui.ctx(), &it.detail, &theme::ui(theme::FS_SMALL));
                 p.text(
                     egui::pos2(r.min.x + 10.0, r.center().y),
@@ -237,7 +237,7 @@ pub fn show(ui: &mut Ui, area: Rect, hosts: &mut [&mut Ctx], active: usize) -> O
                     Align2::RIGHT_CENTER,
                     &it.detail,
                     theme::ui(theme::FS_SMALL),
-                    if row == pal.index { Color32::from_rgb(0xFF, 0xE4, 0xC8) } else { theme::DIM },
+                    theme::DIM,
                 );
                 if resp.clicked() {
                     picked = Some(it.pick.clone());

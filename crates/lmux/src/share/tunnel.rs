@@ -12,7 +12,14 @@ use tokio::process::{Child, Command};
 pub struct Tunnel {
     pub url: String,
     // Dropping the tunnel kills the child (kill_on_drop).
-    _child: Child,
+    child: Child,
+}
+
+impl Tunnel {
+    /// Resolves when cloudflared exits; the address is dead from then on.
+    pub async fn exited(&mut self) {
+        let _ = self.child.wait().await;
+    }
 }
 
 fn home() -> Option<PathBuf> {
@@ -100,7 +107,9 @@ pub fn parse_url(line: &str) -> Option<String> {
     ok.then(|| url.to_string())
 }
 
-pub async fn start(port: u16, explicit: Option<&str>, print: bool) -> anyhow::Result<Tunnel> {
+/// With `log`, cloudflared's own lines are copied to stderr (the gateway
+/// service's journal), so a dropped tunnel leaves a reason behind.
+pub async fn start(port: u16, explicit: Option<&str>, print: bool, log: bool) -> anyhow::Result<Tunnel> {
     let bin = match find_binary(explicit) {
         Some(b) => b,
         None => download(print).await?,
@@ -120,6 +129,9 @@ pub async fn start(port: u16, explicit: Option<&str>, print: bool) -> anyhow::Re
     let mut url: Option<String> = None;
     let wait = async {
         while let Some(line) = lines.next_line().await? {
+            if log {
+                eprintln!("cloudflared: {line}");
+            }
             if url.is_none() {
                 url = parse_url(&line);
             }
@@ -135,8 +147,14 @@ pub async fn start(port: u16, explicit: Option<&str>, print: bool) -> anyhow::Re
         bail!("cloudflared did not print a trycloudflare.com address{}", if timed.is_err() { " in 45 s" } else { "" });
     };
     // Keep draining so cloudflared never blocks on a full pipe.
-    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-    Ok(Tunnel { url, _child: child })
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            if log {
+                eprintln!("cloudflared: {line}");
+            }
+        }
+    });
+    Ok(Tunnel { url, child })
 }
 
 #[cfg(test)]
