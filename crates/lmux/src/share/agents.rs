@@ -543,6 +543,7 @@ pub fn parse_codex(text: &str) -> Vec<Msg> {
 pub fn parse_grok(text: &str) -> Vec<Msg> {
     const NOISE: &[&str] = &["<system-reminder>", "<user_info>", "<rules>"];
     let mut out = Vec::new();
+    let mut calls = HashMap::new();
     for o in lines(text) {
         let ts = o["timestamp"].as_str().or_else(|| o["created_at"].as_str());
         match o["type"].as_str() {
@@ -567,9 +568,24 @@ pub fn parse_grok(text: &str) -> Vec<Msg> {
                 for c in o["tool_calls"].as_array().map(Vec::as_slice).unwrap_or_default() {
                     if let Some(name) = c["name"].as_str().or_else(|| c["function"]["name"].as_str()) {
                         // `arguments` is a JSON object encoded as a string.
-                        let args = c["arguments"].as_str().or_else(|| c["function"]["arguments"].as_str());
-                        let input = args.and_then(|a| serde_json::from_str(a).ok()).unwrap_or(Value::Null);
+                        let args = c.get("arguments").or_else(|| c["function"].get("arguments")).unwrap_or(&Value::Null);
+                        let input = match args {
+                            Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
+                            other => other.clone(),
+                        };
+                        if let Some(id) = c["id"].as_str() { calls.insert(id.to_owned(), name.to_owned()); }
                         push(&mut out, "tool", &tool_line(name, &input), ts);
+                    }
+                }
+            }
+            Some("tool_result" | "tool") => {
+                let id = o["tool_call_id"].as_str().or_else(|| o["tool_use_id"].as_str());
+                let name = o["name"].as_str().or_else(|| id.and_then(|id| calls.get(id).map(String::as_str)));
+                if let Some(name) = name {
+                    let output = block_texts(&o["content"]);
+                    if !output.trim().is_empty() {
+                        let status = if o["is_error"] == true { "failed" } else { "output" };
+                        push(&mut out, "tool", &format!("{name} · {status}\n{output}"), ts);
                     }
                 }
             }
@@ -620,7 +636,7 @@ impl Procs {
 async fn run(cmd: &str, args: &[&str]) -> Option<String> {
     let out = tokio::time::timeout(
         Duration::from_secs(3),
-        tokio::process::Command::new(cmd).args(args).stdin(std::process::Stdio::null()).output(),
+        tokio::process::Command::new(cmd).env_remove("OPENAI_API_KEY").args(args).stdin(std::process::Stdio::null()).output(),
     )
     .await
     .ok()?
@@ -724,6 +740,22 @@ mod tests {
     }
 
     #[test]
+    fn grok_accepts_native_and_openai_calls_and_keeps_tool_output() {
+        let input = [
+            r#"{"type":"assistant","tool_calls":[{"id":"a","name":"read_file","arguments":{"target_file":"a.rs"}},{"id":"b","function":{"name":"run_terminal_cmd","arguments":"{\"command\":\"cargo test\"}"}}]}"#,
+            r#"{"type":"tool","tool_call_id":"b","is_error":true,"content":"exit 101\nassertion failed"}"#,
+            r#"{"type":"tool_result","tool_call_id":"a","content":[{"type":"text","text":"fn main() {}"}]}"#,
+            "{partial",
+        ].join("\n");
+        let messages = parse_grok(&input);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].text, "read_file · a.rs");
+        assert_eq!(messages[1].text, "run_terminal_cmd · cargo test");
+        assert_eq!(messages[2].text, "run_terminal_cmd · failed\nexit 101\nassertion failed");
+        assert_eq!(messages[3].text, "read_file · output\nfn main() {}");
+    }
+
+    #[test]
     fn long_messages_are_capped_on_a_char_boundary() {
         let s = "é".repeat(MAX_MESSAGE_BYTES);
         let c = cap(&s);
@@ -789,7 +821,7 @@ mod tests {
     fn real_transcripts_parse() {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
         let newest = |pattern: &str| -> Option<PathBuf> {
-            let out = std::process::Command::new("sh").arg("-c").arg(format!("ls -t {pattern} 2>/dev/null | head -1")).output().ok()?;
+            let out = std::process::Command::new("sh").env_remove("OPENAI_API_KEY").arg("-c").arg(format!("ls -t {pattern} 2>/dev/null | head -1")).output().ok()?;
             let p = String::from_utf8_lossy(&out.stdout).trim().to_owned();
             (!p.is_empty()).then(|| p.into())
         };

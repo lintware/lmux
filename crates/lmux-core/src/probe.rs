@@ -171,6 +171,30 @@ async fn open_files(pids: &[u32]) -> Vec<(u32, String)> {
 /// For each pane (by id, given its shell's pid), the Codex session running
 /// in it: the rollout file a `codex` process under the pane has open.
 pub async fn codex_sessions(pane_pids: &HashMap<String, u32>) -> HashMap<String, String> {
+    agent_sessions(pane_pids, "codex").await
+}
+
+/// Grok keeps main and subagent files open in the same process. Prefer the
+/// freshest main chat, never restore a subagent into the user's terminal.
+pub async fn grok_sessions(pane_pids: &HashMap<String, u32>) -> HashMap<String, String> {
+    agent_sessions(pane_pids, "grok").await
+}
+
+fn grok_chat(root: &std::path::Path, path: &str) -> Option<(String, std::path::PathBuf)> {
+    let rest = std::path::Path::new(path).strip_prefix(&root).ok()?;
+    let parts: Vec<_> = rest.components().collect();
+    if parts.len() < 3 || !parts.iter().all(|c| matches!(c, std::path::Component::Normal(_))) { return None; }
+    let id = parts[1].as_os_str().to_str()?;
+    if !crate::tree::valid_agent_session_id(id) { return None; }
+    let dir = root.join(parts[0]).join(id);
+    // Missing or invalid metadata is not proof this is a main session.
+    let summary = std::fs::read(dir.join("summary.json")).ok()?;
+    let summary: serde_json::Value = serde_json::from_slice(&summary).ok()?;
+    if summary["session_kind"] == "subagent" { return None; }
+    Some((id.to_owned(), dir.join("chat_history.jsonl")))
+}
+
+async fn agent_sessions(pane_pids: &HashMap<String, u32>, agent: &str) -> HashMap<String, String> {
     let Some(ps) = run("ps", &["-axo", "pid=,ppid=,comm="], None, Duration::from_secs(3)).await else {
         return HashMap::new();
     };
@@ -185,14 +209,21 @@ pub async fn codex_sessions(pane_pids: &HashMap<String, u32>) -> HashMap<String,
         children.entry(ppid).or_default().push(pid);
         names.insert(pid, it.collect::<Vec<_>>().join(" "));
     }
-    let is_codex = |pid: &u32| names.get(pid).is_some_and(|n| n.rsplit('/').next().unwrap_or(n).starts_with("codex"));
+    let is_codex = |pid: &u32| names.get(pid).is_some_and(|n| n.rsplit('/').next().unwrap_or(n).starts_with(agent));
     let mut found = HashMap::new();
     for (pane, root) in pane_pids {
         let codex: Vec<u32> = descendants(&children, &[*root]).into_iter().filter(|p| is_codex(p)).collect();
         if codex.is_empty() {
             continue;
         }
-        if let Some(id) = open_files(&codex).await.iter().find_map(|(_, f)| codex_session_id(f)) {
+        let files = open_files(&codex).await;
+        let id = if agent == "grok" {
+            let root = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".grok/sessions");
+            files.iter().filter_map(|(_, f)| grok_chat(&root, f))
+                .filter_map(|(id, p)| std::fs::metadata(p).ok()?.modified().ok().map(|mtime| (mtime, id)))
+                .max().map(|(_, id)| id)
+        } else { files.iter().find_map(|(_, f)| codex_session_id(f)) };
+        if let Some(id) = id {
             found.insert(pane.clone(), id);
         }
     }
@@ -230,6 +261,24 @@ pub async fn pull_request(cwd: &str) -> Option<PullRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grok_restore_uses_only_main_sessions_inside_its_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root.join("%2Frepo/019f4dbf-d058-78d0-a3cc-1c0f28477ca6");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("events.jsonl");
+        assert!(grok_chat(root, file.to_str().unwrap()).is_none());
+        std::fs::write(dir.join("summary.json"), r#"{"session_kind":"main"}"#).unwrap();
+        let (id, chat) = grok_chat(root, file.to_str().unwrap()).unwrap();
+        assert_eq!(id, "019f4dbf-d058-78d0-a3cc-1c0f28477ca6");
+        assert_eq!(chat, dir.join("chat_history.jsonl"));
+        std::fs::write(dir.join("summary.json"), r#"{"session_kind":"subagent"}"#).unwrap();
+        assert!(grok_chat(root, file.to_str().unwrap()).is_none());
+        assert!(grok_chat(root, "/elsewhere/events.jsonl").is_none());
+        assert!(grok_chat(root, &format!("{}/%2Frepo/../x/events.jsonl", root.display())).is_none());
+    }
 
     #[test]
     fn descendants_follow_the_process_tree() {

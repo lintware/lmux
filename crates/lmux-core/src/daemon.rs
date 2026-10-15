@@ -335,7 +335,7 @@ fn is_shell(command: &str) -> bool {
 /// Parse a tmux `@lmux_agent_session` value, `<agent>:<id>`.
 fn parse_agent_tag(tag: &str) -> Option<AgentSession> {
     let (agent, id) = tag.split_once(':')?;
-    (matches!(agent, "claude" | "codex") && crate::tree::valid_agent_session_id(id)).then(|| AgentSession {
+    (matches!(agent, "claude" | "codex" | "grok") && crate::tree::valid_agent_session_id(id)).then(|| AgentSession {
         agent: agent.to_string(),
         id: id.to_string(),
     })
@@ -349,6 +349,7 @@ fn resume_command(a: &AgentSession) -> Option<String> {
     match a.agent.as_str() {
         "claude" => Some(format!("claude --resume {}\r", a.id)),
         "codex" => Some(format!("codex resume {}\r", a.id)),
+        "grok" => Some(format!("grok --resume {}\r", a.id)),
         _ => None,
     }
 }
@@ -1080,14 +1081,16 @@ impl Inner {
         // Codex has no session hook: find the rollout file each pane's codex
         // process has open, and tag the window like Claude's hook does.
         let pids = self.tmux.pane_pids().await.unwrap_or_default();
-        for (pane, id) in crate::probe::codex_sessions(&pids).await {
+        let (codex, grok) = tokio::join!(crate::probe::codex_sessions(&pids), crate::probe::grok_sessions(&pids));
+        for (pane, agent, id) in codex.into_iter().map(|(p, id)| (p, "codex", id))
+            .chain(grok.into_iter().map(|(p, id)| (p, "grok", id))) {
             let Some(w) = wins.iter().find(|w| w.pane == pane) else { continue };
-            let tag = format!("codex:{id}");
+            let tag = format!("{agent}:{id}");
             if w.agent_session.as_deref() != Some(tag.as_str()) {
                 let _ = self.tmux.set_window_option(&w.window, "@lmux_agent_session", &tag).await;
                 let mut state = self.state.lock().await;
                 if let Some(surf) = state.pane_index.get(&pane).cloned() {
-                    state.resume_mut(&surf).agent = Some(AgentSession { agent: "codex".into(), id });
+                    state.resume_mut(&surf).agent = Some(AgentSession { agent: agent.into(), id });
                 }
             }
         }
@@ -2211,6 +2214,9 @@ mod tests {
         assert!(parse_agent_tag("").is_none());
         let c = parse_agent_tag("codex:019f4dbf-d058-78d0-a3cc-1c0f28477ca6").unwrap();
         assert_eq!(resume_command(&c).unwrap(), "codex resume 019f4dbf-d058-78d0-a3cc-1c0f28477ca6\r");
+        let g = parse_agent_tag("grok:019f4dbf-d058-78d0-a3cc-1c0f28477ca6").unwrap();
+        assert_eq!(resume_command(&g).unwrap(), "grok --resume 019f4dbf-d058-78d0-a3cc-1c0f28477ca6\r");
+        assert!(parse_agent_tag("grok:abc;whoami").is_none());
         assert!(parse_agent_tag("vim:abc").is_none(), "only agents lmux knows how to resume");
         assert!(parse_agent_tag("claude:").is_none());
         assert!(parse_agent_tag("claude:abc; rm -rf ~").is_none());
