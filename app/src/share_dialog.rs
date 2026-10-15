@@ -152,6 +152,9 @@ fn connect_local_backend(gateway: Option<&Gateway>) {
     let Some(gateway) = gateway else { return };
     let Some(bin) = crate::net::local_server_bin() else { return };
     match Command::new(bin).args(["share-connect", &gateway.ssh_target])
+        // A shell can export a socket for a scratch daemon. The app always
+        // shares its normal local daemon, not the launching shell's override.
+        .env_remove("LMUX_SOCKET")
         .env("PATH", format!("{}:/opt/homebrew/bin:/usr/local/bin", crate::net::daemon_path()))
         .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn() {
         Ok(mut child) => {

@@ -42,7 +42,12 @@ pub fn show_hosts(ui: &mut Ui, rect: Rect, hosts: &mut [Ctx], active: usize) {
     // OpenUsage's limits sit at the bottom, under the list.
     let usage_h = super::usage::height(ui.ctx(), rect.height() - strip.height());
     let usage_rect = Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - usage_h), rect.max);
-    super::usage::show(ui, usage_rect);
+    if super::usage::show(ui, usage_rect) {
+        if let Some(c) = hosts.get_mut(active) {
+            // Same as the "Show QR…" menu item; a live share shows its QR again.
+            c.state.share_draft = Some(crate::share_dialog::Draft::default());
+        }
+    }
 
     let list = Rect::from_min_max(egui::pos2(rect.min.x, strip.max.y), egui::pos2(rect.max.x, usage_rect.min.y));
     // Rows are hit-tested against the area they were drawn in, so a drop while
@@ -119,7 +124,7 @@ fn body(ui: &mut Ui, rect: Rect, hosts: &mut [Ctx], active: usize) {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for (i, c) in hosts.iter_mut().enumerate() {
                     let top = ui.cursor().min.y;
-                    if multi && host_header(ui, c, i == active) {
+                    if multi && host_header(ui, c, i == active, i == 0) {
                         continue;
                     }
                     host_list(ui, c, i == active, multi);
@@ -193,14 +198,32 @@ fn host_list(ui: &mut Ui, c: &mut Ctx, is_active: bool, multi: bool) {
 /// A host's group header: its name and connection state. A click folds the
 /// group; the menu creates on that host or reconnects it. Returns true when
 /// the group is folded, so its rows are skipped.
-fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
+///
+/// Every host but the first sits under a hairline, so each reads as its own
+/// group. The right edge sums the group up: how many sessions wait for input,
+/// and, while folded, the unread count, so a folded host still says it needs
+/// you.
+fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool, first: bool) -> bool {
     use crate::net::ConnState;
     let w = ui.available_width();
+    if !first {
+        ui.add_space(6.0);
+    }
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, ROW_H * theme::sidebar_scale()), Sense::click());
     let painter = ui.painter_at(rect);
     let inner = rect.shrink2(Vec2::new(theme::SIDEBAR_PAD, 0.0));
     let cy = rect.center().y;
     let collapsed = c.state.host_collapsed;
+
+    if !first {
+        painter.line_segment(
+            [egui::pos2(inner.min.x, rect.min.y + 0.5), egui::pos2(inner.max.x, rect.min.y + 0.5)],
+            egui::Stroke::new(1.0, theme::HAIRLINE),
+        );
+    }
+    if resp.hovered() {
+        painter.rect_filled(rect.shrink2(Vec2::new(4.0, 2.0)), CornerRadius::same(6), theme::chip_hover_bg());
+    }
 
     icons::chevron(
         &painter,
@@ -209,17 +232,16 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
         theme::DIM,
         if collapsed { Arrow::Right } else { Arrow::Down },
     );
-    let (dot, mut status) = match c.net.state {
-        ConnState::Connected => (theme::GREEN, String::new()),
-        ConnState::Connecting => (theme::AMBER, "connecting…".to_owned()),
-        ConnState::Disconnected => (theme::RED, "offline".to_owned()),
+    let (dot, mut status, mut status_color) = match c.net.state {
+        ConnState::Connected => (theme::GREEN, String::new(), theme::DIM_2),
+        ConnState::Connecting => (theme::AMBER, "connecting…".to_owned(), theme::AMBER),
+        ConnState::Disconnected => (theme::RED, "offline".to_owned(), theme::RED),
     };
     // An install in progress (or failed) says so instead.
     // A cloud box being deleted says that instead.
     let deleting = c.state.cloud_delete.is_some();
     let install = c.state.cloud_delete.as_ref().or(c.state.install.as_ref()).map(|s| s.lock().unwrap().clone());
     let (doing, failed) = if deleting { ("deleting", "delete failed") } else { ("installing", "install failed") };
-    let mut status_color = theme::DIM_2;
     match &install {
         Some(crate::net::InstallStatus::Running(line)) => {
             status = format!("{doing} · {line}");
@@ -232,29 +254,52 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
         }
         _ => {}
     }
-    icons::dot(&painter, egui::pos2(inner.min.x + 18.0, cy), 3.0, dot);
-    let font = theme::pixel(theme::FS_TINY * theme::sidebar_scale());
-    let name = c.net.host_name().to_uppercase();
-    let color = if is_active || resp.hovered() { theme::TEXT_SOFT } else { theme::DIM };
-    let name_w = crate::util::measure(ui.ctx(), &name, &font);
-    let text_x = inner.min.x + 27.0;
+    icons::dot(&painter, egui::pos2(inner.min.x + 18.0, cy), 3.5, dot);
+
+    // The summary, right to left: unread (folded only), then sessions waiting.
+    let scale = theme::sidebar_scale();
+    let mut right = inner.max.x;
+    let unread: u32 = c.state.tree.workspaces.iter().map(|w| w.unread_notifications).sum();
+    if collapsed && unread > 0 {
+        // The same badge a folded folder shows.
+        let center = egui::pos2(right - 12.0, cy);
+        painter.circle_filled(center, 8.0, theme::BADGE);
+        painter.text(center, Align2::CENTER_CENTER, unread.to_string(), theme::ui(theme::FS_TINY * scale), Color32::WHITE);
+        right -= 26.0;
+    }
+    let waiting = c.state.tree.workspaces.iter().filter(|w| w.agent == AgentState::NeedsInput).count();
+    if waiting > 0 {
+        let font = theme::ui_semibold(theme::FS_TINY * scale);
+        let text = format!("{waiting} waiting");
+        let tw = crate::util::measure(ui.ctx(), &text, &font);
+        let pill = Rect::from_min_max(egui::pos2(right - tw - 22.0, cy - 8.0), egui::pos2(right, cy + 8.0));
+        painter.rect_filled(pill, CornerRadius::same(8), theme::attention_bg());
+        icons::dot(&painter, egui::pos2(pill.min.x + 8.5, cy), 2.5, theme::AMBER);
+        painter.text(egui::pos2(pill.max.x - 7.0, cy), Align2::RIGHT_CENTER, text, font, theme::AMBER);
+        right = pill.min.x - 6.0;
+    }
+
+    let text_x = inner.min.x + 28.0;
+    // Connection or install trouble beats the name for room: it is what the
+    // row is there to say.
+    if !status.is_empty() {
+        let font = theme::ui(theme::FS_TINY * scale);
+        let room = ((right - text_x) * 0.6).max(10.0);
+        let label = ellipsize(ui.ctx(), &status, &font, room, false);
+        let sw = crate::util::measure(ui.ctx(), &label, &font);
+        painter.text(egui::pos2(right, cy), Align2::RIGHT_CENTER, label, font, status_color);
+        right -= sw + 8.0;
+    }
+    let font = theme::ui_semibold(theme::FS_BODY * scale);
+    let name = c.net.host_name();
+    let color = if is_active || resp.hovered() { theme::TEXT } else { theme::TEXT_SOFT };
     painter.text(
         egui::pos2(text_x, cy),
         Align2::LEFT_CENTER,
-        ellipsize(ui.ctx(), &name, &font, (inner.max.x - text_x - 4.0).max(10.0), false),
+        ellipsize(ui.ctx(), &name, &font, (right - text_x).max(10.0), false),
         font,
         color,
     );
-    if !status.is_empty() {
-        let sx = text_x + name_w + 8.0;
-        painter.text(
-            egui::pos2(sx, cy),
-            Align2::LEFT_CENTER,
-            ellipsize(ui.ctx(), &status, &theme::ui(theme::FS_TINY * theme::sidebar_scale()), (inner.max.x - sx).max(10.0), false),
-            theme::ui(theme::FS_TINY * theme::sidebar_scale()),
-            status_color,
-        );
-    }
     if let Some(crate::net::InstallStatus::Failed(why)) = &install {
         let log = if deleting {
             "cloud-delete-*"
@@ -264,6 +309,9 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
             "install-*"
         };
         resp.clone().on_hover_text(format!("{why}\n(full log in ~/.local/state/lmux/{log}.log)"));
+    } else if let (ConnState::Disconnected, Some(err)) = (c.net.state, c.net.last_error.as_deref()) {
+        // Why the host is offline, without opening it.
+        resp.clone().on_hover_text(err.to_owned());
     }
 
     if resp.clicked() {
@@ -289,7 +337,7 @@ fn host_header(ui: &mut Ui, c: &mut Ctx, is_active: bool) -> bool {
             ui.close();
         }
         ui.separator();
-        if ui.button("Reconnect").clicked() {
+        if ui.button("Refresh Connection").clicked() {
             reconnect = true;
             ui.close();
         }
@@ -401,7 +449,7 @@ fn folder_row(
     icons::folder(
         &painter,
         Rect::from_center_size(egui::pos2(lead + 23.0, cy), Vec2::splat(17.0 * theme::sidebar_scale())),
-        if collapsed { theme::DIM } else { theme::FLAME },
+        if collapsed { theme::DIM_2 } else { theme::FOLDER },
     );
     let text_x = lead + FOLDER_TEXT_X;
     let avail = (inner.max.x - text_x - 4.0).max(10.0);
@@ -711,14 +759,29 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ct
     let radius = CornerRadius::same(CARD_RADIUS);
     if selected {
         p.rect_filled(rect, radius, theme::CARD_SELECTED);
-        // Thin, brighter bar at the left edge (as in the reference).
+        // A thin accent bar at the left edge marks it; the plate stays neutral.
         let bar = Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height()));
-        p.rect_filled(bar, radius, Color32::from_rgb(0xFF, 0xC2, 0x7A));
+        p.rect_filled(bar, radius, theme::ACCENT);
+    } else if ws.agent == AgentState::NeedsInput {
+        // A session waiting on the user carries an amber wash and edge bar, so
+        // it stands out of a long list without being selected.
+        p.rect_filled(rect, radius, theme::attention_bg());
+        let bar = Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height()));
+        p.rect_filled(bar, radius, theme::AMBER);
+        if resp.hovered() {
+            p.rect_filled(rect, radius, Color32::from_white_alpha(6));
+        }
     } else if resp.hovered() {
         p.rect_filled(rect, radius, Color32::from_white_alpha(8));
     }
 
-    let title_color = if selected { Color32::WHITE } else { theme::TEXT };
+    // An offline host's sessions are a last known state: dim them.
+    let offline = c.net.state == crate::net::ConnState::Disconnected;
+    let title_color = match (selected, offline) {
+        (true, _) => theme::TEXT,
+        (false, true) => theme::DIM,
+        (false, false) => theme::TEXT,
+    };
 
     let x = rect.min.x + PAD_X;
     let max_w = rect.width() - 2.0 * PAD_X;
@@ -741,8 +804,7 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ct
 
     // Agent state line: the card is just a name and what its agent is doing.
     if let Some(color) = agent_color(ws.agent) {
-        // Idle's accent blue is the selected card's own colour: go white there.
-        let color = if selected && color == theme::ACCENT { Color32::WHITE } else { color };
+        let color = if offline { theme::DIM_2 } else { color };
         if ws.agent == AgentState::Running {
             // A running agent spins, so activity reads at a glance.
             let phase = if c.state.animate { (ui.input(|i| i.time) * 0.8).fract() as f32 } else { 0.0 };
@@ -753,13 +815,16 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ct
         } else {
             icons::dot(&p, egui::pos2(x + 3.0, y + 6.0), 3.0, color);
         }
-        p.text(
-            egui::pos2(x + 12.0, y),
-            Align2::LEFT_TOP,
-            agent_label(ws.agent),
-            theme::ui(theme::FS_SMALL * theme::sidebar_scale()),
-            if selected { title_color } else { theme::TEXT_SOFT },
-        );
+        // Waiting for input is the one state that asks something of the user,
+        // so its label takes the state's colour and weight; the rest stay quiet.
+        let (font, label_color) = match ws.agent {
+            AgentState::NeedsInput if !offline => {
+                (theme::ui_semibold(theme::FS_SMALL * theme::sidebar_scale()), color)
+            }
+            AgentState::Running if !offline => (theme::ui(theme::FS_SMALL * theme::sidebar_scale()), theme::TEXT_SOFT),
+            _ => (theme::ui(theme::FS_SMALL * theme::sidebar_scale()), theme::DIM),
+        };
+        p.text(egui::pos2(x + 12.0, y), Align2::LEFT_TOP, agent_label(ws.agent), font, label_color);
     }
 
     // ⌘N while Cmd is held: the key that selects this card (9 is the last).
@@ -777,11 +842,7 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ct
             let w = crate::util::measure(ui.ctx(), &text, &font) + 10.0;
             let right = rect.max.x - if ws.unread_notifications > 0 { 26.0 } else { 6.0 };
             let pill = Rect::from_min_size(egui::pos2(right - w, rect.min.y + 4.0), Vec2::new(w, 15.0));
-            let (fill, fg) = if selected {
-                (Color32::from_white_alpha(60), Color32::WHITE)
-            } else {
-                (Color32::from_white_alpha(22), theme::TEXT_SOFT)
-            };
+            let (fill, fg) = (Color32::from_white_alpha(18), theme::TEXT_SOFT);
             p.rect_filled(pill, CornerRadius::same(7), fill);
             p.text(pill.center(), Align2::CENTER_CENTER, text, font, fg);
         }
@@ -790,15 +851,13 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ct
     // Unread badge, top right.
     if ws.unread_notifications > 0 {
         let badge = egui::pos2(rect.max.x - 12.0, rect.min.y + 11.0);
-        // On the blue selected card a blue badge would vanish: invert it.
-        let (fill, fg) = if selected { (Color32::WHITE, theme::BADGE) } else { (theme::BADGE, Color32::WHITE) };
-        p.circle_filled(badge, 8.0, fill);
+        p.circle_filled(badge, 8.0, theme::BADGE);
         p.text(
             badge,
             Align2::CENTER_CENTER,
             ws.unread_notifications.to_string(),
             theme::ui(theme::FS_TINY * theme::sidebar_scale()),
-            fg,
+            Color32::WHITE,
         );
     }
 
@@ -819,14 +878,9 @@ fn ws_card(ui: &mut Ui, ws: &Workspace, depth: usize, selected: bool, c: &mut Ct
         let hot = close_resp.hovered();
         if hot {
             // Round hover plate so the target reads as a button.
-            let plate = if selected { Color32::from_white_alpha(46) } else { Color32::from_white_alpha(22) };
-            p.circle_filled(close_center, 9.0, plate);
+            p.circle_filled(close_center, 9.0, Color32::from_white_alpha(22));
         }
-        let color = match (hot, selected) {
-            (true, _) => Color32::WHITE,
-            (false, true) => Color32::from_white_alpha(200),
-            (false, false) => theme::DIM_2,
-        };
+        let color = if hot { theme::TEXT } else { theme::DIM };
         icons::close(&p, Rect::from_center_size(close_center, Vec2::splat(14.0)), color);
     }
     if close_resp.clicked() {
@@ -881,6 +935,7 @@ fn card_menu(resp: &egui::Response, ws: &Workspace, c: &mut Ctx) {
 
     let mut new_session = false;
     let mut rename = false;
+    let mut copy_ids = false;
     let mut mark_read = false;
     let mut close = false;
     let mut move_to: Option<Option<Ref>> = None;
@@ -892,6 +947,10 @@ fn card_menu(resp: &egui::Response, ws: &Workspace, c: &mut Ctx) {
         }
         if ui.button("Rename Session…").clicked() {
             rename = true;
+            ui.close();
+        }
+        if ui.button("Copy IDs").clicked() {
+            copy_ids = true;
             ui.close();
         }
         if ws.unread_notifications > 0 && ui.button("Mark as Read").clicked() {
@@ -923,6 +982,19 @@ fn card_menu(resp: &egui::Response, ws: &Workspace, c: &mut Ctx) {
         c.state.new_session(ws.folder.clone());
     } else if rename {
         c.state.begin_ws_rename(Some(&ws.id));
+    } else if copy_ids {
+        // The focused tab's refs, as in a tab's own Copy IDs; the workspace
+        // alone when it has none.
+        let focused = ws
+            .focused_pane
+            .as_ref()
+            .and_then(|p| ws.panes.iter().find(|x| &x.id == p))
+            .or_else(|| ws.panes.first());
+        let surface = focused.and_then(|p| c.state.active_surface(p));
+        c.state.clipboard_out = Some(match (focused, surface) {
+            (Some(p), Some(s)) => crate::ui::ids_text(c, Some(&p.id), &s),
+            _ => format!("{}{}", crate::ui::host_prefix(c), ws.id),
+        });
     } else if mark_read {
         c.state.rpc(lmux_proto::methods::NOTIFY_MARK_READ, serde_json::json!({ "workspace": ws.id }));
         for n in c.state.notifications.iter_mut().filter(|n| n.workspace.as_deref() == Some(ws.id.as_str())) {
@@ -1007,7 +1079,8 @@ fn agent_color(state: AgentState) -> Option<Color32> {
     match state {
         AgentState::None => None,
         AgentState::Running => Some(theme::GREEN),
-        AgentState::Idle => Some(theme::ACCENT),
+        // Grey, not red: an idle agent is done, not failing.
+        AgentState::Idle => Some(theme::DIM_2),
         AgentState::NeedsInput => Some(theme::AMBER),
     }
 }

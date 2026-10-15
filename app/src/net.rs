@@ -45,6 +45,10 @@ pub struct HostConfig {
     /// a fast link; `LMUX_BROWSER_SCALE` overrides for a run.
     #[serde(default)]
     pub browser_scale: Option<f32>,
+    /// Stream this host's browser tabs from its Chromium, instead of running
+    /// them in the app (see [`Net::draws_browsers`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream_browsers: bool,
     /// Set for a cloud box lmux created, so the app can delete it again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud: Option<CloudBox>,
@@ -86,6 +90,7 @@ fn local_host() -> HostConfig {
         ssh_target: None,
         remote_port: DEFAULT_REMOTE_PORT,
         browser_scale: None,
+        stream_browsers: false,
         cloud: None,
     }
 }
@@ -404,6 +409,7 @@ pub fn ssh_host(target: &str) -> HostConfig {
         ssh_target: Some(target.to_owned()),
         remote_port: DEFAULT_REMOTE_PORT,
         browser_scale: None,
+        stream_browsers: false,
         cloud: None,
     }
 }
@@ -434,6 +440,7 @@ pub fn load_hosts() -> Vec<HostConfig> {
             ssh_target: None,
             remote_port: DEFAULT_REMOTE_PORT,
             browser_scale: None,
+            stream_browsers: false,
             cloud: None,
         }];
     }
@@ -461,15 +468,63 @@ pub fn load_hosts() -> Vec<HostConfig> {
 // --- tunnel ----------------------------------------------------------------
 
 pub struct Tunnel {
-    child: Child,
+    child: Option<Child>,
     pub port: u16,
+    /// The host's network as a SOCKS5 proxy (`ssh -D`), for browser pages
+    /// this app runs on the host's behalf.
+    pub socks_port: Option<u16>,
+    /// What the shared master must forget when this tunnel goes.
+    target: String,
+    sock: PathBuf,
+    forward: String,
+}
+
+impl Tunnel {
+    /// Stop the forwarding ssh and cancel its forwards in the shared master,
+    /// returning once the master has forgotten them. Quit uses this so the
+    /// cancel reaches the master before the master is told to exit.
+    fn close(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            run_cancel(cancel_args(&self.target, &self.sock, &self.forward, self.socks_port));
+        }
+    }
 }
 
 impl Drop for Tunnel {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // The cancel is a round trip to the master; keep it off the UI thread.
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let args = cancel_args(&self.target, &self.sock, &self.forward, self.socks_port);
+            std::thread::spawn(move || {
+                let _ = child.wait();
+                run_cancel(args);
+            });
+        }
     }
+}
+
+fn run_cancel(args: Vec<String>) {
+    let _ = Command::new("ssh")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// `ssh` arguments that cancel a tunnel's `-L` and `-D` forwards in the master
+/// behind `sock`.
+fn cancel_args(target: &str, sock: &std::path::Path, forward: &str, socks_port: Option<u16>) -> Vec<String> {
+    let mut a = vec!["-O".to_owned(), "cancel".into(), "-L".into(), forward.to_owned()];
+    if let Some(s) = socks_port {
+        a.push("-D".into());
+        a.push(format!("127.0.0.1:{s}"));
+    }
+    a.extend(["-o".into(), format!("ControlPath={}", sock.display()), "-o".into(), "BatchMode=yes".into(), target.to_owned()]);
+    a
 }
 
 fn free_port() -> Result<u16, String> {
@@ -497,10 +552,26 @@ fn wait_port(port: u16, timeout: Duration) -> bool {
 
 /// A stable control socket per ssh target, so forwards (and reconnects) to the
 /// same host multiplex over one transport (review #14).
-fn control_path(target: &str) -> PathBuf {
+pub fn control_path(target: &str) -> PathBuf {
     let mut h = DefaultHasher::new();
     target.hash(&mut h);
     std::env::temp_dir().join(format!("lmux-ssh-{:016x}", h.finish()))
+}
+
+/// Whether the master behind `sock` still answers (`ssh -O check`).
+fn master_alive(target: &str, sock: &std::path::Path) -> bool {
+    Command::new("ssh")
+        .args(["-O", "check"])
+        .arg("-o")
+        .arg(format!("ControlPath={}", sock.display()))
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .arg(target)
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Make sure a background SSH master exists for `target`. `ControlPersist`
@@ -509,10 +580,17 @@ fn control_path(target: &str) -> PathBuf {
 fn ensure_master(target: &str) -> Result<PathBuf, String> {
     let sock = control_path(target);
     if sock.exists() {
-        return Ok(sock);
+        // A socket file outlives a dead connection (network change, sleep),
+        // and every tunnel through it would fail until ControlPersist ran out.
+        if master_alive(target, &sock) {
+            return Ok(sock);
+        }
+        let _ = std::fs::remove_file(&sock);
     }
     let status = Command::new("ssh")
         .args(["-fN", "-M"])
+        .arg("-o")
+        .arg("ConnectTimeout=8")
         .arg("-o")
         .arg(format!("ControlPath={}", sock.display()))
         .arg("-o")
@@ -532,6 +610,7 @@ fn ensure_master(target: &str) -> Result<PathBuf, String> {
     if !status.success() {
         return Err(format!("ssh master to {target} failed ({status})"));
     }
+    mark_master_owned(target);
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(8) {
         if sock.exists() {
@@ -542,8 +621,34 @@ fn ensure_master(target: &str) -> Result<PathBuf, String> {
     Err(format!("ssh master to {target} did not open {}", sock.display()))
 }
 
-/// Best-effort teardown of a master started by [`ensure_master`] (app exit).
-pub fn close_master(target: &str) {
+/// Targets whose ssh master this process spawned. Other lmux apps, CLI
+/// sessions and ssh itself may share a master through its socket, so only
+/// these are ever told to exit.
+fn owned_masters() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static OWNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    OWNED.get_or_init(Default::default)
+}
+
+fn mark_master_owned(target: &str) {
+    if let Ok(mut o) = owned_masters().lock() {
+        o.insert(target.to_owned());
+    }
+}
+
+fn master_owned(target: &str) -> bool {
+    owned_masters().lock().is_ok_and(|o| o.contains(target))
+}
+
+/// Best-effort teardown of a master this process started (app exit). A master
+/// that was already running, or that another process started, is left alone.
+/// Returns whether an exit was requested.
+pub fn close_master(target: &str) -> bool {
+    if !master_owned(target) {
+        return false;
+    }
+    if let Ok(mut o) = owned_masters().lock() {
+        o.remove(target);
+    }
     let sock = control_path(target);
     let _ = Command::new("ssh")
         .args(["-O", "exit"])
@@ -556,6 +661,16 @@ pub fn close_master(target: &str) {
         .stderr(Stdio::null())
         .arg(target)
         .status();
+    true
+}
+
+/// Keep a live master; clear the socket file of a dead one so the next
+/// attempt builds a fresh master.
+fn refresh_master(target: &str) {
+    let sock = control_path(target);
+    if sock.exists() && !master_alive(target, &sock) {
+        let _ = std::fs::remove_file(&sock);
+    }
 }
 
 /// Blocking: open the tunnel and wait for the local port. Returns the websocket
@@ -566,7 +681,12 @@ pub fn open_tunnel(host: &HostConfig) -> Result<(String, Option<Tunnel>), String
     let sock = ensure_master(&target)?;
     let port = free_port()?;
     let forward = format!("127.0.0.1:{port}:127.0.0.1:{}", host.remote_port);
-    let mut child = Command::new("ssh")
+    let socks_port = free_port().ok();
+    let mut cmd = Command::new("ssh");
+    if let Some(s) = socks_port {
+        cmd.arg("-D").arg(format!("127.0.0.1:{s}"));
+    }
+    let mut child = cmd
         .arg("-N")
         .arg("-o")
         .arg(format!("ControlPath={}", sock.display()))
@@ -589,6 +709,7 @@ pub fn open_tunnel(host: &HostConfig) -> Result<(String, Option<Tunnel>), String
         .map_err(|e| format!("spawn ssh: {e}"))?;
     if !wait_port(port, Duration::from_secs(10)) {
         let _ = child.kill();
+        run_cancel(cancel_args(&target, &sock, &forward, socks_port));
         let detail = match child.wait_with_output() {
             Ok(out) => {
                 let text = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -613,7 +734,7 @@ pub fn open_tunnel(host: &HostConfig) -> Result<(String, Option<Tunnel>), String
             }
         });
     }
-    Ok((format!("ws://127.0.0.1:{port}"), Some(Tunnel { child, port })))
+    Ok((format!("ws://127.0.0.1:{port}"), Some(Tunnel { child: Some(child), port, socks_port, target, sock, forward })))
 }
 
 // --- connection ------------------------------------------------------------
@@ -663,10 +784,18 @@ pub struct Net {
     wake: Option<egui::Context>,
     /// Why the local daemon could not be started, if it could not.
     local_error: Option<String>,
+    /// The browser relay or data store for the current host failed.
+    browser_net_failed: bool,
+    /// `set_network` has run for this host, so `browser_net_failed` is known.
+    /// Until then the hello does not claim browsers it may not be able to draw.
+    browser_net_checked: bool,
 }
 
 impl Drop for Net {
     fn drop(&mut self) {
+        if let Some(t) = self.tunnel.as_mut() {
+            t.close();
+        }
         if let Some(host) = self.current_host() {
             if host.kind == "ssh" {
                 let target = host.ssh_target.clone().unwrap_or_else(|| host.name.clone());
@@ -728,6 +857,8 @@ impl Net {
             next_ping_id: PING_ID_BASE,
             wake: None,
             local_error: None,
+            browser_net_failed: false,
+            browser_net_checked: false,
         }
     }
 
@@ -783,10 +914,12 @@ impl Net {
             .is_some_and(|h| h.name == LOCAL_HOST_NAME)
     }
 
-    /// Device scale factor for the browser stream. Defaults to 1.0 over the
-    /// network (a Retina 2.0 would cost 4× the pixels); `LMUX_BROWSER_SCALE`
-    /// or the host's `browser_scale` opts into more (review #9).
-    pub fn browser_scale(&self) -> f32 {
+    /// Device scale factor for the browser stream: the display's own
+    /// (`pixels_per_point`, 2.0 on Retina), so text is as sharp as in a real
+    /// browser. A 1.0 stream looked pixelated once stretched onto a Retina
+    /// pane. The daemon's adaptive quality still drops resolution on a slow
+    /// link. `LMUX_BROWSER_SCALE` or the host's `browser_scale` overrides it.
+    pub fn browser_scale(&self, pixels_per_point: f32) -> f32 {
         if let Ok(v) = std::env::var("LMUX_BROWSER_SCALE") {
             if let Ok(v) = v.parse::<f32>() {
                 return v.clamp(1.0, 3.0);
@@ -794,8 +927,8 @@ impl Net {
         }
         self.current_host()
             .and_then(|h| h.browser_scale)
-            .unwrap_or(1.0)
-            .clamp(1.0, 3.0)
+            .unwrap_or(pixels_per_point)
+            .clamp(1.0, 2.0)
     }
 
     pub fn select_host(&mut self, index: usize, ctx: &egui::Context) {
@@ -866,8 +999,56 @@ impl Net {
         let msg = ClientMsg::Hello {
             protocol_version: PROTOCOL_VERSION,
             client_name: format!("lmux-app/{}", env!("CARGO_PKG_VERSION")),
+            draws_browsers: self.draws_browsers(),
         };
         self.send(&msg);
+    }
+
+    /// This app runs the host's new browser tabs itself, in WebKit with the
+    /// host's network (see `crate::socks`): pages react at local speed and
+    /// look as sharp as any Mac browser. Needs an ssh host (for the SOCKS
+    /// forward) and macOS 14 (per-host WebKit data stores with a proxy).
+    /// `"stream_browsers": true` in hosts.json, or `LMUX_STREAM_BROWSERS=1`,
+    /// keeps the host's Chromium and its frame stream instead.
+    pub fn draws_browsers(&self) -> bool {
+        self.wants_browsers() && self.browser_net_checked && !self.browser_net_failed
+    }
+
+    /// Whether this host's pages should run here, before the relay and data
+    /// store (which can fail) are known. See [`Net::draws_browsers`].
+    pub fn wants_browsers(&self) -> bool {
+        if std::env::var("LMUX_STREAM_BROWSERS").is_ok_and(|v| v == "1") {
+            return false;
+        }
+        self.current_host().is_some_and(|h| h.kind == "ssh" && !h.stream_browsers)
+            && self.socks_port().is_some()
+            && crate::webview::proxies_supported()
+    }
+
+    /// Record that the relay or data store for this host could not be set up
+    /// (or now can). A connected daemon is told, so it stops giving this app tabs.
+    pub fn set_browser_net_failed(&mut self, failed: bool) {
+        if self.browser_net_failed != failed || !self.browser_net_checked {
+            self.browser_net_failed = failed;
+            self.browser_net_checked = true;
+            if self.state == ConnState::Connected {
+                self.send_hello();
+            }
+        }
+    }
+
+    pub fn is_ssh(&self) -> bool {
+        self.current_host().is_some_and(|h| h.kind == "ssh")
+    }
+
+    /// The daemon port on the host, which pages must not reach.
+    pub fn remote_port(&self) -> u16 {
+        self.current_host().map_or(DEFAULT_REMOTE_PORT, |h| h.remote_port)
+    }
+
+    /// The host's SOCKS proxy port while its tunnel is up.
+    pub fn socks_port(&self) -> Option<u16> {
+        self.tunnel.as_ref().and_then(|t| t.socks_port)
     }
 
     pub fn send(&mut self, msg: &ClientMsg) {
@@ -892,8 +1073,39 @@ impl Net {
         self.receiver = None;
     }
 
+    /// Reconnect now, whatever the state: an attempt in flight is abandoned,
+    /// the backoff starts over, and a dead ssh master is dropped so the new
+    /// attempt builds a fresh one. The sidebar's "Refresh Connection".
+    pub fn reconnect_now(&mut self, ctx: &egui::Context) {
+        // Drop this app's tunnel first so its cancel reaches a live master.
+        // A live master stays (others may share it); only a dead one's socket goes.
+        self.tunnel = None;
+        if let Some(host) = self.current_host() {
+            if host.kind == "ssh" {
+                let target = host.ssh_target.clone().unwrap_or_else(|| host.name.clone());
+                refresh_master(&target);
+            }
+        }
+        self.drop_connection();
+        // A resolve still running keeps its thread but its answer is dropped.
+        self.resolve = Resolve::Idle;
+        self.state = ConnState::Disconnected;
+        self.attempt = 0;
+        self.retry_at = None;
+        self.begin_connect(ctx);
+    }
+
+    /// Skip the rest of a backoff wait, as when the window comes back into
+    /// focus after the Mac slept or changed network.
+    pub fn retry_soon(&mut self) {
+        if self.state == ConnState::Disconnected && self.retry_at.is_some() {
+            self.retry_at = Some(Instant::now());
+            self.wake();
+        }
+    }
+
     fn schedule_retry(&mut self) {
-        let secs = [0.5f64, 1.0, 2.0, 4.0, 8.0, 15.0][(self.attempt as usize).min(5)];
+        let secs = [0.3f64, 0.6, 1.0, 2.0, 3.0, 5.0][(self.attempt as usize).min(5)];
         self.attempt = self.attempt.saturating_add(1);
         self.retry_at = Some(Instant::now() + Duration::from_secs_f64(secs));
     }
@@ -1007,5 +1219,42 @@ impl Net {
             self.wake();
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tunnel_cancel_tests {
+    use super::*;
+
+    #[test]
+    fn only_masters_this_process_started_are_exited() {
+        let t = "lmux-test-no-such-host-owned";
+        assert!(!close_master(t), "a master we did not start must be left alone");
+        mark_master_owned(t);
+        assert!(close_master(t));
+        assert!(!close_master(t), "ownership ends once the master is told to exit");
+    }
+
+    #[test]
+    fn refresh_keeps_a_missing_socket_and_clears_a_dead_one() {
+        let t = "lmux-test-no-such-host-dead";
+        let sock = control_path(t);
+        let _ = std::fs::remove_file(&sock);
+        refresh_master(t);
+        assert!(!sock.exists());
+        std::fs::write(&sock, b"").unwrap();
+        refresh_master(t);
+        assert!(!sock.exists(), "a socket file with no master behind it is removed");
+    }
+
+    #[test]
+    fn cancel_names_both_forwards_and_the_master() {
+        let a = cancel_args("box", std::path::Path::new("/tmp/lmux-ssh-1"), "127.0.0.1:5000:127.0.0.1:7878", Some(6000));
+        assert_eq!(
+            a,
+            ["-O", "cancel", "-L", "127.0.0.1:5000:127.0.0.1:7878", "-D", "127.0.0.1:6000", "-o", "ControlPath=/tmp/lmux-ssh-1", "-o", "BatchMode=yes", "box"]
+        );
+        let a = cancel_args("box", std::path::Path::new("/s"), "f", None);
+        assert!(!a.contains(&"-D".to_owned()));
     }
 }

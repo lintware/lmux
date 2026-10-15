@@ -1,4 +1,4 @@
-//! The macOS menu bar: lmux, Workspace, Tab, View, Window and Help.
+//! The macOS menu bar: lmux, Workspace, Edit, Tab, View, Window and Help.
 //!
 //! Each item's id is a command-palette name, so a pick runs through
 //! [`crate::app::run_command`] like the palette does. A menu item's shortcut
@@ -84,6 +84,27 @@ pub fn install(ctx: &egui::Context) -> Option<MenuBar> {
         ],
     )
     .ok()?;
+    // A native WebKit page (the in-app browser) gets Cmd+C, Cmd+V, Cmd+A and
+    // Cmd+Z only from an Edit menu: AppKit sends `copy:`, `paste:` and the rest
+    // down the responder chain. muda turns auto-enabling off, so these items
+    // stay enabled whatever has focus and their shortcuts take the key before
+    // the window sees it: `webview::sync_focus` keeps the page from being the
+    // first responder while a terminal is focused, and `clip::watch_cmd_v`
+    // sees Cmd+V first.
+    let edit = Submenu::with_items(
+        "Edit",
+        true,
+        &[
+            &P::undo(None),
+            &P::redo(None),
+            &P::separator(),
+            &P::cut(None),
+            &P::copy(None),
+            &P::paste(None),
+            &P::select_all(None),
+        ],
+    )
+    .ok()?;
     let tab = Submenu::with_items(
         "Tab",
         true,
@@ -128,7 +149,7 @@ pub fn install(ctx: &egui::Context) -> Option<MenuBar> {
     let window = Submenu::with_items("Window", true, &[&P::minimize(None), &P::maximize(None)]).ok()?;
     let help = Submenu::with_items("Help", true, &[&named(WEBSITE, "lmux Website", None)]).ok()?;
 
-    let menu = Menu::with_items(&[&app, &workspace, &tab, &view, &window, &help]).ok()?;
+    let menu = Menu::with_items(&[&app, &workspace, &edit, &tab, &view, &window, &help]).ok()?;
     menu.init_for_nsapp();
     window.set_as_windows_menu_for_nsapp();
     help.set_as_help_menu_for_nsapp();

@@ -20,6 +20,30 @@ pub struct Ctx<'a> {
     pub net: &'a mut Net,
 }
 
+/// `"<host> "` on a remote host, empty on this Mac.
+pub fn host_prefix(c: &Ctx) -> String {
+    if c.net.is_local_host() {
+        return String::new();
+    }
+    c.net
+        .current_host()
+        .map(|h| format!("{} ", h.ssh_target.clone().unwrap_or_else(|| h.name.clone())))
+        .unwrap_or_default()
+}
+
+/// The refs of a tab for pasting into a command or a chat. On a remote host
+/// the host comes first (`lint-hqc-03 workspace:19 pane:32 surface:43`), since
+/// the same refs exist on every host and only mean something with it.
+pub fn ids_text(c: &Ctx, pane: Option<&str>, surface: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.extend(host_prefix(c).split_whitespace().map(str::to_owned));
+    let ws = c.state.tree.workspaces.iter().find(|w| w.panes.iter().any(|p| p.surfaces.iter().any(|s| s.id == surface)));
+    parts.extend(ws.map(|w| w.id.clone()));
+    parts.extend(pane.map(str::to_owned));
+    parts.push(surface.to_owned());
+    parts.join(" ")
+}
+
 /// Parse `#rrggbb` (as carried by `StatusPill::color`).
 pub fn parse_hex(s: &str, fallback: egui::Color32) -> egui::Color32 {
     let s = s.trim_start_matches('#');
