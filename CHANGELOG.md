@@ -9,6 +9,36 @@ All notable changes to lmux are listed here, newest first. The format follows
 
 ### Added
 
+- **Host-aware CLI access over SSH/Tailscale.** `--host HOST` selects another
+  daemon, `list-hosts` discovers configured routes, and `tree --all-hosts` groups
+  sessions by host with explicit partial-failure results. Remote calls clear
+  inherited caller IDs and socket settings to keep daemon-local refs isolated.
+  Existing local commands keep their behavior. See [usage](docs/host-routing.md).
+
+- **Per-surface Grok delivery observations.** `harness-status` exposes lifecycle,
+  visible queue counts, stable daemon-local send IDs, evidence sources, timestamps,
+  and staleness. Opt-in native Grok hooks and status-line forwarding distinguish
+  terminal acceptance, submission gates, and active turns. `harness-config`
+  separates requested model/effort from observed values and advertised choices;
+  unsupported live TUI control requests fail explicitly while preserving sessions.
+  Existing send behavior and human `OK` output stay unchanged. See
+  [usage and limits](docs/message-steering-status.md).
+
+- **Browser tabs on remote hosts run in the app's own WebKit.** The page is
+  drawn and run on the Mac, so it is sharp and as fast as a local tab; only
+  the page's network goes through the host. A SOCKS5 relay in the app sends
+  the host's own addresses (`localhost`, private IPs, `.local`, `.internal`,
+  `.ts.net`) through the host's ssh tunnel and everything else straight from
+  the Mac. Each host keeps its own cookies. `lmux browser` commands on the
+  host reach the app's page. Needs macOS 14+; set `"stream_browsers": true`
+  on a host in hosts.json (or `LMUX_STREAM_BROWSERS=1`) to keep the Chromium
+  stream. A host with Chromium moves tabs to it a few seconds after the last
+  such app disconnects, and takes them back when one connects.
+- **`lmux cp FILE... HOST[:WORKSPACE|/PATH]` copies files and folders to a host.**
+  `HOST:WORKSPACE` (a title, a fragment of one, or a ref) copies into that
+  workspace's working directory, so a chat running there can read the files.
+  `--tell` also pastes the remote paths into its terminal. It uses `scp`
+  with your ssh config and prints where each item landed.
 - **Share your sessions to a phone (`lmux share`, lmux menu > Show QR…).** Starts
   a Cloudflare Quick Tunnel and shows a QR code and a `trycloudflare.com` link.
   Opened on a phone, it lists every workspace and tab with its agent status,
@@ -51,6 +81,30 @@ All notable changes to lmux are listed here, newest first. The format follows
 
 ### Fixed
 
+- **Hosts reconnect faster.** The retry waits are shorter (0.3 s up to 5 s, was
+  0.5 s up to 15 s), a host that is waiting retries the moment the window
+  regains focus, and a dead ssh connection left behind by sleep or a network
+  change is replaced instead of reused. The host menu's "Reconnect" is now
+  "Refresh Connection": it drops the current attempt and connection and
+  starts over at once.
+- **Paste, copy and select-all work in the in-app browser.** The app had no
+  Edit menu, and a native WebKit page only receives Cmd+V, Cmd+C and Cmd+A
+  through it.
+- **Files land in streamed browser pages.** Files copied in Finder and
+  pasted with Cmd+V, or dropped from Finder onto the page, reach the page as
+  real files (paste event, drop on the element under the pointer, or a file
+  input), up to 10 MB at a time. Before, only the file name was typed.
+- **Streamed browser pages are sharp on Retina.** The stream now uses the
+  display's scale (2×), so text is no longer pixelated.
+- **Dropping files on a pane of a remote host copies them there.** They go to
+  the workspace's directory over the host's ssh connection, and the remote
+  paths are pasted into the pane (a Mac path means nothing on another host).
+- **Copy IDs** is on terminal panes and sidebar sessions too, and on a remote
+  host it starts with the host, so the refs name one machine.
+- **Copying in Grok Build on a remote host reaches this Mac's clipboard.**
+  Panes on a host now look like an SSH session (`LMUX_REMOTE=1` in the daemon
+  service), so Grok copies with OSC 52 instead of the host's own clipboard.
+  Reinstall the host (`deploy/install-remote.sh`) and open new tabs.
 - **Popups are real windows.** A page's `window.open` and `target=_blank` now
   open a tab beside it that keeps `window.opener`, so sign-ins that finish with
   `postMessage` and `window.close()` complete, and the tab goes away when the

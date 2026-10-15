@@ -74,7 +74,7 @@ struct Probe {
                         print("uploading", data.count, "bytes to", opened)
                     }
                     print("screen", surface, lines.count, "lines (contents withheld)")
-                    if typeText == nil, targetHost != nil {
+                    if typeText == nil, targetHost != nil, surface == opened {
                         check(!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "target host screen is reachable through the phone protocol")
                         try await sock.send(.close)
                         sock.close()
@@ -107,6 +107,10 @@ struct Probe {
             }
         } catch {
             print("socket ended:", error)
+        }
+        if targetHost != nil, typeText == nil {
+            print("FAIL target host did not return a screen")
+            exit(1)
         }
         print("done; chat frames seen:", sawChat)
     }

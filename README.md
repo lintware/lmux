@@ -83,6 +83,17 @@ lmux --help                         # everything else
 
 Inside a pane, `LMUX_WORKSPACE_ID` and `LMUX_SURFACE_ID` are set, so an agent can address its own workspace or the pane next to it.
 
+Refs belong to one daemon. Use `lmux list-hosts`, `lmux --host lint-hqc-01 tree`,
+and `lmux --json tree --all-hosts` to discover and query sessions on other hosts.
+Host routing uses SSH and supports aliases backed by Tailscale. See
+[host-aware CLI access](docs/host-routing.md) for target safety and discovery limits.
+
+For Grok automation, `lmux --json harness-status --surface S` reports per-surface
+lifecycle, queue, and message-delivery evidence. `harness-config` queries observed
+model/effort and reports unsupported live-control requests explicitly. See
+[Grok delivery and configuration](docs/message-steering-status.md) for opt-in
+hooks, usage, evidence limits, and safe handling of queued input.
+
 ## How it's built
 
 ```
