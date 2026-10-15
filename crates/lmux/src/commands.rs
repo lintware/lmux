@@ -683,6 +683,11 @@ fn build(cmd: Cmd) -> anyhow::Result<Req> {
         | Cmd::Hooks { .. }
         | Cmd::WsProbe { .. }
         | Cmd::Share { .. }
+        | Cmd::ShareBackend
+        | Cmd::ShareConnect { .. }
+        | Cmd::ShareAttach { .. }
+        | Cmd::Cp { .. }
+        | Cmd::ShareCode { .. }
         | Cmd::Rpc { .. }
         | Cmd::ImportCmux { .. }
         | Cmd::WaitFor { .. }
