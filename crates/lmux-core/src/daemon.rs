@@ -61,12 +61,56 @@ impl Config {
 }
 
 pub fn hostname() -> String {
+    // Dock/launchd processes have no HOSTNAME, and macOS has no /etc/hostname.
+    // Ask the kernel first so GUI and shell launches register the same host.
+    system_hostname()
+        .or_else(|| fallback_hostname())
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
+fn system_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: buf is writable for exactly the length passed to gethostname.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0)?;
+    clean_hostname(std::str::from_utf8(&buf[..end]).ok()?)
+}
+
+fn clean_hostname(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn fallback_hostname() -> Option<String> {
     std::fs::read_to_string("/etc/hostname")
         .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "localhost".to_string())
+        .and_then(|s| clean_hostname(&s))
+        .or_else(|| std::env::var("HOSTNAME").ok().and_then(|s| clean_hostname(&s)))
+}
+
+#[cfg(test)]
+mod hostname_tests {
+    use super::*;
+
+    #[test]
+    fn kernel_hostname_matches_system_without_shell_environment() {
+        let output = std::process::Command::new("/bin/hostname")
+            .env_remove("HOSTNAME")
+            .output()
+            .expect("system hostname command");
+        assert!(output.status.success());
+        let expected = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(system_hostname().as_deref(), Some(expected.trim()));
+        assert_eq!(hostname(), expected.trim());
+    }
+
+    #[test]
+    fn empty_hostname_is_not_a_valid_fallback() {
+        assert_eq!(clean_hostname(" \n"), None);
+        assert_eq!(clean_hostname(" macbook\n"), Some("macbook".into()));
+    }
 }
 
 /// Branch labels are re-derived at most this often per cwd. Short enough to pick

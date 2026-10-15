@@ -50,6 +50,11 @@ pub const PANE_SWAP: &str = "pane.swap"; // {pane, other} -> {} (exchange two pa
 
 // --- terminal control ---
 pub const TERM_SEND: &str = "term.send"; // {surface?, text} (text is sent literally; "\n" is Enter)
+/// Per-surface delivery evidence; refresh captures only visible Grok UI.
+pub const HARNESS_CONFIG: &str = "harness.config"; // {surface?, workspace?, model?, effort?} (observed/applied + requested; unsupported control is explicit)
+pub const HARNESS_STATUS: &str = "harness.status"; // {surface?, workspace?, all?: bool, cached?: bool}
+/// Sanitized Grok hook/status-line envelope. This records observations only.
+pub const HARNESS_OBSERVE: &str = "harness.observe"; // {surface?, event, session_id, prompt_id?, ...}
 pub const TERM_SEND_KEY: &str = "term.send_key"; // {surface?, key} e.g. "enter", "ctrl+c", "escape", "up"
 // `term.read_screen`: {surface?, scrollback?: bool, lines?: u32, start?, end?, escape?: bool, join?: bool} -> {text}.
 // `lines` keeps the last n lines (with `scrollback`, reaching into history).

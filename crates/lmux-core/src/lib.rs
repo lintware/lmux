@@ -12,6 +12,8 @@ pub mod app_browser;
 pub mod browser;
 pub mod daemon;
 pub mod keys;
+pub mod harness;
+pub mod harness_config;
 pub mod probe;
 pub mod rpc;
 pub mod scrollback;

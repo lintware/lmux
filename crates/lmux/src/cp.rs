@@ -58,7 +58,7 @@ pub fn ssh_target(name: &str, hosts: &Value) -> String {
         .to_string()
 }
 
-fn hosts_file() -> Option<PathBuf> {
+pub(crate) fn hosts_file() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let dir = if cfg!(target_os = "macos") {
         home.join("Library/Application Support")

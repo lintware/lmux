@@ -4,8 +4,9 @@ use anyhow::{bail, Context};
 use lmux_proto::methods;
 use serde_json::{json, Value};
 
-use crate::cli::{BrowserCmd, Cmd, Target};
-use crate::{call, wait};
+use crate::cli::{BrowserCmd, Cmd, HarnessCmd, Target};
+use crate::hosts::{call, Endpoint};
+use crate::wait;
 
 type Printer = Box<dyn Fn(&Value, bool)>;
 
@@ -141,7 +142,7 @@ fn take_flags(text: &mut Vec<String>, t: &mut Target, bools: &mut [(&str, &mut b
 }
 
 /// Run a non-server, non-hook command.
-pub async fn run(cmd: Cmd, socket: &str, json: bool) -> anyhow::Result<()> {
+pub async fn run(cmd: Cmd, socket: &Endpoint, json: bool) -> anyhow::Result<()> {
     // `send`/`paste`: flags written after the text.
     let cmd = match cmd {
         Cmd::Send { mut text, mut target, mut enter, mut paste, mut force } => {
@@ -202,10 +203,33 @@ pub async fn run(cmd: Cmd, socket: &str, json: bool) -> anyhow::Result<()> {
             if submit {
                 // The tab that took the paste, even when it was resolved.
                 let surface = v["surface"].as_str().map(String::from).or(t.surface.clone());
-                call(socket, methods::TERM_SEND_KEY, json!({"surface": surface, "workspace": t.workspace, "key": "enter"}))
+                call(socket, methods::TERM_SEND_KEY, json!({"surface": surface, "workspace": t.workspace, "key": "enter", "message_id": v["message_id"]}))
                     .await?;
             }
             print_json_or(&v, json, |_| println!("OK"));
+            return Ok(());
+        }
+        Cmd::Harness(HarnessCmd::Config { target: t, model, effort, options: _ }) => {
+            let set = model.is_some() || effort.is_some();
+            let v = call(socket, methods::HARNESS_CONFIG, with(target(&t), json!({"model":model, "effort":effort}))).await?;
+            print_json_or(&v, json, |v| {
+                let c = &v["configuration"];
+                println!("{} model={} effort={} stale={}", v["surface"].as_str().unwrap_or("?"),
+                    c["applied"]["model"].as_str().unwrap_or("unknown"),
+                    c["applied"]["effort"].as_str().unwrap_or("unknown"), c["applied"]["stale"]);
+                println!("model options: {}", c["options"]["models"]);
+                println!("effort options: {}", c["options"]["efforts"]);
+                if set {
+                    println!("request: {} ({})", c["requested"]["state"].as_str().unwrap_or("unknown"),
+                        c["requested"]["reason"].as_str().unwrap_or(""));
+                } else {
+                    println!("control: unsupported ({})", c["control"]["reason"].as_str().unwrap_or(""));
+                }
+            });
+            if set {
+                bail!("harness configuration {}: {}", v["configuration"]["requested"]["state"].as_str().unwrap_or("unknown"),
+                    v["configuration"]["requested"]["reason"].as_str().unwrap_or(""));
+            }
             return Ok(());
         }
         Cmd::Notify { clear: true, workspace, surface, .. } => {
@@ -324,7 +348,7 @@ fn build(cmd: Cmd) -> anyhow::Result<Req> {
             json!({}),
             Box::new(|v, j| print_json_or(v, j, |v| println!("{}", v["workspace"].as_str().unwrap_or("")))),
         ),
-        Cmd::Tree { workspace } => req(
+        Cmd::Tree { workspace, all_hosts: false } => req(
             methods::TREE,
             json!({}),
             Box::new(move |v, j| {
@@ -520,6 +544,23 @@ fn build(cmd: Cmd) -> anyhow::Result<Req> {
         Cmd::SendKey { key, target: t, force: _ } => {
             req(methods::TERM_SEND_KEY, with(target(&t), json!({"key": key})), ok_box())
         }
+        Cmd::Harness(HarnessCmd::Status { target: t, all, cached }) => req(
+            methods::HARNESS_STATUS,
+            with(target(&t), json!({"all": all, "cached": cached})),
+            Box::new(|v, j| print_json_or(v, j, |v| {
+                for surface in v["surfaces"].as_array().into_iter().flatten() {
+                    println!("{} lifecycle={} queue={}{}", surface["surface"].as_str().unwrap_or("?"),
+                        surface["lifecycle"]["state"].as_str().unwrap_or("unknown"),
+                        surface["queue"]["count"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()),
+                        if surface["queue"]["lower_bound"] == true { " (visible lower bound)" } else { "" });
+                    for message in surface["messages"].as_array().into_iter().flatten() {
+                        println!("  {} {} terminal_accepted={} consumed_at_ms={}", message["id"].as_str().unwrap_or("?"),
+                            message["state"].as_str().unwrap_or("unknown"), message["terminal_accepted"], message["consumed_at_ms"]);
+                    }
+                    println!("{}", surface["guidance"].as_str().unwrap_or(""));
+                }
+            })),
+        ),
         Cmd::ReadScreen { target: t, scrollback, lines } => req(
             methods::TERM_READ_SCREEN,
             with(target(&t), json!({"scrollback": scrollback || lines.is_some(), "lines": lines})),
@@ -687,11 +728,14 @@ fn build(cmd: Cmd) -> anyhow::Result<Req> {
         | Cmd::ShareConnect { .. }
         | Cmd::ShareAttach { .. }
         | Cmd::Cp { .. }
+        | Cmd::ListHosts
+        | Cmd::Tree { all_hosts: true, .. }
         | Cmd::ShareCode { .. }
         | Cmd::Rpc { .. }
         | Cmd::ImportCmux { .. }
         | Cmd::WaitFor { .. }
         | Cmd::NewWorkspace { .. }
+        | Cmd::Harness(HarnessCmd::Config { .. })
         | Cmd::Paste { .. }
         | Cmd::DismissNotification { .. }
         | Cmd::MarkNotificationRead { .. } => unreachable!("handled before build"),
@@ -888,7 +932,10 @@ fn selector_and_text(
     Ok((sel, text))
 }
 
-fn print_tree(tree: &Value) {
+pub(crate) fn print_tree(tree: &Value) {
+    if let Some(target) = tree["cli_target"]["host"].as_str() {
+        println!("target {target} (SSH)");
+    }
     let host = tree["host"].as_str().unwrap_or("?");
     println!("host {host}");
     let selected = tree["selected_workspace"].as_str().unwrap_or("");

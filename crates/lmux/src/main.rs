@@ -14,6 +14,8 @@ mod cli;
 mod commands;
 mod cp;
 mod import;
+mod grok_hooks;
+mod hosts;
 mod share;
 mod wait;
 
@@ -83,8 +85,21 @@ async fn shutdown_signal() {
 
 async fn run() -> anyhow::Result<()> {
     let cli = parse_cli();
+    cli.validate_host_scope()?;
     let socket = cli.socket.clone().unwrap_or_else(default_socket);
     let json = cli.json;
+    if cli.host.as_deref().is_some_and(|host| host != "local") && matches!(&cli.cmd,
+        Cmd::Server(_) | Cmd::Hooks { .. } | Cmd::WsProbe { .. } | Cmd::Cp { .. }
+        | Cmd::ImportCmux { .. } | Cmd::Share { .. } | Cmd::ShareCode { .. }
+        | Cmd::ShareBackend | Cmd::ShareAttach { .. } | Cmd::ShareConnect { .. } | Cmd::ListHosts
+    ) {
+        bail!("--host supports daemon commands; service, hook, file-copy and discovery commands run on this machine");
+    }
+    let discovered = if cli.host.as_deref().is_some_and(|host| host != "local")
+        || matches!(&cli.cmd, Cmd::ListHosts | Cmd::Tree { all_hosts: true, .. }) {
+        hosts::discover()?
+    } else { Vec::new() };
+    let endpoint = hosts::Endpoint::select(cli.host.as_deref(), cli.socket.as_deref(), &socket, &discovered)?;
 
     match cli.cmd {
         Cmd::Server(args) => {
@@ -181,7 +196,9 @@ async fn run() -> anyhow::Result<()> {
             hooks(cmd, &socket, json).await?;
             return Ok(());
         }
-        other => commands::run(other, &socket, json).await,
+        Cmd::ListHosts => { hosts::print_hosts(&discovered, json); Ok(()) }
+        Cmd::Tree { all_hosts: true, .. } => hosts::all_trees(&discovered, &socket, json).await,
+        other => commands::run(other, &endpoint, json).await,
     }
 }
 
@@ -240,7 +257,10 @@ async fn call_on(stream: tokio::net::UnixStream, req: RpcRequest) -> anyhow::Res
 // ---------------------------------------------------------------------------
 
 async fn hooks(cmd: HooksCmd, socket: &str, _json: bool) -> anyhow::Result<()> {
-    let HooksCmd::Claude { cmd } = cmd;
+    let cmd = match cmd {
+        HooksCmd::Grok { cmd } => return grok_hooks::run(cmd, socket).await,
+        HooksCmd::Claude { cmd } => cmd,
+    };
     if matches!(cmd, ClaudeHook::PrintConfig) {
         println!("{}", claude_settings_snippet());
         return Ok(());

@@ -8,14 +8,14 @@ use anyhow::{bail, Context};
 use lmux_proto::methods;
 use serde_json::json;
 
-use crate::call;
+use crate::hosts::{call, Endpoint};
 use crate::cli::Target;
 
 const SIGNAL_POLL: Duration = Duration::from_millis(50);
 const SCREEN_POLL: Duration = Duration::from_millis(250);
 
 pub async fn run(
-    socket: &str,
+    socket: &Endpoint,
     name: Option<String>,
     signal: bool,
     text: Option<String>,
@@ -35,6 +35,9 @@ pub async fn run(
             wait_for_text(socket, &pattern, scrollback, &target, timeout).await?;
         }
         (Some(name), None) => {
+            if socket.is_remote() {
+                bail!("named wait-for signals are machine-local; use --host with --text to poll a remote surface");
+            }
             let dir = signal_dir()?;
             if signal {
                 send_signal(&dir, &name)?;
@@ -49,7 +52,7 @@ pub async fn run(
 
 /// Poll the target's screen until `pattern` shows up.
 async fn wait_for_text(
-    socket: &str,
+    socket: &Endpoint,
     pattern: &str,
     scrollback: bool,
     target: &Target,
@@ -65,7 +68,16 @@ async fn wait_for_text(
         "scrollback": scrollback,
     });
     loop {
-        let v = call(socket, methods::TERM_READ_SCREEN, params.clone()).await?;
+        let read = call(socket, methods::TERM_READ_SCREEN, params.clone());
+        let v = if socket.is_remote() {
+            tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), read).await
+                .with_context(|| format!("wait-for timed out waiting for {pattern:?} on screen"))??
+        } else {
+            read.await?
+        };
+        if socket.is_remote() && Instant::now() > deadline {
+            bail!("wait-for timed out waiting for {pattern:?} on screen");
+        }
         if v["text"].as_str().is_some_and(|t| t.contains(pattern)) {
             return Ok(());
         }

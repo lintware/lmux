@@ -42,6 +42,8 @@ Terminal:
   send                       Type text (\\n is Enter, \\t is Tab)
   send-key                   Press a key (enter, ctrl+c, up, ...)
   paste                      Send text as is, from the argument or stdin
+  harness-status             Query per-surface lifecycle, queue and delivery evidence
+  harness-config             Query or request per-surface model and effort changes
   read-screen                Print a terminal's screen (--scrollback, --lines)
   capture-pane               tmux-style read-screen (-p, -S, -E, -J, -e)
   wait-for                   Wait for text on screen (--text), or a named signal
@@ -75,15 +77,17 @@ Other:
   share                      Share sessions to a phone or browser through a Cloudflare Quick Tunnel
   share-connect              Register this machine with a phone gateway over outbound SSH
   rpc                        Call a daemon method: rpc <method> [json-params]
+  list-hosts                 Discover local and SSH/Tailscale host routes
   ping                       Check the daemon answers
-  hooks                      Claude Code hooks
+  hooks                      Claude Code and Grok Build observation hooks
   server                     Run the daemon in the foreground
   help                       Print help for a command
 
 Targets: --workspace/--surface/--pane take refs such as workspace:2, surface:5,
 pane:3, or just the number (2). A workspace can also be named by its title.
 Left out, they mean the caller's own (from $LMUX_SURFACE_ID and
-$LMUX_WORKSPACE_ID), else what is focused.";
+$LMUX_WORKSPACE_ID), else what is focused. Refs belong to one host.
+Use --host HOST to query another daemon, or tree --all-hosts to discover sessions.";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -97,11 +101,25 @@ pub struct Cli {
     /// Path to the daemon unix socket (default $LMUX_SOCKET or ~/.local/state/lmux/lmux.sock).
     #[arg(long, global = true)]
     pub socket: Option<String>,
+    /// Select an SSH/Tailscale host (local keeps the local daemon). An explicit --socket is on that host.
+    #[arg(long, global = true)]
+    pub host: Option<String>,
     /// Print raw JSON results.
     #[arg(long, global = true)]
     pub json: bool,
     #[command(subcommand)]
     pub cmd: Cmd,
+}
+
+impl Cli {
+    pub fn validate_host_scope(&self) -> anyhow::Result<()> {
+        if let Cmd::Tree { all_hosts: true, workspace } = &self.cmd {
+            if self.host.is_some() || self.socket.is_some() || workspace.is_some() {
+                anyhow::bail!("tree --all-hosts requires an unfiltered host query; select --host, --socket or --workspace in a separate call");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -239,6 +257,9 @@ pub enum Cmd {
     CurrentWorkspace,
     /// Print workspaces, panes and surfaces.
     Tree {
+        /// Query discovered hosts, grouped by host; report unreachable hosts explicitly.
+        #[arg(long, conflicts_with_all = ["host", "workspace", "socket"])]
+        all_hosts: bool,
         /// Show only this workspace.
         #[arg(long)]
         workspace: Option<String>,
@@ -489,6 +510,8 @@ pub enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    #[command(flatten)]
+    Harness(HarnessCmd),
     /// Print a terminal's screen as plain text.
     ReadScreen {
         #[command(flatten)]
@@ -742,6 +765,9 @@ pub enum Cmd {
         /// A JSON object (default {}).
         params: Option<String>,
     },
+    /// Discover host routes from app hosts.json and literal SSH aliases.
+    #[command(alias = "hosts")]
+    ListHosts,
     /// Check the daemon answers.
     Ping,
     /// Claude Code hooks.
@@ -1088,12 +1114,59 @@ pub enum BrowserCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum HarnessCmd {
+    /// Query observed model/effort, or request a change. Unsupported control
+    /// returns an explicit status and leaves the session untouched.
+    #[command(name = "harness-config")]
+    Config {
+        #[command(flatten)]
+        target: Target,
+        /// Request this session model. Requires supported owning-harness control.
+        #[arg(long)]
+        model: Option<String>,
+        /// Request this model's advertised effort ID (for example high).
+        #[arg(long)]
+        effort: Option<String>,
+        /// Print available session-specific choices, when observed through ACP.
+        #[arg(long, conflicts_with_all = ["model", "effort"])]
+        options: bool,
+    },
+    /// Query per-surface harness lifecycle, queue and delivery evidence.
+    #[command(name = "harness-status")]
+    Status {
+        #[command(flatten)]
+        target: Target,
+        /// Query all terminal surfaces. A workspace target queries its terminals.
+        #[arg(long, conflicts_with_all = ["surface", "workspace"])]
+        all: bool,
+        /// Return cached evidence, with staleness, without capturing a screen.
+        #[arg(long)]
+        cached: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum HooksCmd {
+    /// Forward content-free Grok observations; print-config never installs hooks.
+    Grok {
+        #[command(subcommand)]
+        cmd: GrokHook,
+    },
     /// Install/print Claude Code hooks.
     Claude {
         #[command(subcommand)]
         cmd: ClaudeHook,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GrokHook {
+    /// Read a supported Grok hook event from stdin; print nothing.
+    Event,
+    /// Forward a supported status-line payload from stdin; print nothing.
+    StatusLine,
+    /// Print an opt-in Grok hooks snippet without editing settings.
+    PrintConfig,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1107,7 +1180,7 @@ pub enum ClaudeHook {
 }
 
 /// Global flags that take a value, for [`rewrite_browser_surface`].
-const VALUE_GLOBALS: &[&str] = &["--socket"];
+const VALUE_GLOBALS: &[&str] = &["--socket", "--host"];
 
 /// Stands in for the `--` that ends `send`/`paste` flags. clap swallows a
 /// `--` before the text but keeps one after it, so the text alone cannot say
@@ -1154,8 +1227,17 @@ pub fn rewrite_browser_surface(args: Vec<String>, subcommands: &[String]) -> Vec
     let mut j = i + 1;
     let mut surface = None;
     let mut workspace = None;
+    let mut globals = Vec::new();
     loop {
         match args.get(j).map(String::as_str) {
+            Some(flag) if VALUE_GLOBALS.contains(&flag) && j + 1 < args.len() => {
+                globals.extend_from_slice(&args[j..j + 2]);
+                j += 2;
+            }
+            Some(flag) if flag == "--json" || VALUE_GLOBALS.iter().any(|global| flag.starts_with(&format!("{global}="))) => {
+                globals.push(flag.to_string());
+                j += 1;
+            }
             Some("--workspace") if j + 1 < args.len() => {
                 workspace = Some(args[j + 1].clone());
                 j += 2;
@@ -1185,6 +1267,7 @@ pub fn rewrite_browser_surface(args: Vec<String>, subcommands: &[String]) -> Vec
     let mut out: Vec<String> = args[..=i].to_vec();
     if let Some(sub) = args.get(j) {
         out.push(sub.clone());
+        out.extend(globals);
         for (flag, v) in [("--surface", surface), ("--workspace", workspace)] {
             if let Some(v) = v {
                 out.push(flag.into());
@@ -1214,6 +1297,28 @@ mod tests {
 
     fn v(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn host_flags_preserve_browser_rewriting_and_literal_send_text() {
+        let subs = browser_subcommands();
+        let args = rewrite_browser_surface(v("lmux --host box browser surface:4 snapshot -i"), &subs);
+        assert_eq!(args, v("lmux --host box browser snapshot --surface surface:4 -i"));
+        assert_eq!(Cli::try_parse_from(args).unwrap().host.as_deref(), Some("box"));
+        assert_eq!(Cli::try_parse_from(v("lmux tree --host=box")).unwrap().host.as_deref(), Some("box"));
+        for args in ["lmux browser surface:4 --host box snapshot -i", "lmux browser --host=box surface:4 snapshot -i", "lmux browser --host box --surface surface:4 snapshot -i"] {
+            let cli = Cli::try_parse_from(rewrite_browser_surface(v(args), &subs)).unwrap();
+            assert_eq!(cli.host.as_deref(), Some("box"));
+            assert!(matches!(cli.cmd, Cmd::Browser { cmd: BrowserCmd::Snapshot { target, .. } } if target.surface.as_deref() == Some("surface:4")));
+        }
+        let cli = Cli::try_parse_from(mark_end_of_flags(v("lmux --host box send -- --host literal"))).unwrap();
+        assert_eq!(cli.host.as_deref(), Some("box"));
+        assert!(matches!(cli.cmd, Cmd::Send { text, .. } if text == vec![END_OF_FLAGS, "--host", "literal"]));
+        for args in ["lmux --host box tree --all-hosts", "lmux tree --all-hosts --workspace 1", "lmux --socket /s tree --all-hosts"] {
+            if let Ok(cli) = Cli::try_parse_from(v(args)) {
+                assert!(cli.validate_host_scope().is_err(), "{args}");
+            }
+        }
     }
 
     #[test]

@@ -884,3 +884,295 @@ async fn share_voice_runs_a_read_only_tool_for_the_call() {
     let _ = share.kill();
     let _ = share.wait();
 }
+
+#[test]
+fn harness_receipts_hooks_and_surface_isolation() {
+    let Some(d) = Daemon::start() else { return };
+    let ws = d.json(&["new-workspace", "--name", "harness-test", "--command", "/bin/sh", "--cwd", "/tmp"]);
+    let surface = ws["surface"].as_str().unwrap();
+    let tab = d.json(&["new-surface", "--command", "/bin/sh", "--focus", "false"]);
+    let other = tab["surface"].as_str().unwrap();
+    let text = "echo PRIVATE_HARNESS_TEST";
+    let sent = d.json(&["send", "--paste", "--enter", "--surface", surface, text]);
+    assert_eq!(sent["delivery"]["terminal_accepted"], true);
+    assert_eq!(sent["delivery"]["agent_receipt"], "unknown");
+    let id = sent["message_id"].as_str().unwrap();
+    assert!(id.starts_with("message:"));
+    let state = d.json(&["harness-status", "--surface", surface]);
+    assert_eq!(state["surfaces"][0]["messages"][0]["state"], "unknown");
+    assert!(state["surfaces"][0]["queue"]["count"].is_null());
+    assert!(!state.to_string().contains("PRIVATE_HARNESS_TEST"));
+    assert_eq!(d.ok(&["send-key", "--surface", surface, "enter"]).trim(), "OK");
+
+    let send_hook = |payload: serde_json::Value| {
+        use std::io::Write;
+        let mut child = d.cmd(&["hooks", "grok", "event"])
+            .env("LMUX_SURFACE_ID", surface)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.stdout.is_empty());
+    };
+    send_hook(serde_json::json!({"hookEventName":"session_start", "sessionId":"test-session"}));
+    send_hook(serde_json::json!({"hookEventName":"pre_compact", "sessionId":"test-session"}));
+    let state = d.json(&["harness-status", "--surface", surface, "--cached"]);
+    assert_eq!(state["surfaces"][0]["lifecycle"]["state"], "compacting");
+    send_hook(serde_json::json!({"hookEventName":"user_prompt_submit", "sessionId":"test-session", "promptId":"test-prompt", "prompt":text}));
+    let state = d.json(&["harness-status", "--surface", surface, "--cached"]);
+    assert_eq!(state["surfaces"][0]["messages"][0]["id"], id);
+    assert_eq!(state["surfaces"][0]["messages"][0]["state"], "submitted");
+    assert!(state["surfaces"][0]["messages"][0]["consumed_at_ms"].is_null());
+    send_hook(serde_json::json!({"hookEventName":"notification", "sessionId":"test-session", "notificationType":"permission_prompt"}));
+    send_hook(serde_json::json!({"hookEventName":"stop", "sessionId":"child-session", "subagentType":"explore"}));
+    let state = d.json(&["harness-status", "--surface", surface, "--cached"]);
+    assert_eq!(state["surfaces"][0]["lifecycle"]["state"], "waiting");
+    let state = d.json(&["harness-status", "--surface", other, "--cached"]);
+    assert!(state["surfaces"][0]["messages"].as_array().unwrap().is_empty());
+    let state = d.json(&["harness-status", "--workspace", ws["workspace"].as_str().unwrap(), "--cached"]);
+    assert_eq!(state["surfaces"].as_array().unwrap().len(), 2);
+    let bad = d.run(&["harness-status", "--surface", "999999"]);
+    assert!(!bad.status.success());
+    let config = d.json(&["hooks", "grok", "print-config"]);
+    assert!(config["hooks"]["PostCompact"].is_array());
+    d.ok(&["close-surface", "--surface", surface]);
+    send_hook(serde_json::json!({"hookEventName":"session_start", "sessionId":"late-closed-session"}));
+    let other_state = d.json(&["harness-status", "--surface", other, "--cached"]);
+    assert!(other_state["surfaces"][0]["session_id"].is_null());
+    assert_eq!(other_state["surfaces"][0]["lifecycle"]["state"], "unknown");
+}
+
+#[test]
+fn harness_configuration_query_and_safe_unsupported_set() {
+    let Some(d) = Daemon::start() else { return };
+    let ws = d.json(&["new-workspace", "--name", "configuration-test", "--command", "/bin/sh", "--cwd", "/tmp"]);
+    let surface = ws["surface"].as_str().unwrap();
+    let empty = d.json(&["harness-config", "--surface", surface, "--options"]);
+    assert!(empty["configuration"]["applied"]["model"].is_null());
+    assert!(empty["configuration"]["options"]["models"].is_null());
+    use std::io::Write;
+    let mut child = d.cmd(&["hooks", "grok", "status-line"])
+        .env("LMUX_SURFACE_ID", surface)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"session_id":"configuration-session","prompt_id":"active-prompt","model":{"id":"old-model"},"effort":{"level":"low"},"trigger":"state"}"#).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    let observed = d.json(&["harness-config", "--surface", surface]);
+    assert_eq!(observed["configuration"]["applied"]["model"], "old-model");
+    assert_eq!(observed["configuration"]["applied"]["evidence"]["source"], "grok_status_line");
+    let _ = d.json(&["rpc", "harness.observe", &serde_json::json!({"surface":surface,"event":"pre_compact","session_id":"configuration-session"}).to_string()]);
+    let before = d.ok(&["read-screen", "--surface", surface]);
+    let out = d.run(&["--json", "harness-config", "--surface", surface, "--model", "gpt-6.1-sol", "--effort", "high"]);
+    assert!(!out.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(response["configuration"]["requested"]["state"], "unsupported");
+    assert_eq!(response["configuration"]["requested"]["model"], "gpt-6.1-sol");
+    assert_eq!(response["configuration"]["requested"]["effort"], "high");
+    assert_eq!(response["configuration"]["requested"]["sent_to_harness"], false);
+    assert_eq!(response["configuration"]["applied"]["model"], "old-model");
+    assert_eq!(before, d.ok(&["read-screen", "--surface", surface]));
+    let state = d.json(&["harness-status", "--surface", surface, "--cached"]);
+    assert_eq!(state["surfaces"][0]["lifecycle"]["state"], "compacting");
+    assert!(state["surfaces"][0]["messages"].as_array().unwrap().is_empty());
+    let out = d.run(&["--json", "harness-config", "--surface", surface, "--effort", "high;bad"]);
+    let response: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(response["configuration"]["requested"]["state"], "failed");
+    assert!(response["configuration"]["requested"]["effort"].is_null());
+}
+
+#[test]
+fn harness_visible_queue_refresh_uses_foreground_grok_and_structured_json() {
+    let Some(d) = Daemon::start() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("grok-fixture");
+    std::fs::copy("/bin/sleep", &fixture).unwrap();
+    #[cfg(target_os = "macos")]
+    assert!(Command::new("codesign").args(["--force", "--sign", "-"]).arg(&fixture)
+        .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success());
+    let command = format!("printf '1. steer alpha\\n2. steer bravo\\n3. steer charlie\\n3 queued, Enter to send now\\nCompacting...\\n'; exec '{}' 60", fixture.display());
+    let ws = d.json(&["new-workspace", "--name", "queue-fixture", "--command", &command, "--cwd", "/tmp"]);
+    let surface = ws["surface"].as_str().unwrap();
+    d.ok(&["wait-for", "--text", "Enter to send now", "--surface", surface, "--timeout", "10"]);
+    let a = d.json(&["send", "--surface", surface, "--paste", "--enter", "steer alpha"]);
+    let b = d.json(&["send", "--surface", surface, "--paste", "--enter", "steer bravo"]);
+    let c = d.json(&["send", "--surface", surface, "--paste", "--enter", "steer charlie"]);
+    let v = d.json(&["harness-status", "--surface", surface]);
+    assert_eq!(v["surfaces"][0]["harness"], "grok", "{v}");
+    assert_eq!(v["surfaces"][0]["lifecycle"]["state"], "compacting");
+    assert_eq!(v["surfaces"][0]["queue"]["count"], 3);
+    assert_eq!(v["surfaces"][0]["queue"]["evidence"]["confidence"], "heuristic");
+    for (index, sent) in [a, b, c].into_iter().enumerate() {
+        assert_eq!(v["surfaces"][0]["messages"][index]["id"], sent["message_id"]);
+        assert_eq!(v["surfaces"][0]["messages"][index]["state"], "queued");
+        assert!(v["surfaces"][0]["messages"][index]["consumed_at_ms"].is_null());
+    }
+}
+
+/// A private SSH stand-in executes the actual quoted remote command against a
+/// second scratch daemon, with deliberately conflicting inherited context.
+struct HostCliFixture {
+    _dir: tempfile::TempDir,
+    home: PathBuf,
+    remote_home: PathBuf,
+    bin: PathBuf,
+}
+
+impl HostCliFixture {
+    fn new(local: &Daemon, remote: &Daemon, registry: serde_json::Value) -> Self {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::Builder::new().prefix("lmux-host-cli-").tempdir_in("/tmp").unwrap();
+        let home = dir.path().join("home");
+        let remote_home = dir.path().join("remote");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for (home, daemon) in [(&home, local), (&remote_home, remote)] {
+            std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+            std::fs::create_dir_all(home.join(".local/state/lmux")).unwrap();
+            symlink(BIN, home.join(".local/bin/lmux")).unwrap();
+            symlink(&daemon.socket, home.join(".local/state/lmux/lmux.sock")).unwrap();
+        }
+        let config = if cfg!(target_os = "macos") { home.join("Library/Application Support/lmux") } else { home.join(".config/lmux") };
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("hosts.json"), registry.to_string()).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/config"), "Host box\nHost *.invalid !skip\n").unwrap();
+        let ssh = bin.join("ssh");
+        std::fs::write(&ssh, r##"#!/bin/sh
+previous=''
+last=''
+for arg do previous=$last; last=$arg; done
+if [ -n "$TEST_SSH_LOG" ]; then printf '%s\n' "$previous" >> "$TEST_SSH_LOG"; fi
+case "$previous" in
+  slow) exec /bin/sleep 2;;
+  dead) echo 'test: peer unreachable' >&2; exit 255;;
+  invalid) printf 'invalid-json\n'; exit 0;;
+esac
+export HOME="$TEST_REMOTE_HOME"
+unset XDG_CONFIG_HOME XDG_STATE_HOME
+export LMUX_SOCKET=/wrong-socket LMUX_STATE_DIR=/wrong-state LMUX_SURFACE_ID=surface:1 LMUX_WORKSPACE_ID=workspace:1
+exec /bin/sh -c "$last"
+"##).unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Self { _dir: dir, home, remote_home, bin }
+    }
+
+    fn cmd(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(BIN);
+        command.args(args).env("HOME", &self.home).env("TEST_REMOTE_HOME", &self.remote_home)
+            .env("PATH", format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap_or_default()))
+            .env_remove("XDG_CONFIG_HOME").env_remove("XDG_STATE_HOME")
+            .env_remove("LMUX_SOCKET").env_remove("LMUX_STATE_DIR")
+            .env_remove("LMUX_WORKSPACE_ID").env_remove("LMUX_SURFACE_ID");
+        command
+    }
+}
+
+#[test]
+fn host_cli_routes_colliding_refs_and_stdin_without_local_caller_context() {
+    use std::io::Write;
+    let (Some(local), Some(remote)) = (Daemon::start(), Daemon::start()) else { return };
+    let local_ws = local.json(&["new-workspace", "--name", "local-work", "--command", "/bin/cat", "--cwd", "/tmp"]);
+    let remote_ws = remote.json(&["new-workspace", "--name", "remote-work", "--command", "/bin/cat", "--cwd", "/tmp"]);
+    assert_eq!(local_ws["surface"], remote_ws["surface"]);
+    let focused = remote.json(&["new-surface", "--command", "/bin/cat", "--focus", "true"]);
+    let fixture = HostCliFixture::new(&local, &remote, serde_json::json!([
+        {"name":"build", "label":"Build Host", "kind":"ssh", "ssh_target":"box"}
+    ]));
+    let out = fixture.cmd(&["--host", "Build Host", "--json", "identify"])
+        .env("LMUX_SOCKET", &local.socket).env("LMUX_STATE_DIR", "/wrong-local-state")
+        .env("LMUX_SURFACE_ID", local_ws["surface"].as_str().unwrap())
+        .env("LMUX_WORKSPACE_ID", local_ws["workspace"].as_str().unwrap()).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let identified: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(identified["surface"], focused["surface"]);
+    assert_eq!(identified["cli_target"]["host"], "Build Host");
+    let out = fixture.cmd(&["--json", "identify"]).env("LMUX_SURFACE_ID", local_ws["surface"].as_str().unwrap()).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["surface"], local_ws["surface"]);
+
+    let surface = remote_ws["surface"].as_str().unwrap();
+    let marker = fixture.home.join("shell-injection");
+    let text = format!("literal --host 'quote' `id` ~ $(touch '{}')\nsecond line", marker.display());
+    let mut child = fixture.cmd(&["--host=build", "--json", "paste", "--surface", surface, "-"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!marker.exists());
+    let out = fixture.cmd(&["--host", "build", "wait-for", "--surface", surface, "--text", "literal --host", "--timeout", "5"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = fixture.cmd(&["--host", "build", "--socket", remote.socket.to_str().unwrap(), "--json", "tree"]).output().unwrap();
+    assert!(out.status.success());
+    let tree: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(tree["workspaces"][0]["title"], "remote-work");
+    assert_eq!(local.json(&["tree"])["workspaces"][0]["title"], "local-work");
+    let out = fixture.cmd(&["--host", "build", "read-screen", "--surface", "999999"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("host build"));
+}
+
+#[test]
+fn host_cli_discovery_and_aggregate_trees_preserve_partial_failures_and_host_scope() {
+    let (Some(local), Some(remote)) = (Daemon::start(), Daemon::start()) else { return };
+    local.json(&["new-workspace", "--name", "local-work", "--command", "/bin/cat", "--cwd", "/tmp"]);
+    remote.json(&["new-workspace", "--name", "remote-work", "--command", "/bin/cat", "--cwd", "/tmp"]);
+    let fixture = HostCliFixture::new(&local, &remote, serde_json::json!([
+        {"name":"build", "kind":"ssh", "ssh_target":"box"},
+        {"name":"dead", "kind":"ssh", "ssh_target":"dead"},
+        {"name":"invalid", "kind":"ssh", "ssh_target":"invalid"},
+        {"name":"app-only", "kind":"direct", "url":"ws://localhost:1"}
+    ]));
+    let out = fixture.cmd(&["--json", "list-hosts"]).output().unwrap();
+    assert!(out.status.success());
+    let found: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(found["hosts"].as_array().unwrap().len(), 5);
+    let out = fixture.cmd(&["--json", "tree", "--all-hosts"]).output().unwrap();
+    assert!(!out.status.success());
+    let aggregate: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(aggregate["partial"], true);
+    let hosts = aggregate["hosts"].as_array().unwrap();
+    assert_eq!(hosts[0]["name"], "local");
+    assert_eq!(hosts[0]["tree"]["workspaces"][0]["title"], "local-work");
+    assert_eq!(hosts[1]["tree"]["workspaces"][0]["title"], "remote-work");
+    assert_eq!(hosts[0]["tree"]["workspaces"][0]["id"], hosts[1]["tree"]["workspaces"][0]["id"]);
+    assert_eq!(hosts[2]["state"], "unreachable");
+    assert_eq!(hosts[3]["state"], "unreachable");
+    assert_eq!(hosts[4]["state"], "unsupported");
+    let out = fixture.cmd(&["--host", "dead", "--json", "tree"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    for args in [vec!["--host=-bad", "tree"], vec!["--host=build", "server"], vec!["--host=build", "hooks", "grok", "print-config"], vec!["--host=build", "wait-for", "-S", "local-signal"]] {
+        assert!(!fixture.cmd(&args).output().unwrap().status.success());
+    }
+}
+
+#[test]
+fn host_cli_bounds_remote_waits_and_large_requests_and_keeps_explicit_discovery_working() {
+    use std::io::Write;
+    let (Some(local), Some(remote)) = (Daemon::start(), Daemon::start()) else { return };
+    let fixture = HostCliFixture::new(&local, &remote, serde_json::json!([]));
+    let log = fixture.home.join("ssh-calls");
+    let mut child = fixture.cmd(&["--host", "box", "paste", "-"])
+        .env("TEST_SSH_LOG", &log).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(&vec![b'x'; 256 * 1024]).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("64 KiB"));
+    assert!(!log.exists(), "oversized request launched SSH");
+    let started = Instant::now();
+    let out = fixture.cmd(&["--host", "slow", "wait-for", "--text", "late", "--timeout", "0.05"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("timed out"));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let aliases = (0..300).map(|i| format!("Host box-{i}\n")).collect::<String>();
+    std::fs::write(fixture.home.join(".ssh/config"), aliases).unwrap();
+    let out = fixture.cmd(&["--host", "box-299", "ping"]).env("TEST_SSH_LOG", &log).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+    for args in [vec!["--host", "box-299", "tree", "--all-hosts"], vec!["tree", "--all-hosts", "--host", "box-299"], vec!["--socket", "/x", "tree", "--all-hosts"], vec!["tree", "--all-hosts"]] {
+        let out = fixture.cmd(&args).env("TEST_SSH_LOG", &log).output().unwrap();
+        assert!(!out.status.success());
+    }
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+}

@@ -1180,6 +1180,89 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             ok(id, json!({"workspace": ws, "pane": pane, "other": other}))
         }
 
+        methods::HARNESS_CONFIG => {
+            let mut state = inner.state.lock().await;
+            let Some(surface) = resolve_surface(&state, params) else {
+                return err(id, RpcErrorCode::NotFound, "surface not found");
+            };
+            if !state.terms.contains_key(&surface) {
+                return err(id, RpcErrorCode::InvalidParams, "not a terminal surface");
+            }
+            for key in ["model", "effort"] {
+                if params.get(key).is_some_and(|v| !v.is_null() && !v.is_string()) {
+                    return err(id, RpcErrorCode::InvalidParams, format!("{key} must be a string"));
+                }
+            }
+            let model = s(params, "model");
+            let effort = s(params, "effort");
+            let harness = state.harnesses.entry(surface.clone()).or_default();
+            if model.is_some() || effort.is_some() {
+                harness.configuration.request(model.as_deref(), effort.as_deref(), now_ms());
+            }
+            ok(id, json!({"surface": surface, "session_id": harness.session_id,
+                "configuration": harness.configuration.snapshot(now_ms())}))
+        }
+        methods::HARNESS_OBSERVE => {
+            let mut state = inner.state.lock().await;
+            let Some(surface) = s(params, "surface").or_else(|| s(params, "caller_surface")) else {
+                return err(id, RpcErrorCode::NotFound, "surface not found");
+            };
+            if state.surface(&surface).is_none() {
+                return err(id, RpcErrorCode::NotFound, "observation surface not found");
+            }
+            if !state.terms.contains_key(&surface) {
+                return err(id, RpcErrorCode::InvalidParams, "not a terminal surface");
+            }
+            let harness = state.harnesses.entry(surface.clone()).or_default();
+            if let Err(e) = harness.observe_grok(params, now_ms()) {
+                return err(id, RpcErrorCode::InvalidParams, e);
+            }
+            ok(id, json!({"surface": surface, "observed": true}))
+        }
+        methods::HARNESS_STATUS => {
+            let targets = {
+                let state = inner.state.lock().await;
+                if b(params, "all") == Some(true) || (s(params, "workspace").is_some() && s(params, "surface").is_none()) {
+                    let workspace = if b(params, "all") == Some(true) { None } else { resolve_workspace(&state, params) };
+                    if b(params, "all") != Some(true) && workspace.is_none() {
+                        return err(id, RpcErrorCode::NotFound, "workspace not found");
+                    }
+                    state.all_surface_refs().into_iter().filter(|surface|
+                        state.terms.contains_key(surface) && (workspace.is_none() || state.workspace_of_surface(surface) == workspace)
+                    ).collect::<Vec<_>>()
+                } else {
+                    let Some(surface) = resolve_surface(&state, params) else {
+                        return err(id, RpcErrorCode::NotFound, "surface not found");
+                    };
+                    if !state.terms.contains_key(&surface) {
+                        return err(id, RpcErrorCode::InvalidParams, "not a terminal surface");
+                    }
+                    vec![surface]
+                }
+            };
+            if b(params, "cached") != Some(true) {
+                let windows = inner.tmux.list_windows().await;
+                for surface in &targets {
+                    let Some(term) = inner.surface_term(surface).await else { continue };
+                    let window = windows.as_ref().ok().and_then(|ws| ws.iter().find(|w| w.pane == term.pane));
+                    let command = window.and_then(|w| w.command.as_deref());
+                    let grok = command.is_some_and(|cmd| cmd == "grok" || cmd.starts_with("grok-"));
+                    let screen = if grok { inner.tmux.read_screen(&term.pane, false, None).await } else { Ok(String::new()) };
+                    let mut state = inner.state.lock().await;
+                    let harness = state.harnesses.entry(surface.clone()).or_default();
+                    match (window, screen) {
+                        (Some(_), Ok(screen)) => harness.observe_screen(grok, &screen, now_ms()),
+                        _ => harness.screen_error(now_ms()),
+                    }
+                }
+            }
+            let mut state = inner.state.lock().await;
+            let surfaces: Vec<_> = targets.iter().map(|surface|
+                state.harnesses.entry(surface.clone()).or_default().snapshot(surface, now_ms())
+            ).collect();
+            ok(id, json!({"surfaces": surfaces}))
+        }
+
         methods::TERM_SEND => {
             let surface = {
                 let state = inner.state.lock().await;
@@ -1195,13 +1278,29 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             let Some(term) = term else {
                 return err(id, RpcErrorCode::InvalidParams, "not a terminal surface");
             };
-            // `\n` acts as Enter.
+            // Register before tmux can deliver a hook for this input.
+            let message_id = {
+                let mut state = inner.state.lock().await;
+                state.harnesses.entry(surface.clone()).or_default().begin_send(&text, now_ms())
+            };
+            // `\n` acts as Enter. Preserve the existing byte path exactly.
             let bytes: Vec<u8> = text.bytes().map(|b| if b == b'\n' { b'\r' } else { b }).collect();
-            if let Err(e) = inner.tmux.send_bytes(&term.pane, &bytes).await {
+            let sent = inner.tmux.send_bytes(&term.pane, &bytes).await;
+            let accepted_at = now_ms();
+            if let Some(message_id) = &message_id {
+                let mut state = inner.state.lock().await;
+                if let Some(harness) = state.harnesses.get_mut(&surface) {
+                    harness.finish_send(message_id, sent.is_ok(), text.ends_with(['\n', '\r']), accepted_at);
+                }
+            }
+            if let Err(e) = sent {
                 return err(id, RpcErrorCode::Internal, format!("tmux: {e}"));
             }
-            ok(id, json!({"surface": surface}))
+            ok(id, json!({"surface": surface, "message_id": message_id,
+                "delivery": {"terminal_accepted": true, "accepted_at_ms": accepted_at,
+                    "agent_receipt": "unknown", "actual_steering": null, "completion": "unknown"}}))
         }
+
         methods::TERM_SEND_KEY => {
             let surface = {
                 let state = inner.state.lock().await;
@@ -1220,7 +1319,16 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             if let Err(e) = inner.tmux.send_named_key(&term.pane, &key).await {
                 return err(id, RpcErrorCode::InvalidParams, format!("{e}"));
             }
-            ok(id, json!({"surface": surface}))
+            let accepted_at = now_ms();
+            if matches!(key.to_ascii_lowercase().as_str(), "enter" | "return") {
+                if let Some(message_id) = s(params, "message_id") {
+                    if let Some(harness) = inner.state.lock().await.harnesses.get_mut(&surface) {
+                        harness.note_submit_key(&message_id, accepted_at);
+                    }
+                }
+            }
+            ok(id, json!({"surface": surface, "delivery": {"terminal_accepted": true,
+                "accepted_at_ms": accepted_at, "agent_receipt": "unknown", "actual_steering": null}}))
         }
         methods::TERM_READ_SCREEN => {
             let surface = {
