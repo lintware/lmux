@@ -620,7 +620,7 @@ impl Procs {
 async fn run(cmd: &str, args: &[&str]) -> Option<String> {
     let out = tokio::time::timeout(
         Duration::from_secs(3),
-        tokio::process::Command::new(cmd).args(args).stdin(std::process::Stdio::null()).output(),
+        tokio::process::Command::new(cmd).env_remove("OPENAI_API_KEY").args(args).stdin(std::process::Stdio::null()).output(),
     )
     .await
     .ok()?
@@ -789,7 +789,7 @@ mod tests {
     fn real_transcripts_parse() {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
         let newest = |pattern: &str| -> Option<PathBuf> {
-            let out = std::process::Command::new("sh").arg("-c").arg(format!("ls -t {pattern} 2>/dev/null | head -1")).output().ok()?;
+            let out = std::process::Command::new("sh").env_remove("OPENAI_API_KEY").arg("-c").arg(format!("ls -t {pattern} 2>/dev/null | head -1")).output().ok()?;
             let p = String::from_utf8_lossy(&out.stdout).trim().to_owned();
             (!p.is_empty()).then(|| p.into())
         };

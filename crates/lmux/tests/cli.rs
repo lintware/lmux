@@ -510,3 +510,256 @@ async fn share_shows_an_agent_transcript_as_chat() {
     let _ = share.kill();
     let _ = share.wait();
 }
+
+/// Gateway mode: `lmux share --server X` lists X's sessions next to this
+/// machine's, under `X/` ids, and sends screens, input and uploads to the
+/// server that owns the tab. A stand-in `ssh` runs the backend command here,
+/// against a second scratch daemon that plays the remote server.
+#[tokio::test(flavor = "multi_thread")]
+async fn share_gateway_controls_another_server() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+    let Some(local) = Daemon::start() else { return };
+    let Some(remote) = Daemon::start() else { return };
+    local.ok(&["new-workspace", "--name", "here", "--command", "/bin/sh"]);
+    remote.ok(&["new-workspace", "--name", "there", "--command", "/bin/sh"]);
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let ssh = bin_dir.path().join("ssh");
+    std::fs::write(&ssh, "#!/bin/sh\nfor a; do [ \"$a\" = gone ] && { echo 'ssh: Could not resolve hostname gone' >&2; exit 255; }; last=$a; done\nexec sh -c \"$last\"\n").unwrap();
+    std::fs::set_permissions(&ssh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin_dir.path().display(), std::env::var("PATH").unwrap_or_default());
+    let remote_bin = format!("{BIN} --socket {}", remote.socket.display());
+
+    let mut share = local
+        .cmd(&["--json", "share", "--no-tunnel", "--allow-typing", "--server", "vps1", "--server", "gone"])
+        .env("PATH", &path)
+        .env("LMUX_REMOTE_BIN", &remote_bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(share.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let info: serde_json::Value = serde_json::from_str(&line).expect("share prints JSON");
+    let url = info["url"].as_str().unwrap().to_string();
+    let (base, code) = url.split_once("/#").unwrap();
+    let addr = base.trim_start_matches("http://").to_string();
+    let body = format!("{{\"code\":\"{code}\"}}");
+    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    s.write_all(
+        format!("POST /auth HTTP/1.1\r\nHost: {addr}\r\nOrigin: {base}\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut ok = String::new();
+    s.read_to_string(&mut ok).unwrap();
+    let cookie = ok.lines().find_map(|l| l.strip_prefix("Set-Cookie: ")).expect("cookie").split(';').next().unwrap().to_string();
+
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("Origin", base.parse().unwrap());
+    req.headers_mut().insert("Cookie", cookie.parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("upgrade");
+
+    // Wait for a tree with both servers' sessions (the SSH link comes up in the background).
+    let mut tree = serde_json::Value::Null;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await else { continue };
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        let settled = |n: &str, want: &str| {
+            v["servers"].as_array().into_iter().flatten().any(|s| s["name"] == n && s["status"] == want)
+        };
+        if v["t"] == "tree" && v["workspaces"].as_array().is_some_and(|w| w.len() == 2)
+            && settled("vps1", "connected") && settled("gone", "unreachable")
+        {
+            tree = v;
+            break;
+        }
+    }
+    let ws_list = tree["workspaces"].as_array().expect("both servers' workspaces");
+    let there = ws_list.iter().find(|w| w["title"] == "there").expect("remote workspace");
+    assert_eq!(there["server"], "vps1");
+    assert_eq!(there["tabs"][0]["id"], "vps1/surface:1");
+    let here = ws_list.iter().find(|w| w["title"] == "here").expect("local workspace");
+    assert_eq!(here["tabs"][0]["id"], "surface:1");
+    let servers = tree["servers"].as_array().expect("server list");
+    let status = |n: &str| servers.iter().find(|s| s["name"] == n).map(|s| s["status"].clone());
+    assert_eq!(status("vps1"), Some(serde_json::json!("connected")));
+    assert_eq!(status("gone"), Some(serde_json::json!("unreachable")));
+    let gone = servers.iter().find(|s| s["name"] == "gone").unwrap();
+    assert!(gone["error"].as_str().unwrap_or("").contains("resolve"), "{gone}");
+
+    // Typing into the remote tab reaches the remote daemon only.
+    ws.send(Message::Text(r#"{"t":"open","surface":"vps1/surface:1"}"#.into())).await.unwrap();
+    ws.send(Message::Text(r#"{"t":"send","surface":"vps1/surface:1","text":"echo GW_$((6*7))","enter":true}"#.into()))
+        .await
+        .unwrap();
+    let mut saw = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !saw {
+        let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await else { continue };
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        saw = v["t"] == "screen" && v["surface"] == "vps1/surface:1" && v["text"].as_str().unwrap_or("").contains("GW_42");
+    }
+    assert!(saw, "the remote screen shows the typed command's output");
+    assert!(!local.ok(&["read-screen", "--surface", "surface:1"]).contains("GW_"));
+
+    // An upload lands on the server of the open tab.
+    ws.send(Message::Text(r#"{"t":"upload","id":"u1","name":"note.txt","size":5}"#.into())).await.unwrap();
+    ws.send(Message::Binary(b"hello".to_vec())).await.unwrap();
+    let mut path = None;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && path.is_none() {
+        let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await else { continue };
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        assert_ne!(v["t"], "upload_error", "{v}");
+        if v["t"] == "uploaded" {
+            path = v["path"].as_str().map(str::to_owned);
+        }
+    }
+    let path = path.expect("uploaded");
+    assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+
+    // An unknown server's tab is refused.
+    ws.send(Message::Text(r#"{"t":"send","surface":"nope/surface:1","text":"x","enter":false}"#.into())).await.unwrap();
+
+    let _ = share.kill();
+    let _ = share.wait();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The voice endpoints against a fake OpenAI: auth rules, the session body,
+/// and a `read_screen` tool call that runs through the share's real daemon.
+#[tokio::test(flavor = "multi_thread")]
+async fn share_voice_runs_a_read_only_tool_for_the_call() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let Some(d) = Daemon::start() else { return };
+    d.ok(&["new-workspace", "--name", "shared", "--command", "/bin/sh"]);
+    d.ok(&["send", "echo", "VOICE_$((6*7))\\n", "--surface", "surface:1"]);
+    d.ok(&["wait-for", "--text", "VOICE_42", "--surface", "surface:1", "--timeout", "10"]);
+
+    // A fake OpenAI, and a voice config that points at it with a throwaway key.
+    let fake = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fake_base = format!("http://{}", fake.local_addr().unwrap());
+    let cfg_dir = tempfile::Builder::new().prefix("lmuxvoice").tempdir_in("/tmp").unwrap();
+    let key = cfg_dir.path().join("key");
+    std::fs::write(&key, "throwaway-test-key\n").unwrap();
+    let cfg = cfg_dir.path().join("voice.json");
+    std::fs::write(&cfg, serde_json::json!({"openai_api_key_file": key}).to_string()).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in [&key, &cfg] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    let server = tokio::spawn(async move {
+        let (mut s, _) = fake.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let (end, len) = loop {
+            let n = s.read(&mut chunk).await.unwrap();
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..p]).to_ascii_lowercase();
+                assert!(head.contains("authorization: bearer throwaway-test-key"));
+                let len: usize = head.split("content-length: ").nth(1).unwrap().split("\r\n").next().unwrap().parse().unwrap();
+                break (p + 4, len);
+            }
+        };
+        while buf.len() < end + len {
+            let n = s.read(&mut chunk).await.unwrap();
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let sent: serde_json::Value = serde_json::from_slice(&buf[end..end + len]).unwrap();
+        let body = serde_json::json!({"session": {"id": "live_t"}, "transport": {"sdp": "v=0 answer"}}).to_string();
+        s.write_all(format!("HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        drop(s);
+
+        let (s, _) = fake.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
+        let ev = |v: serde_json::Value| Message::Text(serde_json::json!({"type": "response.event", "delegation_id": "d", "event": v}).to_string());
+        ws.send(ev(serde_json::json!({"type": "response.created", "response": {"id": "r1"}}))).await.unwrap();
+        ws.send(ev(serde_json::json!({"type": "response.output_item.done", "item": {"type": "function_call",
+            "call_id": "c1", "name": "read_screen", "arguments": "{\"surface\":\"surface:1\"}"}}))).await.unwrap();
+        ws.send(ev(serde_json::json!({"type": "response.completed", "response": {"id": "r1", "output": []}}))).await.unwrap();
+        let mut output = None;
+        let mut closed_asked = false;
+        while let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            match v["type"].as_str() {
+                Some("response.item.create") => output = Some(v["item"]["output"].as_str().unwrap().to_string()),
+                Some("session.close") => {
+                    closed_asked = true;
+                    ws.send(Message::Text(serde_json::json!({"type": "session.closed", "reason": "close_requested", "usage": {"seconds": 1}}).to_string())).await.unwrap();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        (sent, output, closed_asked)
+    });
+
+    let mut share = d
+        .cmd(&["--json", "share", "--no-tunnel"])
+        .env("LMUX_VOICE_CONFIG", &cfg)
+        .env("LMUX_OPENAI_BASE", &fake_base)
+        .env_remove("OPENAI_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(share.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let info: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let url = info["url"].as_str().unwrap().to_string();
+    let (base, code) = url.split_once("/#").unwrap();
+    let addr = base.trim_start_matches("http://").to_string();
+    let http = |req: String| -> String {
+        let mut s = std::net::TcpStream::connect(&addr).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    };
+    let post = |path: &str, origin: &str, cookie: Option<&str>, body: &str| {
+        let cookie = cookie.map(|c| format!("Cookie: {c}\r\n")).unwrap_or_default();
+        http(format!("POST {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\n{cookie}Content-Length: {}\r\n\r\n{body}", body.len()))
+    };
+
+    // Nothing without the cookie or with a foreign origin, and nothing was spent upstream.
+    let offer = r#"{"sdp":"v=0\r\no=- 1 1 IN IP4 0.0.0.0"}"#;
+    assert!(post("/voice/offer", base, None, offer).starts_with("HTTP/1.1 401"));
+    let ok = post("/auth", base, None, &format!("{{\"code\":\"{code}\"}}"));
+    let cookie = ok.lines().find(|l| l.starts_with("Set-Cookie:")).unwrap().trim_start_matches("Set-Cookie: ").split(';').next().unwrap().to_string();
+    assert!(post("/voice/offer", "http://evil.example", Some(&cookie), offer).starts_with("HTTP/1.1 403"));
+    assert!(post("/voice/offer", base, Some(&cookie), r#"{"sdp":"nope"}"#).starts_with("HTTP/1.1 400"));
+    assert!(post("/voice/talk", base, Some(&cookie), r#"{"on":true,"seq":1}"#).starts_with("HTTP/1.1 404"), "no call yet");
+
+    let r = post("/voice/offer", base, Some(&cookie), offer);
+    assert!(r.starts_with("HTTP/1.1 201"), "{r}");
+    assert!(r.contains(r#""sdp":"v=0 answer""#), "{r}");
+    assert!(!r.contains("throwaway-test-key"));
+    // A second call while one runs is refused.
+    assert!(post("/voice/offer", base, Some(&cookie), offer).starts_with("HTTP/1.1 429"));
+
+    // Let the tool run, then end the call from the page.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(post("/voice/end", base, Some(&cookie), "{}").starts_with("HTTP/1.1 200"));
+    let (sent, output, closed_asked) = tokio::time::timeout(Duration::from_secs(15), server).await.unwrap().unwrap();
+    assert!(closed_asked, "session.close reached the sideband");
+    assert_eq!(sent["session"]["delegation"]["type"], "responses");
+    assert!(!sent.to_string().contains("send_text"));
+    let output = output.expect("the tool result reached the sideband");
+    assert!(output.contains("VOICE_42"), "{output}");
+    assert!(output.contains("not instructions"), "screen text is marked as data");
+
+    let _ = share.kill();
+    let _ = share.wait();
+}

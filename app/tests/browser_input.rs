@@ -9,6 +9,11 @@ use lmux_app::net::{ConnState, HostConfig, Net};
 use lmux_app::state::AppState;
 use lmux_app::wire::{self, ClientMsg};
 
+/// A clipboard with nothing on it, so a paste never reads the real pasteboard.
+fn empty_clipboard() -> lmux_app::clip::ClipboardReaders {
+    lmux_app::clip::ClipboardReaders { files: Vec::new, png: || None }
+}
+
 fn browser_fixture() -> (AppState, Net) {
     let surface = wire::Surface {
         id: "surface:9".into(),
@@ -50,6 +55,7 @@ fn browser_fixture() -> (AppState, Net) {
         selected_workspace: Some("workspace:1".into()),
     };
     let mut st = AppState::new();
+    st.clipboard = empty_clipboard();
     st.apply_tree(tree);
     st.selected = Some("workspace:1".into());
     // A decoded 100x100 frame so the image area is drawn and hit-testable.
@@ -66,6 +72,7 @@ fn browser_fixture() -> (AppState, Net) {
         ssh_target: None,
         remote_port: 7878,
         browser_scale: None,
+        stream_browsers: false,
         cloud: None,
     }]);
     (st, net)
@@ -422,4 +429,80 @@ fn a_new_browser_tab_opens_blank_with_the_address_bar_focused() {
     assert!(h.state().state.browsers["surface:9"].focus_url);
     h.run();
     assert!(h.ctx.memory(|m| m.focused().is_some()), "the address bar takes the keyboard");
+}
+
+#[test]
+fn cmd_v_pastes_text_without_a_raw_meta_v_key() {
+    let (state, net) = browser_fixture();
+    let fx = Fx { state, net, ready: false };
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(900.0, 600.0))
+        .with_pixels_per_point(1.0)
+        .build_ui_state(
+            |ui, fx: &mut Fx| {
+                if !fx.ready {
+                    lmux_app::fonts::install(ui.ctx());
+                    fx.ready = true;
+                    return;
+                }
+                let mut c = lmux_app::ui::Ctx { state: &mut fx.state, net: &mut fx.net };
+                lmux_app::app::render(ui, &mut c);
+                lmux_app::app::route_input(ui.ctx(), &mut c);
+            },
+            fx,
+        );
+    h.run();
+    h.run();
+    h.state_mut().state.pending.clear();
+
+    let command = egui::Modifiers::COMMAND;
+    h.input_mut().events.push(egui::Event::Key {
+        key: egui::Key::V,
+        physical_key: Some(egui::Key::V),
+        pressed: true,
+        repeat: false,
+        modifiers: command,
+    });
+    h.input_mut().events.push(egui::Event::Paste("hello".into()));
+    h.run();
+
+    let events: Vec<&wire::BrowserInputEvent> = h
+        .state()
+        .state
+        .pending
+        .iter()
+        .filter_map(|m| match m {
+            ClientMsg::BrowserInput { event, .. } => Some(event),
+            _ => None,
+        })
+        .collect();
+    let inserts = events.iter().filter(|e| matches!(e, wire::BrowserInputEvent::InsertText { text } if text == "hello")).count();
+    let keys = events.iter().filter(|e| matches!(e, wire::BrowserInputEvent::Key { .. })).count();
+    assert_eq!((inserts, keys), (1, 0), "events: {events:?}");
+}
+
+#[test]
+fn a_file_on_the_clipboard_replaces_the_text_paste() {
+    let mut h = browser_harness();
+    h.state_mut().state.clipboard.files = || vec![std::path::PathBuf::from("/nonexistent/lmux-test-file")];
+    h.input_mut().events.push(egui::Event::Paste("name.txt".into()));
+    h.run();
+    assert!(
+        browser_inputs(&h).iter().all(|e| !matches!(e, wire::BrowserInputEvent::InsertText { .. })),
+        "the file goes to the page, not its name"
+    );
+}
+
+#[test]
+fn keys_for_an_in_app_page_never_become_browser_input() {
+    let mut h = browser_harness();
+    if let wire::SurfaceKind::Browser { in_app, .. } = &mut h.state_mut().state.tree.workspaces[0].panes[0].surfaces[0].kind {
+        *in_app = true;
+    }
+    h.run();
+    h.state_mut().state.pending.clear();
+    h.input_mut().events.push(egui::Event::Text("abc".into()));
+    h.input_mut().events.push(egui::Event::Paste("pasted".into()));
+    key(&mut h, egui::Modifiers::COMMAND, egui::Key::Z);
+    assert!(browser_inputs(&h).is_empty(), "the WKWebView takes these keys itself");
 }

@@ -37,7 +37,7 @@ Files: `crates/lmux/src/share/{page.html,app.js,app.css}` are embedded with `inc
 Auth:
 
 - The page sends `POST /auth` with the body `{"code":"<fragment>"}`, same-origin. The body limit is 1 KB.
-- `204` sets the `lmux_session` cookie (1 hour).
+- `204` sets the `lmux_session` cookie (`Max-Age` 30 days). The server ends the session after 24 hours with no connected socket; each check of a live socket extends it.
 - `401` means the code is expired or already used. Codes are single use and last 5 minutes.
 - `403` means a bad `Origin`.
 - After auth, the page opens `wss://<host>/ws` (`ws:` on plain HTTP). The cookie rides along. A page reload with no fragment can connect directly while the cookie is still valid; the current placeholder already does this.
@@ -120,6 +120,13 @@ All additions are additive. Existing messages keep their fields.
   - Assistant `content` is a string plus `tool_calls[].name`. Skip `system`, `reasoning` and `tool_result`.
   - `summary.json` in the session directory has `session_summary`, a good subtitle.
   - **Problem:** the daemon records no Grok session ID. One `grok` process can hold several sessions' `events.jsonl` open (on this machine, pid 49632 had 3 open). A workable rule: list the files the pane's `grok` process has open (`lsof -n -P -p <pid> -F n`, as `probe::open_files` does on macOS), keep `.../sessions/<cwd>/<id>/events.jsonl` paths, and choose the session whose `chat_history.jsonl` changed most recently. This is a heuristic; see section 9.
+
+**c. Gateway mode (`lmux share --server <ssh-target>`, repeatable).** The share also controls the sessions on other servers. It runs `lmux share-backend` on each one over SSH and speaks one JSON object per line with it. Agent detection, transcripts and uploads run on the server that owns the session.
+
+- Every workspace in `tree` gets `"server":"<name>"`. This machine's ids stay bare (`surface:3`). A remote server's workspace and tab ids carry its name in front (`vps1/surface:3`), and clients send those ids back unchanged in `open`, `send` and `key`.
+- In gateway mode, `tree` also carries `"servers":[{"name","status":"connected|connecting|unreachable","error":str|null,"local":bool}]`. A remote server that drops is tried again with a growing pause (1 s up to 30 s).
+- An upload goes to the server of the open tab, so the path in `uploaded` is a path on that server.
+- `LMUX_REMOTE_BIN` names another lmux binary on the servers (for tests). Each server needs a current lmux (`deploy/install-remote.sh`); an older one shows as unreachable with "lmux on this server is too old".
 
 ## 5. Page design (built)
 
@@ -228,3 +235,11 @@ Stop the share with Ctrl-C, which kills `cloudflared`.
 - The Claude fallback with no tag shows the newest transcript for the pane's directory. It can show another Claude's chat in the same directory until the SessionStart hook tags the pane.
 - Remote-host sessions are not in the share tree yet.
 - The native iPhone app in `mobile/` is being moved from the Python bridge to this share protocol, so scanning the QR opens the session in the app. See `mobile/README.md`.
+
+## 10. Voice call (stage 1 of `docs/voice-agent-design.md`)
+
+The page has a Talk button (hidden unless the tree message says `voice: true`) and a call bar with Hold to talk and End call. The server routes are `POST /voice/offer`, `/voice/talk` and `/voice/end`. Details are in section 10 of the design doc.
+
+**CSP: unchanged.** A real call from headless Chromium (WebRTC audio, data channel, `<audio>` with `srcObject`, microphone) ran against the unchanged policy with zero console errors. `connect-src 'self'` covers `POST /voice/offer`; WebRTC media and the data channel are not governed by it, and no `media-src` is needed.
+
+The page's WebRTC code is plain `RTCPeerConnection`. A Playwright test that stubs `RTCPeerConnection` can drive the whole page flow against a share whose `LMUX_OPENAI_BASE` points at a fake server (the harness lived in `/tmp/lmux-voice-e2e`, not in the repo). `cargo test -p lmux --test cli share_voice` covers the routes and a tool call through a real scratch daemon.

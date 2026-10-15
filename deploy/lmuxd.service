@@ -24,6 +24,9 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 RestartSec=2
 Environment=RUST_LOG=info
+# Panes look like an SSH session, so Grok Build copies with OSC 52 (to the
+# Mac running the app) instead of this host's clipboard.
+Environment=LMUX_REMOTE=1
 # The tmux server and windows must outlive the daemon, so let tmux daemonise
 # normally; killing lmuxd only drops the control client.
 KillMode=process

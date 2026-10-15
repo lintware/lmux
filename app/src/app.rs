@@ -44,6 +44,8 @@ pub struct LmuxApp {
     hosts: Vec<HostSession>,
     /// The host whose workspace is on screen; keys and the top strip act on it.
     active: usize,
+    /// Whether the window had focus last frame (a regained focus retries hosts).
+    was_focused: bool,
     /// Browser panes drawn as native WebKit views.
     #[cfg(target_os = "macos")]
     webviews: crate::webview::Webviews,
@@ -62,6 +64,7 @@ impl LmuxApp {
         }
         crate::clip::watch_cmd_v();
         crate::usage::start(&cc.egui_ctx);
+        crate::share_dialog::load_gateway();
         theme::set_traffic_lights(cfg!(target_os = "macos"));
         eprintln!("[fonts] ui={ui_font} mono={mono_font}");
 
@@ -122,6 +125,7 @@ impl LmuxApp {
         Self {
             hosts,
             active,
+            was_focused: true,
             dock_badge: 0,
             #[cfg(target_os = "macos")]
             webviews: Default::default(),
@@ -190,6 +194,14 @@ impl eframe::App for LmuxApp {
         // --- input --------------------------------------------------------
         if !minimized {
             let window_focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+            // Coming back to the window (after sleep or a network change) is
+            // when a down host is most likely reachable again: skip the wait.
+            if window_focused && !self.was_focused {
+                for h in self.hosts.iter_mut() {
+                    h.net.retry_soon();
+                }
+            }
+            self.was_focused = window_focused;
             let active = self.active;
             {
                 let h = &mut self.hosts[active];
@@ -262,7 +274,18 @@ impl eframe::App for LmuxApp {
             if minimized {
                 h.state.native_rects.clear();
             }
+            let ok = self.webviews.set_network(&h.net.host_name(), h.net.is_ssh(), h.net.wants_browsers(), h.net.socks_port(), h.net.remote_port());
+                h.net.set_browser_net_failed(!ok);
             self.webviews.place(frame, &ctx, &h.net.host_name(), &mut h.state, over);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(h) = self.hosts.get(self.active) {
+            let focused = h.state.focused_browser().filter(|s| h.state.in_app_browser(s));
+            let egui_has_keys = ctx.egui_wants_keyboard_input() || ctx.any_popup_open() || h.state.palette.is_some()
+                || h.state.add_host_draft.is_some() || h.state.share_draft.is_some()
+                || h.state.cloud_draft.is_some() || h.state.confirm_close.is_some()
+                || h.state.confirm_cloud_delete.is_some();
+            self.webviews.sync_focus(&h.net.host_name(), focused.as_deref(), egui_has_keys);
         }
 
         self.poll_installs(&ctx);
@@ -316,7 +339,7 @@ impl eframe::App for LmuxApp {
         for (from, action) in actions {
             match action {
                 Action::SwitchHost(to) => self.create_on(from, to),
-                Action::Reconnect => self.hosts[from].net.begin_connect(&ctx),
+                Action::Reconnect => self.hosts[from].net.reconnect_now(&ctx),
                 Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 Action::AddHost(target) => {
                     let install = self.hosts[from].state.add_host_install;
@@ -377,6 +400,8 @@ impl eframe::App for LmuxApp {
         #[cfg(target_os = "macos")]
         {
             for h in &mut self.hosts {
+                let ok = self.webviews.set_network(&h.net.host_name(), h.net.is_ssh(), h.net.wants_browsers(), h.net.socks_port(), h.net.remote_port());
+                h.net.set_browser_net_failed(!ok);
                 self.webviews.service(frame, ctx, &h.net.host_name(), &mut h.state);
             }
             self.flush();
@@ -415,6 +440,7 @@ impl LmuxApp {
             // Output from the local PTYs, which never goes through the websocket.
             h.state.pump_local_ptys();
             h.state.poll_image_pastes();
+            h.state.poll_file_copies();
             h.state.poll_decoded();
             let connected = h.net.state == ConnState::Connected;
             if !connected && h.was_connected {
@@ -758,13 +784,13 @@ pub fn render_hosts(ui: &mut Ui, hosts: &mut [ui::Ctx], active: usize) {
         let banner = Rect::from_min_size(content.min, Vec2::new(content.width(), h));
         let (bg, fg, text) = match c.net.state {
             ConnState::Connecting => (
-                Color32::from_rgb(0x2E, 0x1C, 0x10),
+                Color32::from_rgb(0x26, 0x21, 0x19),
                 theme::AMBER,
                 format!("connecting to {}…", c.net.host_name()),
             ),
             _ => (
-                Color32::from_rgb(0x3A, 0x16, 0x0E),
-                Color32::from_rgb(0xFF, 0xB8, 0x9A),
+                Color32::from_rgb(0x2C, 0x1C, 0x18),
+                Color32::from_rgb(0xE0, 0xA8, 0x96),
                 match c.net.last_error.as_deref() {
                     Some(err) => format!("disconnected · {err}"),
                     None => "disconnected — reconnecting…".to_owned(),
@@ -1143,19 +1169,34 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
             // the PTY. Remote panes keep the daemon's input path.
             c.state.send_term_input(&sid, &bytes);
         }
+        // An in-app page has no Chromium page behind the daemon: its keys go
+        // to the WKWebView, and `BrowserInput` for it would be lost.
+        Some(SurfaceKind::Browser { in_app: true, .. }) => {}
         Some(SurfaceKind::Browser { .. }) => {
             let mut events: Vec<BrowserInputEvent> = Vec::new();
             // The page's clipboard lives on the daemon's host, often another
             // machine, so copy and paste go through this Mac's clipboard: copy
             // asks the page for its selection, paste types the local text.
             let mut copy: Option<&str> = None;
+            // Cmd+V with files copied in Finder: egui only sees their names
+            // as text, so hand the files themselves to the page. With an
+            // image and no text, egui sees nothing; send the image as a file.
+            let cmd_v = crate::clip::take_cmd_v();
+            let text_paste = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))));
+            let mut files = Vec::new();
+            if cmd_v || text_paste {
+                files = (c.state.clipboard.files)();
+                if files.is_empty() && !text_paste {
+                    files.extend((c.state.clipboard.png)());
+                }
+            }
             ctx.input(|i| {
                 for ev in &i.events {
                     match ev {
                         // Cmd chords the app did not take (Cmd+A, Cmd+Z,
                         // Cmd+arrows…) reach the page with Meta held; the
                         // daemon maps them to editing commands.
-                        egui::Event::Key { key, pressed: true, .. } => {
+                        egui::Event::Key { key, pressed: true, modifiers, .. } if keys::browser_key_event(*key, modifiers.command) => {
                             if let Some((k, code)) = keys::dom_key(*key) {
                                 events.push(BrowserInputEvent::Key {
                                     action: KeyAction::Down,
@@ -1169,7 +1210,7 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
                         egui::Event::Text(t) if !t.is_empty() => {
                             events.push(BrowserInputEvent::InsertText { text: t.clone() });
                         }
-                        egui::Event::Paste(t) if !t.is_empty() => {
+                        egui::Event::Paste(t) if !t.is_empty() && files.is_empty() => {
                             events.push(BrowserInputEvent::InsertText { text: t.clone() });
                         }
                         egui::Event::Copy => copy = Some(COPY_SELECTION_JS),
@@ -1180,6 +1221,9 @@ pub fn route_input(ctx: &egui::Context, c: &mut ui::Ctx) {
             });
             for event in events {
                 c.state.pending.push(ClientMsg::BrowserInput { surface: sid.clone(), event });
+            }
+            if !files.is_empty() {
+                ui::browser::send_files_to_page(c, &sid, &files, None);
             }
             if let Some(script) = copy {
                 c.state.browser_request(

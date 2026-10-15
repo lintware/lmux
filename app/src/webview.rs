@@ -33,11 +33,15 @@ enum Event {
     Clicked,
     /// The answer to an agent's step.
     Answer(u64, Result<Value, String>),
+    /// A navigation to the Mac's own loopback in a remote host's page: load
+    /// it as the host's `localhost` instead.
+    Reroute(String),
 }
 
 /// Tells the app when the page is clicked, since clicks on a native view never
-/// reach egui.
-const CLICK_SCRIPT: &str = "window.addEventListener('mousedown', () => window.ipc.postMessage('click'), true);";
+/// reach egui. Runs in every frame (a click in an iframe counts), where
+/// `window.ipc` exists only in the main one, so it posts to the handler.
+const CLICK_SCRIPT: &str = "window.addEventListener('mousedown', () => window.webkit.messageHandlers.ipc.postMessage('click'), true);";
 
 /// A view an agent drives before the pane is on screen gets this size, so the
 /// page lays out (and screenshots) as it would in a pane.
@@ -70,9 +74,214 @@ type Events = Arc<Mutex<Vec<(String, Ref, Event)>>>;
 pub struct Webviews {
     views: HashMap<(String, Ref), View>,
     events: Events,
+    /// Remote hosts whose pages run here: each has its own WebKit data store
+    /// (cookies, storage) whose traffic goes through its SOCKS relay.
+    remotes: HashMap<String, Remote>,
+    /// Hosts reached over ssh: their pages need a route, or they are not shown.
+    ssh_hosts: HashSet<String>,
+    /// Hosts whose relay or data store failed; not retried every frame.
+    net_failed: HashSet<String>,
+    /// Who last got the window's keyboard focus from [`Webviews::sync_focus`].
+    focus: Option<FirstResponder>,
+}
+
+/// Who should be the window's first responder: the winit view (egui and
+/// terminals) or one page's WKWebView.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FirstResponder {
+    Parent,
+    Page(String, Ref),
+}
+
+/// The first responder for this frame. The page of the focused pane gets it,
+/// unless egui needs the keys (a menu, dialog, address bar) or the focused
+/// pane is not a native browser.
+pub fn wanted_first_responder(host: &str, focused_native: Option<&str>, egui_has_keys: bool) -> FirstResponder {
+    match focused_native {
+        Some(s) if !egui_has_keys => FirstResponder::Page(host.to_owned(), s.to_owned()),
+        _ => FirstResponder::Parent,
+    }
+}
+
+/// A remote host's browser network: the relay to its tunnel, and the data
+/// store WebKit uses for its pages.
+struct Remote {
+    relay: crate::socks::Relay,
+    store_id: [u8; 16],
+    /// WebKit keeps a store's proxy only on the object it was set on: a
+    /// store freed and fetched again by id comes back without it.
+    _store: objc2::rc::Retained<objc2_web_kit::WKWebsiteDataStore>,
+}
+
+/// What a page needs to belong to a remote host.
+#[derive(Clone, Copy)]
+struct Route {
+    store_id: [u8; 16],
+}
+
+/// WebKit takes a proxy per data store only from macOS 14.
+pub fn proxies_supported() -> bool {
+    use objc2_foundation::NSProcessInfo;
+    NSProcessInfo::processInfo().operatingSystemVersion().majorVersion >= 14
+}
+
+/// A stable data store id for a host, so its logins survive restarts. A fixed
+/// hash (FNV-1a), not `DefaultHasher`, whose output may change between Rust
+/// releases.
+fn store_id(host: &str) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (i, chunk) in out.chunks_mut(8).enumerate() {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in b"lmux-browser-store".iter().chain(&[0, i as u8, 0]).chain(host.as_bytes()) {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        chunk.copy_from_slice(&h.to_le_bytes());
+    }
+    // An RFC 4122 version 4 layout, so WebKit takes it as a plain UUID.
+    out[6] = (out[6] & 0x0F) | 0x40;
+    out[8] = (out[8] & 0x3F) | 0x80;
+    out
+}
+
+/// The data store `id`, pointed at the SOCKS5 proxy on `127.0.0.1:port`.
+/// Network.framework's C API, loaded at run time so the app still starts on
+/// macOS 12 and 13.
+fn proxied_store(
+    id: [u8; 16],
+    port: u16,
+) -> Result<objc2::rc::Retained<objc2_web_kit::WKWebsiteDataStore>, String> {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{msg_send, sel, MainThreadMarker};
+    use objc2_foundation::NSUUID;
+    use objc2_web_kit::WKWebsiteDataStore;
+
+    type EndpointFn = unsafe extern "C" fn(*const std::ffi::c_char, *const std::ffi::c_char) -> *mut AnyObject;
+    type SocksFn = unsafe extern "C" fn(*mut AnyObject) -> *mut AnyObject;
+    extern "C" {
+        fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+    }
+    // RTLD_DEFAULT on macOS.
+    let default = -2isize as *mut std::ffi::c_void;
+    let mtm = MainThreadMarker::new().ok_or("not on the main thread")?;
+    // SAFETY: both symbols are Network.framework C functions with these
+    // signatures (macOS 14+); null checks guard older systems. They return
+    // +1 objects, owned here by `Retained` and released when it drops; the
+    // array and the store retain what they keep.
+    unsafe {
+        let ep = dlsym(default, c"nw_endpoint_create_host".as_ptr());
+        let socks = dlsym(default, c"nw_proxy_config_create_socksv5".as_ptr());
+        if ep.is_null() || socks.is_null() {
+            return Err("this macOS has no per-store proxies".into());
+        }
+        let ep: EndpointFn = std::mem::transmute(ep);
+        let socks: SocksFn = std::mem::transmute(socks);
+        let port = std::ffi::CString::new(port.to_string()).map_err(|e| e.to_string())?;
+        let endpoint = Retained::from_raw(ep(c"127.0.0.1".as_ptr(), port.as_ptr())).ok_or("no proxy endpoint")?;
+        let config = Retained::from_raw(socks(Retained::as_ptr(&endpoint) as *mut AnyObject)).ok_or("no proxy config")?;
+        let store = WKWebsiteDataStore::dataStoreForIdentifier(&NSUUID::from_bytes(id), mtm);
+        let setter = sel!(setProxyConfigurations:);
+        let supported: bool = msg_send![&*store, respondsToSelector: setter];
+        if !supported {
+            return Err("this WebKit has no per-store proxies".into());
+        }
+        let list: Retained<AnyObject> = msg_send![objc2::class!(NSArray), arrayWithObject: &*config];
+        let _: () = msg_send![&*store, setProxyConfigurations: &*list];
+        Ok(store)
+    }
 }
 
 impl Webviews {
+    /// Say whether `host`'s pages run here with its network: `wanted` when
+    /// this app takes the host's browsers, `socks` the SOCKS port of its ssh
+    /// tunnel while it is up, `daemon_port` the host daemon's port, which
+    /// pages may not reach. Returns false when `wanted` but the relay or data
+    /// store could not be set up. Call every frame, before
+    /// [`Webviews::place`] and [`Webviews::service`].
+    pub fn set_network(&mut self, host: &str, ssh: bool, wanted: bool, socks: Option<u16>, daemon_port: u16) -> bool {
+        if ssh {
+            self.ssh_hosts.insert(host.to_owned());
+        } else {
+            self.ssh_hosts.remove(host);
+        }
+        if !wanted {
+            self.net_failed.remove(host);
+            // The tunnel is down or the mode is off: nothing may go to a stale port.
+            if let Some(r) = self.remotes.get(host) {
+                r.relay.set_upstream(0);
+            }
+            return true;
+        }
+        if self.net_failed.contains(host) {
+            return false;
+        }
+        if !self.remotes.contains_key(host) {
+            let relay = match crate::socks::Relay::start(daemon_port) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[webview] {host}: no SOCKS relay: {e}");
+                    self.net_failed.insert(host.to_owned());
+                    return false;
+                }
+            };
+            let store_id = store_id(host);
+            let store = match proxied_store(store_id, relay.port()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[webview] {host}: {e}");
+                    self.net_failed.insert(host.to_owned());
+                    return false;
+                }
+            };
+            self.remotes.insert(host.to_owned(), Remote { relay, store_id, _store: store });
+        }
+        if let Some(r) = self.remotes.get(host) {
+            r.relay.set_guarded_port(daemon_port);
+            r.relay.set_upstream(socks.unwrap_or(0));
+        }
+        true
+    }
+
+    /// An ssh host's page cannot be shown: no relay, so no route to the host.
+    fn unrouted(&self, host: &str) -> bool {
+        self.ssh_hosts.contains(host) && !self.remotes.contains_key(host)
+    }
+
+    /// Make AppKit's first responder follow lmux's focus, so typed keys and
+    /// Cmd+V reach the focused pane: its page when that is a native browser
+    /// on `host`, the winit view otherwise. Call every frame after
+    /// [`Webviews::place`], for the host on screen.
+    pub fn sync_focus(&mut self, host: &str, focused_native: Option<&str>, egui_has_keys: bool) {
+        let want = wanted_first_responder(host, focused_native, egui_has_keys);
+        match &want {
+            FirstResponder::Parent => {
+                // Checked against AppKit every frame: a page can regain the
+                // first responder behind our back (a new view, the window
+                // becoming key again).
+                if let Some(v) = self.views.values().find(|v| holds_focus(&v.webview)) {
+                    let _ = v.webview.focus_parent();
+                }
+                self.focus = Some(want);
+            }
+            FirstResponder::Page(h, s) => {
+                // Not built yet: try again next frame. Checked against AppKit
+                // every frame: a click on the toolbar or tab chip hands the
+                // first responder to the winit view behind our back.
+                if let Some(v) = self.views.get(&(h.clone(), s.clone())) {
+                    if !holds_focus(&v.webview) {
+                        let _ = v.webview.focus();
+                    }
+                    self.focus = Some(want);
+                }
+            }
+        }
+    }
+
+    fn route(&self, host: &str) -> Option<Route> {
+        self.remotes.get(host).map(|r| Route { store_id: r.store_id })
+    }
+
     /// Match the native views of `host` to this frame: create the ones newly
     /// on screen, place them, and park the rest. With `hide_all` (a menu,
     /// dialog or drag over the panes) all are parked, since a native view
@@ -88,6 +297,10 @@ impl Webviews {
         let zoom = ctx.zoom_factor();
         let rects = std::mem::take(&mut state.native_rects);
         for (surface, rect) in &rects {
+            if self.unrouted(host) {
+                unrouted_placeholder(ctx, surface, *rect);
+                continue;
+            }
             if !self.ensure(window, ctx, host, state, surface, *rect) {
                 continue;
             }
@@ -128,6 +341,7 @@ impl Webviews {
         // An empty tree is one not loaded yet (or reconnecting): keep all.
         self.views.retain(|(h, s), _| h != host || live.contains(s) || live.is_empty());
 
+        let route = self.route(host);
         for (surface, cmd) in std::mem::take(&mut state.native_cmds) {
             let Some(v) = self.views.get(&(host.to_owned(), surface)) else { continue };
             let _ = match cmd {
@@ -135,12 +349,12 @@ impl Webviews {
                 NativeCmd::Forward => v.webview.evaluate_script("history.forward()"),
                 NativeCmd::Reload => v.webview.reload(),
                 NativeCmd::Stop => v.webview.evaluate_script("window.stop()"),
-                NativeCmd::Goto(url) => v.webview.load_url(&url),
+                NativeCmd::Goto(url) => v.webview.load_url(&page_url(route, &url)),
             };
         }
 
         self.run_calls(window, ctx, host, state, &live);
-        self.apply_events(host, state);
+        self.apply_events(ctx, host, state);
     }
 
     /// The view for `surface`, made now if there is none: placed at `rect`,
@@ -158,10 +372,20 @@ impl Webviews {
         if self.views.contains_key(&key) {
             return true;
         }
+        let route = self.route(host);
         let url = state.browser_url(surface).unwrap_or_else(|| "about:blank".to_owned());
-        match self.build(window, ctx, host, surface, &url, rect, ctx.zoom_factor()) {
+        let url = page_url(route, &url);
+        if self.unrouted(host) {
+            return false;
+        }
+        let front = FrontApp::note();
+        let built = self.build(window, ctx, host, surface, &url, rect, ctx.zoom_factor(), route);
+        front.restore();
+        match built {
             Ok(webview) => {
                 self.views.insert(key, View { webview, bounds: rect, committed: false });
+                // wry made the new view the first responder.
+                self.focus = None;
                 true
             }
             Err(e) => {
@@ -195,6 +419,10 @@ impl Webviews {
                 continue;
             }
             let key = (host.to_owned(), call.surface.clone());
+            if self.unrouted(host) {
+                answer(state, call.id, Err("this browser is drawn by another lmux window".into()));
+                continue;
+            }
             if !self.ensure(window, ctx, host, state, &call.surface, parked(HIDDEN_SIZE)) {
                 answer(state, call.id, Err("WebKit could not make a view".into()));
                 continue;
@@ -211,14 +439,19 @@ impl Webviews {
             match call.op {
                 AppBrowserOp::Eval { script } => {
                     let push = pusher(&self.events, ctx, host, &call.surface);
-                    let r = v
-                        .webview
-                        .evaluate_script_with_callback(&script, move |raw| push(Event::Answer(id, Ok(Value::String(raw)))));
+                    // Agents read the host's own name for its loopback.
+                    let remote = self.route(host).is_some();
+                    let r = v.webview.evaluate_script_with_callback(&script, move |raw| {
+                        let raw = if remote { crate::socks::unalias_text(&raw) } else { raw };
+                        push(Event::Answer(id, Ok(Value::String(raw))))
+                    });
                     if let Err(e) = r {
                         answer(state, id, Err(e.to_string()));
                     }
                 }
-                AppBrowserOp::Navigate { url } => answer(state, id, done(v.webview.load_url(&url))),
+                AppBrowserOp::Navigate { url } => {
+                    answer(state, id, done(v.webview.load_url(&page_url(self.route(host), &url))))
+                }
                 AppBrowserOp::Back => answer(state, id, done(v.webview.evaluate_script("history.back()"))),
                 AppBrowserOp::Forward => answer(state, id, done(v.webview.evaluate_script("history.forward()"))),
                 AppBrowserOp::Reload => answer(state, id, done(v.webview.reload())),
@@ -241,18 +474,37 @@ impl Webviews {
         url: &str,
         rect: egui::Rect,
         zoom: f32,
+        route: Option<Route>,
     ) -> wry::Result<WebView> {
+        use wry::WebViewBuilderExtDarwin;
         let push = pusher(&self.events, ctx, host, surface);
-        let (p1, p2, p3, p4) = (push.clone(), push.clone(), push.clone(), push);
-        WebViewBuilder::new()
+        let (p1, p2, p3, p4, p5) = (push.clone(), push.clone(), push.clone(), push.clone(), push);
+        let remote_page = route.is_some();
+        let mut builder = WebViewBuilder::new();
+        if let Some(r) = route {
+            builder = builder.with_data_store_identifier(r.store_id);
+        }
+        builder
             .with_url(url)
             .with_bounds(bounds(rect, zoom))
             .with_accept_first_mouse(true)
+            // wry makes each new view the first responder on macOS whatever
+            // this says; `sync_focus` hands it back right after.
+            .with_focused(false)
             .with_devtools(true)
-            .with_initialization_script(CLICK_SCRIPT)
+            .with_initialization_script_for_main_only(CLICK_SCRIPT, false)
             .with_initialization_script(lmux_proto::browser_js::CAPTURE_INIT)
             .with_on_page_load_handler(move |e, url| p1(Event::Loading(matches!(e, PageLoadEvent::Started), url)))
             .with_document_title_changed_handler(move |t| p2(Event::Title(t)))
+            .with_navigation_handler(move |url| {
+                // A remote host's loopback is the host's, not this Mac's: top-level
+                // navigations and redirects to it are redone under the alias.
+                if remote_page && crate::socks::is_loopback_url(&url) {
+                    p5(Event::Reroute(url));
+                    return false;
+                }
+                true
+            })
             .with_new_window_req_handler(move |url, _| {
                 p3(Event::NewTab(url));
                 NewWindowResponse::Deny
@@ -268,14 +520,22 @@ impl Webviews {
     /// WebKit's callbacks for `host`, applied to the toolbar, reported to the
     /// daemon so the tab comes back at its page after a restart, and agents'
     /// answers sent back.
-    fn apply_events(&mut self, host: &str, state: &mut AppState) {
+    fn apply_events(&mut self, ctx: &egui::Context, host: &str, state: &mut AppState) {
         let mine: Vec<(Ref, Event)> = {
             let mut all = self.events.lock().unwrap();
             let (mine, rest): (Vec<_>, Vec<_>) = all.drain(..).partition(|(h, _, _)| h == host);
             *all = rest;
             mine.into_iter().map(|(_, s, e)| (s, e)).collect()
         };
+        let remote = self.route(host).is_some();
         for (surface, event) in mine {
+            // A remote host's page asks for its `localhost` by another name;
+            // the toolbar and the daemon see the real one.
+            let event = match event {
+                Event::Loading(l, url) if remote => Event::Loading(l, crate::socks::from_page_url(&url)),
+                Event::NewTab(url) if remote => Event::NewTab(crate::socks::from_page_url(&url)),
+                e => e,
+            };
             match event {
                 Event::Loading(loading, url) => {
                     if let Some(v) = self.views.get_mut(&(host.to_owned(), surface.clone())) {
@@ -297,14 +557,87 @@ impl Webviews {
                     }
                 }
                 Event::Clicked => {
+                    if let Some(v) = self.views.get(&(host.to_owned(), surface.clone())) {
+                        let _ = v.webview.focus();
+                        self.focus = Some(FirstResponder::Page(host.to_owned(), surface.clone()));
+                        // A click on the page never reaches egui, so a field
+                        // there would keep the keys.
+                        ctx.memory_mut(|m| {
+                            if let Some(id) = m.focused() {
+                                m.surrender_focus(id);
+                            }
+                        });
+                    }
                     if let Some(pane) = state.pane_of_surface(&surface) {
                         state.focus_pane(&pane);
                         state.select_tab(&pane, &surface);
                     }
                 }
                 Event::Answer(id, r) => answer(state, id, r),
+                Event::Reroute(url) => {
+                    if let Some(v) = self.views.get(&(host.to_owned(), surface.clone())) {
+                        let _ = v.webview.load_url(&page_url(self.route(host), &url));
+                    }
+                }
             }
         }
+    }
+}
+
+/// Whether this page's WKWebView is its window's first responder.
+fn holds_focus(webview: &WebView) -> bool {
+    use objc2::rc::Retained;
+    use objc2_app_kit::NSResponder;
+    let view = webview.webview();
+    let Some(window) = view.window() else { return false };
+    let Some(current) = window.firstResponder() else { return false };
+    let page: &NSResponder = &view;
+    std::ptr::eq(Retained::as_ptr(&current), page)
+}
+
+/// What a remote tab shows when this window cannot run its page.
+fn unrouted_placeholder(ctx: &egui::Context, surface: &str, rect: egui::Rect) {
+    let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new(("unrouted", surface)));
+    let p = ctx.layer_painter(layer);
+    p.rect_filled(rect, 0.0, egui::Color32::from_rgb(0x24, 0x24, 0x24));
+    p.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "This browser is drawn by another lmux window",
+        egui::FontId::proportional(14.0),
+        egui::Color32::from_gray(0xA0),
+    );
+}
+
+/// The app that had the keyboard before a view was built. wry activates lmux
+/// whenever it builds a view, which would pull a host agent's new tab to the front.
+struct FrontApp(Option<objc2::rc::Retained<objc2_app_kit::NSRunningApplication>>);
+
+impl FrontApp {
+    /// Remember the frontmost app, if lmux is not it.
+    fn note() -> FrontApp {
+        use objc2_app_kit::{NSApplication, NSWorkspace};
+        let Some(mtm) = objc2::MainThreadMarker::new() else { return FrontApp(None) };
+        if NSApplication::sharedApplication(mtm).isActive() {
+            return FrontApp(None);
+        }
+        FrontApp(NSWorkspace::sharedWorkspace().frontmostApplication())
+    }
+
+    fn restore(self) {
+        use objc2_app_kit::NSApplicationActivationOptions;
+        if let Some(app) = self.0 {
+            #[allow(deprecated)]
+            let _ = app.activateWithOptions(NSApplicationActivationOptions::ActivateIgnoringOtherApps);
+        }
+    }
+}
+
+/// The URL a page loads: a remote host's loopback goes to the host.
+fn page_url(route: Option<Route>, url: &str) -> String {
+    match route {
+        Some(_) => crate::socks::to_page_url(url),
+        None => url.to_owned(),
     }
 }
 
@@ -352,5 +685,44 @@ fn bounds(rect: egui::Rect, zoom: f32) -> wry::Rect {
     wry::Rect {
         position: LogicalPosition::new((rect.min.x * zoom) as f64, (rect.min.y * zoom) as f64).into(),
         size: LogicalSize::new((rect.width() * zoom).max(1.0) as f64, (rect.height() * zoom).max(1.0) as f64).into(),
+    }
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::*;
+
+    #[test]
+    fn page_takes_focus_only_when_its_pane_is_focused_and_egui_wants_no_keys() {
+        assert_eq!(wanted_first_responder("h", Some("surface:2"), false), FirstResponder::Page("h".into(), "surface:2".into()));
+        assert_eq!(wanted_first_responder("h", Some("surface:2"), true), FirstResponder::Parent);
+        assert_eq!(wanted_first_responder("h", None, false), FirstResponder::Parent);
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    #[test]
+    fn store_ids_are_fixed_per_host() {
+        let id = store_id("lint-hqc-03");
+        assert_eq!(id, store_id("lint-hqc-03"));
+        assert_ne!(id, store_id("lint-hqc-01"));
+        assert_eq!(id[6] >> 4, 4);
+        // Pinned: a change here would orphan every host's cookies.
+        assert_eq!(id, store_id("lint-hqc-03"));
+        let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "8cb8909e27984cdd83811e8d1a05f582");
+    }
+
+    #[test]
+    fn loopback_navigations_are_recognised() {
+        use crate::socks::is_loopback_url;
+        assert!(is_loopback_url("http://localhost:7878/"));
+        assert!(is_loopback_url("http://127.0.0.1:3000/x"));
+        assert!(is_loopback_url("http://[::1]/"));
+        assert!(!is_loopback_url("http://localhost.lmux:3000/"));
+        assert!(!is_loopback_url("https://example.com/localhost"));
     }
 }

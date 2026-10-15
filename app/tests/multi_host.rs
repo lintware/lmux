@@ -20,6 +20,7 @@ fn host(name: &str, url: &str) -> HostConfig {
         ssh_target: None,
         remote_port: 7878,
         browser_scale: None,
+        stream_browsers: false,
         cloud: None,
     }
 }
@@ -386,4 +387,82 @@ fn opening_a_port_makes_a_browser_tab_in_that_workspace() {
     assert_eq!(call["url"], "http://localhost:3000/");
     assert_eq!(call["pane"], "pane:1");
     assert!(fx.hosts[0].state.pending.is_empty(), "nothing goes to the other host");
+}
+
+/// The sidebar as it looks with several servers: one host on screen, one with
+/// a session waiting for input (its card washed amber, its header counting
+/// it), a folded one that still says it needs you, and one that is offline.
+#[test]
+fn snapshot_sidebar_many_hosts() {
+    use wire::AgentState;
+    let names = ["this mac", "lint-hqc-01", "lint-hqc-03", "lint-cloud-noverse01"];
+    let configs: Vec<HostConfig> =
+        names.iter().enumerate().map(|(i, n)| host(n, &format!("ws://127.0.0.1:{}", 7879 + i))).collect();
+    let make = |i: usize, t: wire::Tree, state: ConnState| {
+        let mut net = Net::for_host(configs.clone(), i);
+        net.state = state;
+        let mut st = AppState::new();
+        st.host_salt = net.host_name();
+        st.set_current_host(&net.host_name());
+        st.apply_tree(t);
+        st.activated = false;
+        st.animate = false;
+        Host { state: st, net }
+    };
+
+    let mut local = tree("this mac", "lmux", "local shell", "/Users/me/Documents/lmux");
+    local.workspaces[0].agent = AgentState::Running;
+
+    let mut hqc1 = tree("lint-hqc-01", "webapp", "claude · api-refactor", "/home/me/webapp");
+    hqc1.workspaces[0].agent = AgentState::NeedsInput;
+    hqc1.workspaces[0].unread_notifications = 2;
+    let mut idle = hqc1.workspaces[0].clone();
+    idle.id = "workspace:2".into();
+    idle.title = "deploy · logs".into();
+    idle.agent = AgentState::Idle;
+    idle.unread_notifications = 0;
+    hqc1.workspaces.push(idle);
+
+    let mut hqc3 = tree("lint-hqc-03", "infra", "codex · migrations", "/home/me/infra");
+    hqc3.workspaces[0].agent = AgentState::NeedsInput;
+    hqc3.workspaces[0].unread_notifications = 1;
+
+    let mut cloud = tree("lint-cloud-noverse01", "noverse", "grok · eval run", "/home/me/noverse");
+    cloud.workspaces[0].agent = AgentState::Running;
+
+    let mut fx = Fixture {
+        hosts: vec![
+            make(0, local, ConnState::Connected),
+            make(1, hqc1, ConnState::Connected),
+            make(2, hqc3, ConnState::Connected),
+            make(3, cloud, ConnState::Disconnected),
+        ],
+        active: 1,
+        ready: false,
+    };
+    fx.hosts[2].state.host_collapsed = true;
+    // The waiting session is not the selected one, so its own wash shows.
+    fx.hosts[1].state.selected = Some("workspace:2".into());
+    fx.hosts[3].net.last_error = Some("ssh: connect to host lint-cloud-noverse01 port 22: Operation timed out".into());
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(720.0, 520.0))
+        .with_pixels_per_point(2.0)
+        .build_ui_state(
+            |ui, fx: &mut Fixture| {
+                if !fx.ready {
+                    fonts::install(ui.ctx());
+                    fx.ready = true;
+                    return;
+                }
+                let mut ctxs: Vec<lmux_app::ui::Ctx> = fx
+                    .hosts
+                    .iter_mut()
+                    .map(|h| lmux_app::ui::Ctx { state: &mut h.state, net: &mut h.net })
+                    .collect();
+                app::render_hosts(ui, &mut ctxs, fx.active);
+            },
+            fx,
+        );
+    h.run();
+    h.snapshot("sidebar_many_hosts");
 }
