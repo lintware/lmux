@@ -12,6 +12,8 @@ struct Probe {
             print("usage: share-probe <share link>"); exit(2)
         }
         let typeText = args.count > 2 ? args[2] : nil
+        let targetHost = ProcessInfo.processInfo.environment["TARGET_HOST"]
+        let targetAgent = ProcessInfo.processInfo.environment["TARGET_AGENT"]
         // Optional: upload this file once the tab is open and print where it landed.
         let uploadFile = ProcessInfo.processInfo.environment["UPLOAD"]
         var uploaded = false
@@ -57,7 +59,8 @@ struct Probe {
                         print("  ws", w.id, w.displayTitle, w.agent ?? "-", "branch", w.gitBranch ?? "-", "cwd", w.cwd ?? "-")
                         for tab in w.tabs { print("    tab", tab.id, tab.displayTitle, tab.kind ?? "-", tab.agentLabel ?? "-", "chat", tab.hasChat) }
                     }
-                    if opened == nil, let tab = t.workspaces.flatMap(\.tabs).first(where: \.isTerminal) {
+                    let candidates = t.workspaces.filter { targetHost == nil || $0.server == targetHost }.flatMap(\.tabs)
+                    if opened == nil, let tab = candidates.first(where: { $0.isTerminal && (targetAgent == nil || $0.agent == targetAgent) }) {
                         opened = tab.id
                         try await sock.send(.open(surface: tab.id))
                         print("opened", tab.id)
@@ -70,7 +73,14 @@ struct Probe {
                         try await sock.upload(id: "probe-1", name: (uploadFile as NSString).lastPathComponent, data: data)
                         print("uploading", data.count, "bytes to", opened)
                     }
-                    print("screen", surface, lines.count, "lines; last non-empty:", lines.last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? "")
+                    print("screen", surface, lines.count, "lines (contents withheld)")
+                    if typeText == nil, targetHost != nil {
+                        check(!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "target host screen is reachable through the phone protocol")
+                        try await sock.send(.close)
+                        sock.close()
+                        print("OK read-only target verification; no terminal input sent")
+                        return
+                    }
                     if let typeText, let opened, !sentText {
                         sentText = true
                         try await sock.send(.send(surface: opened, text: typeText, enter: true))
@@ -101,5 +111,8 @@ struct Probe {
         print("done; chat frames seen:", sawChat)
     }
 
-    static func check(_ ok: Bool, _ what: String) { print(ok ? "OK" : "FAIL", what) }
+    static func check(_ ok: Bool, _ what: String) {
+        print(ok ? "OK" : "FAIL", what)
+        if !ok { exit(1) }
+    }
 }
