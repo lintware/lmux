@@ -218,6 +218,9 @@ struct Clients {
     /// Connections that are lmux apps (they said so in `hello`), oldest
     /// first: they draw in-app browsers and run steps in them.
     apps: Vec<u64>,
+    /// Apps that also run a remote host's browser pages themselves (they
+    /// said `draws_browsers` in `hello`).
+    browser_apps: HashSet<u64>,
     /// surface -> connection ids subscribed.
     subs: HashMap<Ref, HashSet<u64>>,
     next_id: u64,
@@ -292,6 +295,9 @@ pub struct Inner {
     prs: std::sync::Mutex<HashMap<String, (Option<lmux_proto::PullRequest>, Instant)>>,
     /// Steps sent to an app for its in-app browsers, awaiting answers.
     pub(crate) app_calls: std::sync::Mutex<crate::app_browser::AppCalls>,
+    /// Held while browser tabs move between the app and Chromium, so two
+    /// calls at once cannot make a second page for a tab and close the first.
+    handover: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -365,11 +371,12 @@ impl Inner {
     /// Forget a client. A browser it was the last viewer of stops streaming,
     /// as on `Unsubscribe`: its last frame was never acked, so a stream left
     /// running would stay stalled for the next viewer.
-    async fn unregister(&self, id: u64) {
+    async fn unregister(self: &Arc<Self>, id: u64) {
         let orphaned: Vec<Ref> = {
             let mut c = self.clients.lock().await;
             c.conns.remove(&id);
             c.apps.retain(|a| *a != id);
+            c.browser_apps.remove(&id);
             c.subs
                 .iter_mut()
                 .filter_map(|(surface, set)| (set.remove(&id) && set.is_empty()).then(|| surface.clone()))
@@ -385,8 +392,9 @@ impl Inner {
         }
     }
 
-    /// Send a step to the app that draws `surface` (the newest app connected),
-    /// returning the call id and where its answer will arrive.
+    /// Send a step to the app that draws `surface`: the newest app that runs
+    /// this host's pages, or, with `--app-browser` (no Chromium), the newest app.
+    /// Returns the call id and where its answer will arrive.
     pub(crate) async fn call_app(
         &self,
         surface: &str,
@@ -394,7 +402,12 @@ impl Inner {
     ) -> Result<(u64, tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>>), String> {
         let sink = {
             let c = self.clients.lock().await;
-            c.apps.iter().rev().find_map(|a| c.conns.get(a).cloned())
+            let drawing = c.apps.iter().rev().find(|a| c.browser_apps.contains(a)).and_then(|a| c.conns.get(a).cloned());
+            drawing.or_else(|| {
+                (self.browser.is_none() && self.cfg.app_browser)
+                    .then(|| c.apps.iter().rev().find_map(|a| c.conns.get(a).cloned()))
+                    .flatten()
+            })
         };
         let Some(sink) = sink else {
             return Err("this browser runs in the lmux app, and no lmux app is connected".into());
@@ -713,6 +726,12 @@ impl Inner {
         self.browser_streaming.lock().await.remove(surface);
     }
 
+    /// Whether a connected app runs this host's browser pages itself. A new
+    /// browser tab then lives in the app, with no Chromium page and no stream.
+    pub(crate) async fn app_draws_browsers(&self) -> bool {
+        !self.clients.lock().await.browser_apps.is_empty()
+    }
+
     /// Reconcile the loaded state with the still-running tmux server. Takes only
     /// the single state lock.
     async fn reconcile(self: &Arc<Self>) {
@@ -881,15 +900,93 @@ impl Inner {
         self.mark_dirty();
     }
 
+    /// On a host with Chromium, give the app's tabs a Chromium page at their
+    /// saved URL once no app that runs pages itself (`draws_browsers`) is
+    /// connected, so agents can drive them. Called lazily, when an agent asks
+    /// for a browser or a viewer needs a frame, not when the app leaves: a
+    /// reconnect or a handover then never reloads a page. `only` moves just
+    /// that tab. Tabs never move into the app while they live in Chromium;
+    /// only new tabs start there. Idempotent and serialized with
+    /// `reopen_browsers`.
+    pub(crate) async fn settle_browsers(self: &Arc<Self>, only: Option<&str>) {
+        let Some(b) = self.browser.clone() else {
+            return;
+        };
+        let _handover = self.handover.lock().await;
+        if self.app_draws_browsers().await {
+            return;
+        }
+        let moving: Vec<(Ref, String)> = {
+            let state = self.state.lock().await;
+            state
+                .all_surface_refs()
+                .into_iter()
+                .filter(|surf| only.is_none_or(|o| surf.as_str() == o))
+                .filter_map(|surf| match state.surface(&surf).map(|s| &s.kind) {
+                    Some(SurfaceKind::Browser { url, in_app: true, .. }) => Some((surf, url.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut changed = false;
+        for (surf, _) in moving {
+            // Re-read under the lock: the tab may have moved or closed meanwhile.
+            let url = match self.state.lock().await.surface(&surf).map(|s| &s.kind) {
+                Some(SurfaceKind::Browser { url, in_app: true, .. }) => url.clone(),
+                _ => continue,
+            };
+            if let Err(e) = b.create_surface(&surf, Some(&url)).await {
+                tracing::warn!(surface = %surf, "moving browser to Chromium failed: {e}");
+                continue;
+            }
+            // The app may have come back while the page was made.
+            if self.app_draws_browsers().await {
+                let _ = b.close_surface(&surf).await;
+                continue;
+            }
+            let mut state = self.state.lock().await;
+            if let Some(SurfaceKind::Browser { in_app, .. }) = state.surface_mut(&surf).map(|s| &mut s.kind) {
+                *in_app = false;
+                changed = true;
+            }
+            drop(state);
+            if self.has_subscribers(&surf).await {
+                self.clear_streaming(&surf).await;
+                self.maybe_start_fallback_screencast(surf);
+            }
+        }
+        if changed {
+            self.tree_changed();
+            self.mark_dirty();
+        }
+    }
+
+    /// Give `surf` to Chromium if it is an app tab and no app draws pages
+    /// for this host, so a viewer or an agent's input is not left with a
+    /// placeholder. Returns whether it is still the app's.
+    pub(crate) async fn settle_if_undrawn(self: &Arc<Self>, surf: &str) -> bool {
+        let in_app = |s: &SessionState| {
+            matches!(s.surface(surf).map(|x| &x.kind), Some(SurfaceKind::Browser { in_app: true, .. }))
+        };
+        if self.browser.is_some() && in_app(&*self.state.lock().await) && !self.app_draws_browsers().await {
+            self.settle_browsers(Some(surf)).await;
+        }
+        in_app(&*self.state.lock().await)
+    }
+
     /// Open the browser tabs the state file kept, at their saved URLs. The
     /// browser starts empty with the daemon: without this a restored browser
     /// pane is in the tree but has no page, so it never shows a frame.
     async fn reopen_browsers(self: &Arc<Self>) {
+        let _handover = self.handover.lock().await;
         // Tabs saved under the other kind of browser (Chromium here, or the
         // app's WebKit) switch to this one, rather than waiting for a page
         // nothing will draw.
-        if self.browser.is_some() || self.cfg.app_browser {
-            let in_app_now = self.browser.is_none();
+        // Only an `--app-browser` host flips tabs here. On a host with Chromium,
+        // the daemon starts before any app has connected, so every app tab would
+        // look orphaned; they stay and move lazily (`settle_browsers`).
+        if self.browser.is_none() && self.cfg.app_browser {
+            let in_app_now = true;
             let mut changed = false;
             let mut state = self.state.lock().await;
             for surf in state.all_surface_refs() {
@@ -913,14 +1010,30 @@ impl Inner {
                 .all_surface_refs()
                 .into_iter()
                 .filter_map(|surf| match state.surface(&surf).map(|s| &s.kind) {
-                    Some(SurfaceKind::Browser { url, .. }) => Some((surf, url.clone())),
+                    Some(SurfaceKind::Browser { url, in_app: false, .. }) => Some((surf, url.clone())),
                     _ => None,
                 })
                 .collect()
         };
         for (surf, url) in browsers {
+            // A drawing app may have claimed the tab since the list was made.
+            let still_chromium = matches!(
+                self.state.lock().await.surface(&surf).map(|s| &s.kind),
+                Some(SurfaceKind::Browser { in_app: false, .. })
+            );
+            if !still_chromium {
+                continue;
+            }
             if let Err(e) = b.create_surface(&surf, Some(&url)).await {
                 tracing::warn!(surface = %surf, "reopening browser failed: {e}");
+                continue;
+            }
+            let claimed = matches!(
+                self.state.lock().await.surface(&surf).map(|s| &s.kind),
+                Some(SurfaceKind::Browser { in_app: true, .. })
+            );
+            if claimed {
+                let _ = b.close_surface(&surf).await;
                 continue;
             }
             // A viewer that subscribed before its page was back got no stream.
@@ -1359,6 +1472,7 @@ pub async fn run(cfg: Config, browser: Option<Arc<dyn BrowserBackend>>) -> anyho
         paused_output: Default::default(),
         prs: std::sync::Mutex::new(HashMap::new()),
         app_calls: Default::default(),
+            handover: Default::default(),
     });
 
     tokio::spawn(tmux_event_loop(inner.clone(), ev_rx));
@@ -1689,6 +1803,14 @@ async fn browser_event_loop(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<B
             BrowserEvent::Closed { surface } => {
                 {
                     let mut state = inner.state.lock().await;
+                    // An app-drawn tab has no Chromium page: this is the page
+                    // being handed to the app, not the tab closing.
+                    if matches!(
+                        state.surface(&surface).map(|s| &s.kind),
+                        Some(SurfaceKind::Browser { in_app: true, .. })
+                    ) {
+                        continue;
+                    }
                     state.remove_surface(&surface);
                 }
                 inner
@@ -1781,12 +1903,32 @@ async fn serve_ws(inner: Arc<Inner>) -> anyhow::Result<()> {
     }
 }
 
+/// Handshake check: a browser always sends `Origin`, native clients (the app,
+/// the CLI, the share backend) never do. Refusing every handshake that has one
+/// keeps web pages, including ones reaching this port through a proxy or DNS
+/// rebinding, from driving the daemon, which has no other auth.
+#[allow(clippy::result_large_err)]
+fn refuse_web_origin(
+    req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+    resp: tokio_tungstenite::tungstenite::handshake::server::Response,
+) -> Result<
+    tokio_tungstenite::tungstenite::handshake::server::Response,
+    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+> {
+    if req.headers().contains_key("origin") {
+        let mut deny = tokio_tungstenite::tungstenite::http::Response::new(Some("web pages may not connect".to_string()));
+        *deny.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
+        return Err(deny);
+    }
+    Ok(resp)
+}
+
 async fn handle_ws_conn(
     inner: Arc<Inner>,
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
 ) -> anyhow::Result<()> {
-    let ws = tokio_tungstenite::accept_async(stream).await?;
+    let ws = tokio_tungstenite::accept_hdr_async(stream, refuse_web_origin).await?;
     let (mut sink, mut source) = ws.split();
     let outbox = ClientSink::new(CLIENT_QUEUE_MAX);
     let id = inner.register(outbox.clone()).await;
@@ -1855,9 +1997,19 @@ impl Inner {
         outbox: &Arc<ClientSink>,
     ) {
         match msg {
-            ClientMsg::Hello { client_name, .. } => {
+            ClientMsg::Hello { client_name, draws_browsers, .. } => {
                 if client_name.starts_with("lmux-app") {
-                    self.clients.lock().await.apps.push(id);
+                    let mut c = self.clients.lock().await;
+                    if !c.apps.contains(&id) {
+                        c.apps.push(id);
+                    }
+                    tracing::info!(id, %client_name, draws_browsers, "app hello");
+                    // A later hello can withdraw the claim (the app's relay failed).
+                    if draws_browsers {
+                        c.browser_apps.insert(id);
+                    } else {
+                        c.browser_apps.remove(&id);
+                    }
                 }
             }
             ClientMsg::AppBrowserResult { id: call, value, error } => {
@@ -1869,6 +2021,11 @@ impl Inner {
             }
             ClientMsg::Subscribe { surface, history } => {
                 let count = self.add_subscription(id, &surface).await;
+                // A viewer that is not the drawing app would see a placeholder.
+                let viewer_draws = self.clients.lock().await.browser_apps.contains(&id);
+                if !viewer_draws {
+                    self.settle_if_undrawn(&surface).await;
+                }
                 let kind = self
                     .state
                     .lock()
@@ -2252,6 +2409,7 @@ mod tests {
             paused_output: Default::default(),
             prs: std::sync::Mutex::new(HashMap::new()),
             app_calls: Default::default(),
+            handover: Default::default(),
         });
         let call = |method: &str, params: serde_json::Value| RpcRequest { id: 1, method: method.into(), params };
 
@@ -2364,6 +2522,7 @@ mod tests {
             paused_output: Default::default(),
             prs: std::sync::Mutex::new(HashMap::new()),
             app_calls: Default::default(),
+            handover: Default::default(),
         });
 
         // A restart reopens the saved browser tab at its URL.
@@ -2461,9 +2620,277 @@ mod tests {
             paused_output: Default::default(),
             prs: std::sync::Mutex::new(HashMap::new()),
             app_calls: Default::default(),
+            handover: Default::default(),
         });
         tokio::spawn(browser_event_loop(inner.clone(), rx));
         Some((inner, fake, pane, surf, scratch, state_dir))
+    }
+
+    /// A host with Chromium still lets an app that runs pages itself
+    /// (`draws_browsers`) own its new browser tabs: no Chromium page is made,
+    /// and agents' steps go to the app. Once that app leaves, Chromium is
+    /// used again.
+    #[tokio::test]
+    async fn an_app_that_draws_browsers_owns_new_tabs_on_a_chromium_host() {
+        let Some((inner, fake, pane, _surf, _scratch, _dir)) = browser_daemon("draws").await else { return };
+        let call = |params: serde_json::Value| RpcRequest { id: 1, method: methods::SURFACE_NEW.into(), params };
+        let in_app = |inner: Arc<Inner>, s: String| async move {
+            matches!(inner.state.lock().await.surface(&s).map(|x| x.kind.clone()), Some(SurfaceKind::Browser { in_app: true, .. }))
+        };
+
+        let sink = ClientSink::new(64);
+        let id = inner.register(sink.clone()).await;
+        inner
+            .handle_client_msg(
+                id,
+                ClientMsg::Hello { protocol_version: 1, client_name: "lmux-app/test".into(), draws_browsers: true },
+                &sink,
+            )
+            .await;
+        let r = crate::rpc::dispatch(&inner, &call(json!({"pane": pane, "type": "browser", "url": "https://news.ycombinator.com"}))).await;
+        let s = r.result.unwrap()["surface"].as_str().unwrap().to_owned();
+        assert!(in_app(inner.clone(), s.clone()).await, "the app draws the new tab");
+        assert!(
+            !fake.calls.lock().unwrap().iter().any(|c| c.contains(&s)),
+            "no Chromium page for an app-drawn tab: {:?}",
+            fake.calls.lock().unwrap()
+        );
+
+        inner.unregister(id).await;
+        let r = crate::rpc::dispatch(&inner, &call(json!({"pane": pane, "type": "browser", "url": "https://example.com"}))).await;
+        let s = r.result.unwrap()["surface"].as_str().unwrap().to_owned();
+        assert!(!in_app(inner.clone(), s.clone()).await, "Chromium again once the app is gone");
+    }
+
+    /// A live Chromium tab stays in Chromium when an app connects (no reload);
+    /// only new tabs go to the app. An app's tabs move to Chromium lazily,
+    /// when an agent asks for one and no drawing app is connected, and a quick
+    /// reconnect moves nothing.
+    #[tokio::test]
+    async fn tabs_move_to_chromium_only_when_an_agent_needs_them() {
+        let Some((inner, fake, pane, surf, _scratch, _dir)) = browser_daemon("handoff").await else { return };
+        let in_app = |inner: Arc<Inner>, s: String| async move {
+            matches!(inner.state.lock().await.surface(&s).map(|x| x.kind.clone()), Some(SurfaceKind::Browser { in_app: true, .. }))
+        };
+        let hello = |name: &str, draws: bool| ClientMsg::Hello { protocol_version: 1, client_name: name.into(), draws_browsers: draws };
+        let rpc = |method: &str, params: serde_json::Value| RpcRequest { id: 1, method: method.into(), params };
+
+        // An old app (no draws_browsers) changes nothing.
+        let old_sink = ClientSink::new(64);
+        let old = inner.register(old_sink.clone()).await;
+        inner.handle_client_msg(old, hello("lmux-app/old", false), &old_sink).await;
+        inner.unregister(old).await;
+        assert!(!in_app(inner.clone(), surf.clone()).await);
+
+        // A drawing app does not pull the live Chromium tab in.
+        let sink = ClientSink::new(64);
+        let id = inner.register(sink.clone()).await;
+        inner.handle_client_msg(id, hello("lmux-app/new", true), &sink).await;
+        assert!(!in_app(inner.clone(), surf.clone()).await, "the Chromium tab stays");
+        assert_eq!(fake.calls.lock().unwrap().len(), 0, "{:?}", fake.calls.lock().unwrap());
+
+        // A new tab is the app's.
+        let r = crate::rpc::dispatch(&inner, &rpc(methods::SURFACE_NEW, json!({"pane": pane, "type": "browser", "url": "https://b.test"}))).await;
+        let app_tab = r.result.unwrap()["surface"].as_str().unwrap().to_owned();
+        assert!(in_app(inner.clone(), app_tab.clone()).await);
+
+        // The app leaves and comes back: nothing moves, no timer moves it.
+        inner.unregister(id).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(in_app(inner.clone(), app_tab.clone()).await, "no move without an agent call");
+        let sink2 = ClientSink::new(64);
+        let id2 = inner.register(sink2.clone()).await;
+        inner.handle_client_msg(id2, hello("lmux-app/new", true), &sink2).await;
+        assert!(in_app(inner.clone(), app_tab.clone()).await);
+        assert!(!fake.calls.lock().unwrap().iter().any(|c| c.starts_with("create")));
+
+        // With the app gone, an agent's call finds no drawing app: Chromium takes the tab.
+        inner.unregister(id2).await;
+        let r = crate::rpc::dispatch(&inner, &rpc(methods::BROWSER_URL, json!({"surface": app_tab}))).await;
+        let _ = r;
+        assert!(!in_app(inner.clone(), app_tab.clone()).await, "tab went to Chromium on the agent call");
+        assert!(fake.calls.lock().unwrap().contains(&format!("create {app_tab} Some(\"https://b.test\")")));
+    }
+
+    /// A restart's `reopen_browsers` must not flip tabs to Chromium or make
+    /// pages for them when a drawing app is already connected.
+    #[tokio::test]
+    async fn reopen_leaves_tabs_to_a_connected_drawing_app() {
+        let Some((inner, fake, _pane, surf, _scratch, _dir)) = browser_daemon("reopen-app").await else { return };
+        {
+            let mut st = inner.state.lock().await;
+            if let Some(SurfaceKind::Browser { in_app, .. }) = st.surface_mut(&surf).map(|s| &mut s.kind) {
+                *in_app = true;
+            }
+        }
+        let sink = ClientSink::new(64);
+        let id = inner.register(sink.clone()).await;
+        inner
+            .handle_client_msg(id, ClientMsg::Hello { protocol_version: 1, client_name: "lmux-app/t".into(), draws_browsers: true }, &sink)
+            .await;
+        inner.reopen_browsers().await;
+        assert!(matches!(
+            inner.state.lock().await.surface(&surf).map(|s| s.kind.clone()),
+            Some(SurfaceKind::Browser { in_app: true, .. })
+        ));
+        assert!(!fake.calls.lock().unwrap().iter().any(|c| c.starts_with("create")), "{:?}", fake.calls.lock().unwrap());
+    }
+
+    async fn mark_in_app(inner: &Arc<Inner>, surf: &str) {
+        let mut st = inner.state.lock().await;
+        if let Some(SurfaceKind::Browser { in_app, .. }) = st.surface_mut(surf).map(|s| &mut s.kind) {
+            *in_app = true;
+        }
+    }
+
+    async fn is_in_app(inner: &Arc<Inner>, surf: &str) -> bool {
+        matches!(inner.state.lock().await.surface(surf).map(|s| s.kind.clone()), Some(SurfaceKind::Browser { in_app: true, .. }))
+    }
+
+    /// A hello with draws_browsers true and then false leaves the app out of
+    /// `browser_apps`, and in `apps` once.
+    #[tokio::test]
+    async fn hello_is_idempotent_and_can_withdraw_the_claim() {
+        let Some((inner, _fake, _pane, _surf, _scratch, _dir)) = browser_daemon("hello").await else { return };
+        let hello = |draws: bool| ClientMsg::Hello { protocol_version: 1, client_name: "lmux-app/t".into(), draws_browsers: draws };
+        let sink = ClientSink::new(64);
+        let id = inner.register(sink.clone()).await;
+        inner.handle_client_msg(id, hello(true), &sink).await;
+        assert!(inner.app_draws_browsers().await);
+        inner.handle_client_msg(id, hello(false), &sink).await;
+        assert!(!inner.app_draws_browsers().await, "the claim was withdrawn");
+        let c = inner.clients.lock().await;
+        assert_eq!(c.apps.iter().filter(|a| **a == id).count(), 1);
+        assert!(!c.browser_apps.contains(&id));
+    }
+
+    /// Two agent calls at once make one Chromium page per tab: the second must
+    /// not close the first's page and drop the tab.
+    #[tokio::test]
+    async fn concurrent_handovers_make_one_page_per_tab() {
+        let Some((inner, fake, _pane, surf, _scratch, _dir)) = browser_daemon("conc").await else { return };
+        mark_in_app(&inner, &surf).await;
+        let (a, b) = (inner.clone(), inner.clone());
+        let s1 = surf.clone();
+        let t1 = tokio::spawn(async move { a.settle_browsers(Some(&s1)).await });
+        let t2 = tokio::spawn(async move { b.settle_browsers(None).await });
+        let _ = tokio::join!(t1, t2);
+        let calls = fake.calls.lock().unwrap().clone();
+        assert_eq!(calls.iter().filter(|c| c.starts_with("create")).count(), 1, "{calls:?}");
+        assert!(!calls.iter().any(|c| c.starts_with("close")), "{calls:?}");
+        assert!(!is_in_app(&inner, &surf).await);
+        assert!(inner.state.lock().await.surface(&surf).is_some(), "the tab survived");
+    }
+
+    /// An agent's call for one tab moves only that tab.
+    #[tokio::test]
+    async fn settle_with_only_moves_just_that_tab() {
+        let Some((inner, fake, pane, surf, _scratch, _dir)) = browser_daemon("only").await else { return };
+        let other = inner.state.lock().await.next_surface();
+        inner.state.lock().await.add_surface(&pane, Surface {
+            id: other.clone(),
+            title: "o".into(),
+            kind: SurfaceKind::Browser { url: "https://o.test".into(), loading: false, can_go_back: false, can_go_forward: false, in_app: true },
+        });
+        mark_in_app(&inner, &surf).await;
+        inner.settle_browsers(Some(&surf)).await;
+        assert!(!is_in_app(&inner, &surf).await);
+        assert!(is_in_app(&inner, &other).await, "the other tab was not touched");
+        assert_eq!(fake.calls.lock().unwrap().iter().filter(|c| c.starts_with("create")).count(), 1);
+    }
+
+    /// With no drawing app, a viewer that subscribes to an app tab gets it in
+    /// Chromium instead of a placeholder; so does real input for it.
+    #[tokio::test]
+    async fn a_viewer_of_an_undrawn_app_tab_gets_chromium() {
+        let Some((inner, fake, _pane, surf, _scratch, _dir)) = browser_daemon("viewer").await else { return };
+        mark_in_app(&inner, &surf).await;
+        let sink = ClientSink::new(64);
+        let id = inner.register(sink.clone()).await;
+        inner
+            .handle_client_msg(id, ClientMsg::Hello { protocol_version: 1, client_name: "lmux-app/stream".into(), draws_browsers: false }, &sink)
+            .await;
+        inner.handle_client_msg(id, ClientMsg::Subscribe { surface: surf.clone(), history: None }, &sink).await;
+        assert!(!is_in_app(&inner, &surf).await);
+        assert!(fake.calls.lock().unwrap().contains(&format!("create {surf} Some(\"https://a.test\")")));
+
+        mark_in_app(&inner, &surf).await;
+        let req = RpcRequest { id: 1, method: "browser.mouse".into(), params: json!({"surface": surf, "type": "click", "x": 1, "y": 1}) };
+        let _ = crate::rpc::dispatch(&inner, &req).await;
+        assert!(!is_in_app(&inner, &surf).await, "input for an undrawn app tab settles it");
+    }
+
+    /// A drawing app keeps its tabs when another viewer subscribes.
+    #[tokio::test]
+    async fn a_viewer_does_not_take_tabs_from_a_drawing_app() {
+        let Some((inner, fake, _pane, surf, _scratch, _dir)) = browser_daemon("viewer2").await else { return };
+        mark_in_app(&inner, &surf).await;
+        let hello = |draws: bool| ClientMsg::Hello { protocol_version: 1, client_name: "lmux-app/t".into(), draws_browsers: draws };
+        let ds = ClientSink::new(64);
+        let d = inner.register(ds.clone()).await;
+        inner.handle_client_msg(d, hello(true), &ds).await;
+        let vs = ClientSink::new(64);
+        let v = inner.register(vs.clone()).await;
+        inner.handle_client_msg(v, hello(false), &vs).await;
+        inner.handle_client_msg(v, ClientMsg::Subscribe { surface: surf.clone(), history: None }, &vs).await;
+        assert!(is_in_app(&inner, &surf).await);
+        assert!(!fake.calls.lock().unwrap().iter().any(|c| c.starts_with("create")));
+    }
+
+    /// A restart on a Chromium host runs before any app has connected: the
+    /// app's tabs stay put until something needs them.
+    #[tokio::test]
+    async fn restart_on_a_chromium_host_leaves_app_tabs_alone() {
+        let Some((inner, fake, _pane, surf, _scratch, _dir)) = browser_daemon("restart").await else { return };
+        mark_in_app(&inner, &surf).await;
+        inner.reopen_browsers().await;
+        assert!(is_in_app(&inner, &surf).await);
+        assert!(!fake.calls.lock().unwrap().iter().any(|c| c.starts_with("create")));
+    }
+
+    /// Agent steps go to an app that runs this host's pages, not just the newest app.
+    #[tokio::test]
+    async fn agent_steps_go_to_the_browser_drawing_app() {
+        let Some((inner, _fake, _pane, surf, _scratch, _dir)) = browser_daemon("callapp").await else { return };
+        let hello = |draws: bool| ClientMsg::Hello { protocol_version: 1, client_name: "lmux-app/t".into(), draws_browsers: draws };
+        let drawing_sink = ClientSink::new(64);
+        let d = inner.register(drawing_sink.clone()).await;
+        inner.handle_client_msg(d, hello(true), &drawing_sink).await;
+        let other_sink = ClientSink::new(64);
+        let o = inner.register(other_sink.clone()).await;
+        inner.handle_client_msg(o, hello(false), &other_sink).await;
+        assert!(inner.call_app(&surf, AppBrowserOp::Reload).await.is_ok());
+        assert_eq!(drawing_sink.take_all().len(), 1, "the drawing app got the step");
+        assert_eq!(other_sink.take_all().len(), 0, "the newer non-drawing app did not");
+        inner.unregister(d).await;
+        assert!(inner.call_app(&surf, AppBrowserOp::Reload).await.is_err(), "no drawing app, Chromium host");
+    }
+
+    /// Web pages (any handshake with an `Origin`) are refused; native clients are not.
+    #[tokio::test]
+    async fn ws_handshake_with_an_origin_is_refused() {
+        let Some((inner, _fake, _pane, _surf, _scratch, _dir)) = browser_daemon("origin").await else { return };
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (s, peer) = l.accept().await.unwrap();
+                let inner = inner.clone();
+                tokio::spawn(async move {
+                    let _ = handle_ws_conn(inner, s, peer).await;
+                });
+            }
+        });
+        let url = format!("ws://{addr}");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("native client connects");
+        assert!(ws.next().await.is_some(), "welcome arrives");
+        for origin in ["http://localhost.lmux:7878", "http://evil.example", "null"] {
+            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+            let mut req = url.clone().into_client_request().unwrap();
+            req.headers_mut().insert("Origin", origin.parse().unwrap());
+            assert!(tokio_tungstenite::connect_async(req).await.is_err(), "origin {origin} must be refused");
+        }
+        server.abort();
     }
 
     /// A window a page opened becomes a tab beside its opener, selected so it
@@ -2635,6 +3062,7 @@ mod tests {
             paused_output: Default::default(),
             prs: std::sync::Mutex::new(HashMap::new()),
             app_calls: Default::default(),
+            handover: Default::default(),
         });
 
         let result = async {
@@ -2748,6 +3176,7 @@ mod tests {
             paused_output: Default::default(),
             prs: std::sync::Mutex::new(HashMap::new()),
             app_calls: Default::default(),
+            handover: Default::default(),
         });
 
         let result = async {
@@ -2883,6 +3312,7 @@ mod tests {
             paused_output: Default::default(),
             prs: std::sync::Mutex::new(HashMap::new()),
             app_calls: Default::default(),
+            handover: Default::default(),
         });
 
         let result = async {
