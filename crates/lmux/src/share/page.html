@@ -16,6 +16,7 @@
     <span id="host" class="host"></span>
   </div>
   <button id="attention" type="button" class="pill warn" hidden></button>
+  <button id="talk" type="button" class="ghost talk" hidden>Talk</button>
   <button id="theme" type="button" class="ghost">Dark</button>
 </header>
 <p id="notice" class="notice" role="status" hidden></p>
@@ -62,7 +63,7 @@
           <button type="button" data-key="enter" aria-label="Enter">⏎</button>
         </div>
         <div class="line">
-          <input id="text" type="text" enterkeyhint="send" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="Text to type" placeholder="Type to the terminal">
+          <textarea id="text" rows="1" enterkeyhint="send" autocapitalize="sentences" spellcheck="true" aria-label="Text to type" placeholder="Type to the terminal"></textarea>
           <button type="button" id="keys-btn" class="ghost" aria-controls="keys" aria-expanded="false" hidden>Keys</button>
           <button type="submit" class="primary">Send</button>
         </div>
@@ -70,6 +71,13 @@
     </section>
     <p class="empty">Pick a session to see its screen.</p>
   </main>
+</div>
+<div id="call" class="call" data-state="idle" hidden>
+  <p id="call-status" class="call-status" role="status" aria-live="polite"></p>
+  <div class="call-row">
+    <button id="hold" type="button" class="hold" disabled>Hold to talk</button>
+    <button id="hangup" type="button" class="ghost">End call</button>
+  </div>
 </div>
 <div id="toast" role="alert" hidden></div>
 <script src="/app.js"></script>
