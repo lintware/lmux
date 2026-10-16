@@ -11,6 +11,9 @@
 
 ## Updating remote hosts
 
-- Remote daemons run the code from the last `deploy/install-remote.sh <ssh-target>` (builds on the host, restarts `lmuxd`; existing panes keep their environment, new panes pick up changes). Hosts are listed in `~/Library/Application Support/lmux/hosts.json`. Rerun it for each ssh host after changing `crates/` code.
+- GitHub is the single source. Every host keeps its own clone in `~/.local/share/lmux/src` and updates itself with `deploy/update.sh`: fetch the ref it follows, build (on Macs with lmux.app installed, the app too), install, restart the daemon, then check that the daemon answers with the new build and that every tmux pane and session is still there; otherwise it rolls back and holds automatic updates (`~/.local/state/lmux/update.held`). An hourly systemd timer / launchd agent (`--install-timer`) runs it with `--auto`. Nothing is copied from one server to another; to ship a change, push it to the ref the hosts follow (`LMUX_UPDATE_REF` in `~/.config/lmux/update.env`).
+- Per host: `~/.local/share/lmux/src/deploy/update.sh --status` (what it runs and follows), `--check`, or a plain run to update now. Never point the updater at `~/lmux`.
+- New host: `deploy/install-remote.sh <ssh-target> [ref]` (the host clones from GitHub, builds, sets up `lmuxd`, hooks and automatic updates). Hosts are listed in `~/Library/Application Support/lmux/hosts.json` and `~/.ssh/config`; prefer tailnet addresses there (`lmux list-hosts` shows how each route travels).
+- `lmux --version` and `lmux rpc system.ping` report the commit a binary and a running daemon were built from.
 - `publish.sh` takes `icon.png` from the built app bundle, so rebuild the bundle first to get the current icon.
 - The DMG is not notarized unless a `lmux-notary` notarytool keychain profile exists.

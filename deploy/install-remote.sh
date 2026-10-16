@@ -2,14 +2,19 @@
 # Install or update lmux on a remote Linux or macOS host, so the app can add
 # it as a host ("Add Remote Host…" in the sidebar menu, or hosts.json).
 #
-#   deploy/install-remote.sh <ssh-target> [git-ref]
+#   deploy/install-remote.sh <ssh-target> [ref]
 #
-# Ships the source of <git-ref> (default: HEAD) over SSH, builds a release
-# binary there, installs it to ~/.local/bin/lmux, runs it as the systemd user
+# The host pulls <ref> (default: main) from GitHub into
+# ~/.local/share/lmux/src and builds it with deploy/update.sh: GitHub is the
+# single source, nothing is built here and copied there. It installs
+# ~/.local/bin/lmux, runs it as the systemd user
 # service `lmuxd` on Linux or the launchd agent `dev.lmux.lmuxd` on macOS
 # (websocket on 127.0.0.1:7878, reached through the app's SSH tunnel), and adds the Claude Code hooks that let panes resume their Claude
-# session after a reboot. Re-running it updates in place; tmux sessions survive
-# the daemon restart.
+# session after a reboot, and turns on hourly automatic updates from the same
+# ref (deploy/update.sh --install-timer). Re-running it updates in place; tmux
+# sessions survive the daemon restart. The ref must contain deploy/update.sh.
+# LMUX_SRC_TAR (set by the app) ships a source tarball instead, for hosts that
+# cannot reach GitHub; those get no automatic updates.
 #
 # Needs on the host: tmux, a Rust toolchain (rustup), and on Linux systemd user
 # services with lingering (`loginctl enable-linger $USER`) so the daemon
@@ -19,13 +24,13 @@ set -euo pipefail
 # SSH runs a non-login shell: on macOS that PATH has neither Homebrew nor cargo.
 env_path='export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH";'
 
-target=${1:?usage: install-remote.sh <ssh-target> [git-ref]}
-ref=${2:-HEAD}
-# The app runs this from its bundle with LMUX_SRC_TAR pointing at the source
-# it ships; from a checkout, the source comes from git.
-if [ -z "${LMUX_SRC_TAR:-}" ]; then
-  repo=$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)
-fi
+target=${1:?usage: install-remote.sh <ssh-target> [ref]}
+ref=${2:-main}
+repo_url=${LMUX_UPDATE_REPO:-https://github.com/lintware/lmux.git}
+case $ref in *[!A-Za-z0-9._/-]*) echo "bad ref $ref" >&2; exit 2 ;; esac
+case $repo_url in *[!A-Za-z0-9._/:@-]*) echo "bad repo URL $repo_url" >&2; exit 2 ;; esac
+# Where the host's source lives: its own GitHub clone, or (tarball) ~/lmux.
+if [ -n "${LMUX_SRC_TAR:-}" ]; then src='~/lmux'; else src='~/.local/share/lmux/src'; fi
 
 echo "==> checking $target"
 ssh -o BatchMode=yes "$target" "$env_path"'set -e
@@ -46,29 +51,35 @@ ssh -o BatchMode=yes "$target" "$env_path"'set -e
 
 if [ -n "${LMUX_SRC_TAR:-}" ]; then
   echo "==> shipping $(basename "$LMUX_SRC_TAR")"
-  ship() { cat "$LMUX_SRC_TAR"; }
+  ssh -o BatchMode=yes "$target" \
+    'rm -rf ~/lmux.new && mkdir -p ~/lmux.new && tar -x -C ~/lmux.new' <"$LMUX_SRC_TAR"
+  echo "==> building (first build takes a minute or two)"
+  ssh -o BatchMode=yes "$target" "$env_path"'set -e
+    cd ~/lmux.new && "$(command -v cargo)" build --release -p lmux 2>&1 | tail -1
+    rm -rf ~/lmux.old; [ -d ~/lmux ] && mv ~/lmux ~/lmux.old; mv ~/lmux.new ~/lmux
+    mkdir -p ~/.local/bin && install -m755 ~/lmux/target/release/lmux ~/.local/bin/lmux'
 else
-  echo "==> shipping $(git -C "$repo" rev-parse --short "$ref")"
-  ship() { git -C "$repo" archive --format=tar "$ref"; }
-  # `git archive` has no .git: name the commit for `lmux --version` and ping.
-  build_id=$(git -C "$repo" rev-parse --short=8 "$ref")
+  echo "==> $target pulls $ref from $repo_url and builds it (the first build takes a few minutes)"
+  ssh -o BatchMode=yes "$target" "$env_path"'set -e
+    src=~/.local/share/lmux/src
+    [ -d "$src/.git" ] || git clone -q '"$repo_url"' "$src"
+    git -C "$src" fetch -q origin "+refs/heads/*:refs/remotes/origin/*"
+    git -C "$src" -c advice.detachedHead=false checkout -q --force --detach "origin/'"$ref"'" 2>/dev/null \
+      || git -C "$src" -c advice.detachedHead=false checkout -q --force --detach '"$ref"'
+    [ -f "$src/deploy/update.sh" ] || { echo "'"$ref"' has no deploy/update.sh"; exit 1; }
+    LMUX_UPDATE_REPO='"$repo_url"' bash "$src/deploy/update.sh" --ref '"$ref"' --no-restart'
 fi
-ship | ssh -o BatchMode=yes "$target" \
-  'rm -rf ~/lmux.new && mkdir -p ~/lmux.new && tar -x -C ~/lmux.new'
 
-echo "==> building (first build takes a minute or two)"
+echo "==> helpers"
 ssh -o BatchMode=yes "$target" "$env_path"'set -e
-  cargo=$(command -v cargo)
-  cd ~/lmux.new && LMUX_BUILD_ID='"${build_id:-}"' "$cargo" build --release -p lmux 2>&1 | tail -1
-  rm -rf ~/lmux.old; [ -d ~/lmux ] && mv ~/lmux ~/lmux.old; mv ~/lmux.new ~/lmux
-  mkdir -p ~/.local/bin && install -m755 ~/lmux/target/release/lmux ~/.local/bin/lmux
+  src='"$src"'
   # Browser pages run in WebKit on the host when its helper is installed
   # (else the daemon uses Chromium).
   mkdir -p ~/.local/libexec/lmux
   helper=~/.local/libexec/lmux/lmux-webkit
   if [ "$(uname)" = Darwin ]; then
     rm -f "$helper.new"
-    command -v swiftc >/dev/null && swiftc -O -o "$helper.new" ~/lmux/helpers/webkit-mac/main.swift 2>&1 | tail -3
+    command -v swiftc >/dev/null && swiftc -O -o "$helper.new" "$src/helpers/webkit-mac/main.swift" 2>&1 | tail -3
     if [ -x "$helper.new" ]; then
       mv "$helper.new" "$helper" && echo "WebKit helper built"
     else
@@ -76,7 +87,7 @@ ssh -o BatchMode=yes "$target" "$env_path"'set -e
     fi
   elif python3 -c "import gi; gi.require_version(\"Gtk\", \"3.0\"); gi.require_version(\"WebKit2\", \"4.1\")" 2>/dev/null \
       && command -v Xvfb >/dev/null; then
-    install -m755 ~/lmux/helpers/webkit-linux/lmux-webkit "$helper" && echo "WebKit helper installed"
+    install -m755 "$src/helpers/webkit-linux/lmux-webkit" "$helper" && echo "WebKit helper installed"
   else
     rm -f "$helper"
     echo "no WebKit helper (sudo apt install python3-gi gir1.2-webkit2-4.1 xvfb); browsers use Chromium"
@@ -84,13 +95,14 @@ ssh -o BatchMode=yes "$target" "$env_path"'set -e
 
 echo "==> starting lmuxd"
 ssh -o BatchMode=yes "$target" "$env_path"'set -e
+  src='"$src"'
   if [ "$(uname)" = Darwin ]; then
     # A launchd agent: in the GUI session when someone is logged in at the
     # Mac, else in the background user session SSH has.
     plist=~/Library/LaunchAgents/dev.lmux.lmuxd.plist
     mkdir -p ~/Library/LaunchAgents ~/.local/state/lmux
     sed -e "s|@HOME@|$HOME|g" -e "s|@PATH@|$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin|g" \
-      ~/lmux/deploy/lmuxd.plist > "$plist"
+      "$src/deploy/lmuxd.plist" > "$plist"
     uid=$(id -u)
     domain=gui/$uid
     launchctl print "$domain" >/dev/null 2>&1 || domain=user/$uid
@@ -103,7 +115,7 @@ ssh -o BatchMode=yes "$target" "$env_path"'set -e
       echo "lmuxd did not start; see ~/.local/state/lmux/daemon.log"; tail -5 ~/.local/state/lmux/daemon.log; exit 1; }
   else
     mkdir -p ~/.config/systemd/user
-    install -m644 ~/lmux/deploy/lmuxd.service ~/.config/systemd/user/lmuxd.service
+    install -m644 "$src/deploy/lmuxd.service" ~/.config/systemd/user/lmuxd.service
     systemctl --user daemon-reload
     systemctl --user enable lmuxd >/dev/null 2>&1
     systemctl --user restart lmuxd
@@ -139,5 +151,10 @@ os.makedirs(os.path.dirname(p), exist_ok=True)
 json.dump(s, open(p, "w"), indent=2)
 print("hooks installed")
 PY'
+
+if [ -z "${LMUX_SRC_TAR:-}" ]; then
+  echo "==> automatic updates"
+  ssh -o BatchMode=yes "$target" "$env_path"'LMUX_UPDATE_REPO='"$repo_url"' bash ~/.local/share/lmux/src/deploy/update.sh --ref '"$ref"' --install-timer'
+fi
 
 echo "==> done. In the app: right click the sidebar > Add Remote Host… > $target"
