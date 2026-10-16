@@ -91,6 +91,15 @@ daemon_build() { "$bin" --socket "$sock" rpc system.ping 2>/dev/null | sed -n 's
 # --- timer ---------------------------------------------------------------
 self=$src/deploy/update.sh
 if [ "$mode" = install-timer ] || [ "$mode" = remove-timer ]; then
+  if [ "$mode" = install-timer ]; then
+    # Remember the ref first: enabling the timer can start a run right away
+    # (its OnBootSec is long past), and that run must follow the same ref.
+    mkdir -p "$(dirname "$conf")"
+    touch "$conf"
+    grep -v '^LMUX_UPDATE_REF=' "$conf" >"$conf.tmp" || true
+    echo "LMUX_UPDATE_REF=$ref" >>"$conf.tmp"
+    mv "$conf.tmp" "$conf"
+  fi
   if [ "$os" = Linux ]; then
     unit=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
     if [ "$mode" = remove-timer ]; then
@@ -147,12 +156,6 @@ EOF
     launchctl bootstrap "$domain" "$plist"
     echo "automatic updates on (launchd agent dev.lmux.update, hourly)"
   fi
-  # Remember the ref, so the timer follows the same one.
-  mkdir -p "$(dirname "$conf")"
-  touch "$conf"
-  grep -v '^LMUX_UPDATE_REF=' "$conf" >"$conf.tmp" || true
-  echo "LMUX_UPDATE_REF=$ref" >>"$conf.tmp"
-  mv "$conf.tmp" "$conf"
   echo "following $ref from $repo"
   exit 0
 fi
