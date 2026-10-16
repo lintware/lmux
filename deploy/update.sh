@@ -146,6 +146,9 @@ EOF
   <array><string>/bin/bash</string><string>$self</string><string>--auto</string></array>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><false/>
+  <!-- A daemon the app started is relaunched from this job; without this,
+       launchd kills it with the job's process group when the job exits. -->
+  <key>AbandonProcessGroup</key><true/>
   <key>LowPriorityIO</key><true/>
   <key>Nice</key><integer>10</integer>
   <key>StandardOutPath</key><string>$state/update.out</string>
