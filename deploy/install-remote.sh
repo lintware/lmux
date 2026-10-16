@@ -50,6 +50,8 @@ if [ -n "${LMUX_SRC_TAR:-}" ]; then
 else
   echo "==> shipping $(git -C "$repo" rev-parse --short "$ref")"
   ship() { git -C "$repo" archive --format=tar "$ref"; }
+  # `git archive` has no .git: name the commit for `lmux --version` and ping.
+  build_id=$(git -C "$repo" rev-parse --short=8 "$ref")
 fi
 ship | ssh -o BatchMode=yes "$target" \
   'rm -rf ~/lmux.new && mkdir -p ~/lmux.new && tar -x -C ~/lmux.new'
@@ -57,7 +59,7 @@ ship | ssh -o BatchMode=yes "$target" \
 echo "==> building (first build takes a minute or two)"
 ssh -o BatchMode=yes "$target" "$env_path"'set -e
   cargo=$(command -v cargo)
-  cd ~/lmux.new && "$cargo" build --release -p lmux 2>&1 | tail -1
+  cd ~/lmux.new && LMUX_BUILD_ID='"${build_id:-}"' "$cargo" build --release -p lmux 2>&1 | tail -1
   rm -rf ~/lmux.old; [ -d ~/lmux ] && mv ~/lmux ~/lmux.old; mv ~/lmux.new ~/lmux
   mkdir -p ~/.local/bin && install -m755 ~/lmux/target/release/lmux ~/.local/bin/lmux
   # Browser pages run in WebKit on the host when its helper is installed

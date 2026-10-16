@@ -96,7 +96,7 @@ Use --host HOST to query another daemon, or tree --all-hosts to discover session
 #[derive(Parser, Debug)]
 #[command(
     name = "lmux",
-    version,
+    version = lmux_core::VERSION,
     about = "lmux: persistent terminal and browser workspaces, driven like cmux",
     help_template = "{about}\n\n{usage-heading} {usage}{after-help}\n\nOptions:\n{options}\n",
     after_help = COMMANDS_HELP,

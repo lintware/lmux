@@ -37,6 +37,16 @@ impl Drop for Daemon {
     }
 }
 
+/// A child process killed when the test ends, failed or not.
+struct Reaped(Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn tmux_available() -> bool {
     Command::new("tmux")
         .arg("-V")
@@ -1289,13 +1299,13 @@ async fn share_rolls_credentials_over_and_revoke_ends_them() {
     d.ok(&["new-workspace", "--name", "shared", "--command", "/bin/sh"]);
     let state = tempfile::Builder::new().prefix("lmuxshare").tempdir_in("/tmp").unwrap();
     let start = || {
-        d.cmd(&["share", "--service", "--no-tunnel"])
+        Reaped(d.cmd(&["share", "--service", "--no-tunnel"])
             .env("LMUX_STATE_DIR", state.path())
             .env("LMUX_SHARE_ROTATE_SECS", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .unwrap()
+            .unwrap())
     };
     let code_from = || -> serde_json::Value {
         for _ in 0..100 {
@@ -1307,7 +1317,7 @@ async fn share_rolls_credentials_over_and_revoke_ends_them() {
         }
         panic!("the gateway service did not come up");
     };
-    let mut service = start();
+    let service = start();
     let info = code_from();
     let url = info["url"].as_str().unwrap().to_string();
     let (base, code) = url.split_once("/#").unwrap();
@@ -1384,9 +1394,8 @@ async fn share_rolls_credentials_over_and_revoke_ends_them() {
     // The service restarts (new process): the phone stays paired.
     drop(ws);
     drop(page);
-    let _ = service.kill();
-    let _ = service.wait();
-    let mut service = start();
+    drop(service);
+    let _service = start();
     let info = code_from();
     let addr2 = info["url"].as_str().unwrap().split_once("/#").unwrap().0.trim_start_matches("http://").to_string();
     assert!(ack(&addr2, &third).starts_with("HTTP/1.1 204"), "persisted across the restart");
@@ -1404,9 +1413,6 @@ async fn share_rolls_credentials_over_and_revoke_ends_them() {
     assert!(ended["msg"].as_str().unwrap().contains("expired"));
     assert!(ack(&addr2, &third).starts_with("HTTP/1.1 401"));
     assert!(connect(addr2.clone(), third.clone()).await.is_err());
-
-    let _ = service.kill();
-    let _ = service.wait();
 }
 
 /// When cloudflared exits, the share starts a new tunnel itself and tells
@@ -1432,10 +1438,10 @@ exec sleep 60
 "#, c = count.display())).unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let mut service = d.cmd(&["share", "--service", "--port", &port.to_string(), "--cloudflared", fake.to_str().unwrap()])
+    let mut service = Reaped(d.cmd(&["share", "--service", "--port", &port.to_string(), "--cloudflared", fake.to_str().unwrap()])
         .env("LMUX_STATE_DIR", state.path())
         .env("LMUX_SHARE_TAILNET", "0")
-        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     let share_code = || -> Option<serde_json::Value> {
         let out = d.cmd(&["share-code"]).env("LMUX_STATE_DIR", state.path()).output().unwrap();
         out.status.success().then(|| serde_json::from_slice(&out.stdout).unwrap())
@@ -1477,7 +1483,5 @@ exec sleep 60
     assert!(share_code().unwrap()["url"].as_str().unwrap().starts_with("https://gen-2.trycloudflare.com/#"));
     let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(state.path().join("share.json")).unwrap()).unwrap();
     assert_eq!(saved["url"], "https://gen-2.trycloudflare.com");
-    assert!(service.try_wait().unwrap().is_none(), "the service kept running");
-    let _ = service.kill();
-    let _ = service.wait();
+    assert!(service.0.try_wait().unwrap().is_none(), "the service kept running");
 }

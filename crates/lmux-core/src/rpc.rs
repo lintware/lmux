@@ -619,7 +619,8 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
     let id = req.id;
     let params = &req.params;
     match req.method.as_str() {
-        methods::PING => ok(id, json!({"pong": true})),
+        // `build` says which commit this daemon runs (a fleet update checks it).
+        methods::PING => ok(id, json!({"pong": true, "version": env!("CARGO_PKG_VERSION"), "build": crate::BUILD_ID, "pid": std::process::id()})),
 
         methods::IDENTIFY => {
             let state = inner.state.lock().await;

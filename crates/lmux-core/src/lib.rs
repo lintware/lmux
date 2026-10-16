@@ -28,6 +28,11 @@ pub use tree::SessionState;
 
 use std::path::PathBuf;
 
+/// The commit this binary was built from (`-dirty` with local changes).
+pub const BUILD_ID: &str = env!("LMUX_BUILD_ID");
+/// `0.1.0 (1a2b3c4d)`: what `lmux --version` prints.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("LMUX_BUILD_ID"), ")");
+
 /// Default state directory: `$LMUX_STATE_DIR`, else `$XDG_STATE_HOME/lmux`, else
 /// `~/.local/state/lmux`.
 pub fn default_state_dir() -> PathBuf {
