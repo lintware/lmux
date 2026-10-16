@@ -7,6 +7,11 @@ import Observation
 /// `/ws` socket streams the tree, the open tab's screen and its chat. The socket is
 /// reopened while the cookie is valid (after a drop, or when the app returns to the
 /// foreground). When the server says the session is over, the app asks for a new QR.
+///
+/// The share keeps the connection going on its own: it rolls the credential over on
+/// the live socket (`nextCookie`, acknowledged, then promoted) and says where it
+/// answers (`endpoints`). The app tries those addresses in order, the tailnet ones
+/// first, so a restarted Quick Tunnel under a new address does not end the session.
 @MainActor
 @Observable
 final class Store {
@@ -47,8 +52,33 @@ final class Store {
     @ObservationIgnored private var foreground = true
     @ObservationIgnored private var attempt = 0
     /// Reconnects in a row that found no host. A Quick Tunnel's address dies
-    /// with it, so after a few the old link is gone for good.
+    /// with it, so after a few the old link is gone for good (unless the share
+    /// also has tailnet addresses).
     @ObservationIgnored private var hostMisses = 0
+    /// The addresses and credentials still to try in this round, in order.
+    @ObservationIgnored private var attempts: [Attempt] = []
+    /// What the current socket used.
+    @ObservationIgnored private var live: Attempt?
+    /// A tailnet address failed lately: skip them for a while (off the tailnet
+    /// each costs a timeout).
+    @ObservationIgnored private var tailnetFailedAt: Date?
+
+    struct Attempt: Equatable {
+        let origin: URL
+        let cookie: String
+    }
+
+    /// Every address with every credential: addresses as the share ordered them
+    /// (tailnet first) and the one it was paired on last; the successor before
+    /// the current credential, since using it acknowledges it.
+    static func plan(_ s: SavedSession, skipTailnet: Bool) -> [Attempt] {
+        var origins: [URL] = []
+        for u in (s.endpoints ?? []) + [s.origin] where !origins.contains(u) {
+            if skipTailnet && ShareEndpoint.isTailnet(u) && u != s.origin { continue }
+            origins.append(u)
+        }
+        return origins.flatMap { o in s.credentials.map { Attempt(origin: o, cookie: $0) } }
+    }
     /// Uploads waiting for the server's answer, by id.
     @ObservationIgnored private var uploads: [String: CheckedContinuation<String, Error>] = [:]
 
@@ -133,6 +163,7 @@ final class Store {
     }
 
     private func resetView() {
+        attempts = []
         tree = nil
         screens = [:]
         chats = [:]
@@ -227,10 +258,15 @@ final class Store {
             return
         }
         disconnect()
-        guard let sock = ShareSocket(s) else {
+        if attempts.isEmpty {
+            let skip = tailnetFailedAt.map { Date().timeIntervalSince($0) < 600 } ?? false
+            attempts = Self.plan(s, skipTailnet: skip)
+        }
+        guard let next = attempts.first, let sock = ShareSocket(origin: next.origin, cookie: next.cookie) else {
             expire("This share link is not valid.")
             return
         }
+        live = next
         socket = sock
         if case .reconnecting = phase {} else { phase = .connecting }
         reader = Task { [weak self] in
@@ -259,13 +295,41 @@ final class Store {
         guard socket === sock else { return }
         socket = nil
         reader = nil
+        let tried = live
+        live = nil
         if case .expired = phase { return }
         if let e = error as? ShareClient.SocketError, e == .unauthorized {
-            expire(e.localizedDescription)
+            // That credential is refused: a successor the share replaced, or the
+            // session is over. Try the other one before giving up.
+            if let tried {
+                if tried.cookie == saved?.nextCookie {
+                    updateActive { $0.nextCookie = nil; $0.nextExpires = nil }
+                }
+                attempts.removeAll { $0.cookie == tried.cookie }
+            }
+            if attempts.isEmpty || tried == nil {
+                expire(e.localizedDescription)
+            } else {
+                connect()
+            }
             return
         }
-        guard foreground else { return }
-        if let e = error as? URLError, e.code == .cannotFindHost {
+        guard foreground else {
+            attempts = []
+            return
+        }
+        // Still trying this round's addresses: on to the next one at once.
+        if let tried, !attempts.isEmpty {
+            if ShareEndpoint.isTailnet(tried.origin) { tailnetFailedAt = Date() }
+            attempts.removeAll { $0.origin == tried.origin }
+            if !attempts.isEmpty {
+                connect()
+                return
+            }
+        }
+        attempts = []
+        let hasTailnet = saved?.endpoints?.contains(where: ShareEndpoint.isTailnet) ?? false
+        if !hasTailnet, let e = error as? URLError, e.code == .cannotFindHost {
             hostMisses += 1
             if hostMisses >= 3 {
                 expire("The share link changed (the gateway restarted). Scan a new QR code.")
@@ -304,6 +368,14 @@ final class Store {
                 phase = .connected
                 attempt = 0
                 hostMisses = 0
+                attempts = []
+                if let live {
+                    if ShareEndpoint.isTailnet(live.origin) { tailnetFailedAt = nil }
+                    // The share took the successor: it is acknowledged by use.
+                    updateActive { $0.promote(live.cookie) }
+                }
+                // Ask for rollover and the share's addresses.
+                Task { try? await socket?.send(.hello) }
                 // A new socket streams nothing until told which tab is open.
                 if let s = openSurface { Task { try? await socket?.send(.open(surface: s)) } }
             }
@@ -319,6 +391,26 @@ final class Store {
             uploads.removeValue(forKey: id)?.resume(returning: path)
         case let .uploadError(id, message):
             uploads.removeValue(forKey: id)?.resume(throwing: UploadError(message: message))
+        case let .rollover(token, expiresIn):
+            guard let live else { break }
+            // Saved before the acknowledgement: whatever happens next, one of
+            // the two credentials works.
+            updateActive { $0.nextCookie = token; $0.nextExpires = Date().addingTimeInterval(expiresIn) }
+            Task { [weak self] in
+                do {
+                    try await ShareClient.ack(origin: live.origin, cookie: token)
+                    self?.updateActive { $0.promote(token) }
+                } catch {
+                    // The next connection tries it first, which acknowledges it.
+                }
+            }
+        case let .endpoints(primary, urls):
+            let list = urls.compactMap(URL.init(string:)).filter { ["http", "https"].contains($0.scheme?.lowercased() ?? "") }
+            updateActive { c in
+                c.endpoints = list
+                // The tunnel restarted under a new public address.
+                if let p = primary.flatMap(URL.init(string:)), p.scheme?.lowercased() == "https" { c.origin = p }
+            }
         case let .error(msg):
             if msg.localizedCaseInsensitiveContains("session expired") {
                 expire("The session expired. Scan a new QR code.")

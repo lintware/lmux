@@ -5,8 +5,11 @@
 # The laptop app asks it for pairing codes over SSH (`lmux share-code`).
 # Installed by deploy/install-gateway.sh.
 #
-# When cloudflared exits the address is dead, so the share exits and systemd
-# starts it again with a new address (written to ~/.local/state/lmux/share.json).
+# When cloudflared exits the share starts a new tunnel itself, writes the new
+# address to ~/.local/state/lmux/share.json and tells connected phones. Paired
+# phones are kept in ~/.local/state/lmux/share-sessions.json across restarts.
+# It exits (and systemd restarts it) only when the tunnel cannot be started
+# again. On a tailnet it also listens at <tailnet IP>:7871.
 
 [Unit]
 Description=lmux phone gateway (Cloudflare Quick Tunnel)

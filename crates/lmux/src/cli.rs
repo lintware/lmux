@@ -78,6 +78,8 @@ Other:
   import-cmux                Bring cmux's workspaces over (--move hands over their Claude sessions)
   share                      Share sessions to a phone or browser through a Cloudflare Quick Tunnel
   share-connect              Register this machine with a phone gateway over outbound SSH
+  share-sessions             List the phones paired with the gateway service here
+  share-revoke               End a paired phone's session now (ID, or --all)
   rpc                        Call a daemon method: rpc <method> [json-params]
   list-hosts                 Discover local and SSH/Tailscale host routes
   ping                       Check the daemon answers
@@ -824,6 +826,18 @@ pub enum Cmd {
         /// `lmux share-code` and exit when the tunnel stops.
         #[arg(long)]
         service: bool,
+    },
+    /// List the phones paired with the gateway service on this machine.
+    ShareSessions,
+    /// End a paired phone's session at once (the gateway service on this
+    /// machine). Its open connections close within a second.
+    ShareRevoke {
+        /// Session id from `lmux share-sessions`.
+        #[arg(conflicts_with = "all", required_unless_present = "all")]
+        id: Option<String>,
+        /// End every paired phone's session.
+        #[arg(long)]
+        all: bool,
     },
     /// Print a new pairing code (JSON with the link and QR) from the gateway
     /// service on this machine, or with --status, whether a code is unused.

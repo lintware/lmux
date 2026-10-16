@@ -16,6 +16,10 @@ struct Probe {
         let targetAgent = ProcessInfo.processInfo.environment["TARGET_AGENT"]
         // Optional: upload this file once the tab is open and print where it landed.
         let uploadFile = ProcessInfo.processInfo.environment["UPLOAD"]
+        // Optional: with a share started with LMUX_SHARE_ROTATE_SECS=1, wait
+        // for a credential rollover, store and acknowledge it as the app does,
+        // and reconnect with the successor.
+        let checkRollover = ProcessInfo.processInfo.environment["ROLLOVER"] == "1"
         var uploaded = false
         print("origin", link.origin, "code length", link.code.count)
         // Hand-off forms resolve to the same link.
@@ -45,6 +49,10 @@ struct Probe {
             catch { check((error as? ShareClient.SocketError) == .unauthorized, "bad cookie refused (\(error))") }
         }
 
+        if checkRollover {
+            await rollover(saved)
+            return
+        }
         guard let sock = ShareSocket(saved) else { print("FAIL socket"); exit(1) }
         var opened: String?
         var sentText = false
@@ -100,6 +108,10 @@ struct Probe {
                     print("OK uploaded", id, "->", path)
                 case let .uploadError(id, message):
                     print("FAIL upload", id, message)
+                case .rollover:
+                    print("rollover offered")
+                case let .endpoints(primary, urls):
+                    print("endpoints", primary ?? "-", urls)
                 case .unknown:
                     print("unknown frame")
                 }
@@ -113,6 +125,42 @@ struct Probe {
             exit(1)
         }
         print("done; chat frames seen:", sawChat)
+    }
+
+    /// The app's rollover path: hello, the successor saved as `nextCookie`,
+    /// the ack, `promote`, then a new socket with the successor.
+    static func rollover(_ first: SavedSession) async {
+        var saved = first
+        guard let sock = ShareSocket(saved) else { print("FAIL socket"); exit(1) }
+        var sentHello = false
+        do {
+            for try await frame in sock.frames {
+                switch frame {
+                case .tree:
+                    if !sentHello { sentHello = true; try await sock.send(.hello) }
+                case let .endpoints(primary, urls):
+                    print("endpoints", primary ?? "-", urls)
+                case let .rollover(token, expiresIn):
+                    saved.nextCookie = token
+                    saved.nextExpires = Date().addingTimeInterval(expiresIn)
+                    check(saved.credentials.first == token, "successor is tried first")
+                    try await ShareClient.ack(origin: saved.origin, cookie: token)
+                    saved.promote(token)
+                    check(saved.cookie == token && saved.nextCookie == nil, "acknowledged and promoted")
+                    sock.close()
+                default:
+                    break
+                }
+            }
+        } catch {}
+        check(saved.cookie != first.cookie, "a rollover arrived")
+        guard let again = ShareSocket(saved) else { print("FAIL socket"); exit(1) }
+        do {
+            for try await frame in again.frames {
+                if case .tree = frame { check(true, "reconnected with the successor"); again.close() }
+            }
+        } catch {}
+        print("OK rollover")
     }
 
     static func check(_ ok: Bool, _ what: String) {

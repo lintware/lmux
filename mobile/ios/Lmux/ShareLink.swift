@@ -70,6 +70,12 @@ enum ShareEndpoint {
         return parts?.url
     }
 
+    /// A share's tailnet address: plain HTTP, since WireGuard already
+    /// encrypts it. Public addresses are always HTTPS.
+    static func isTailnet(_ origin: URL) -> Bool {
+        origin.scheme?.lowercased() == "http"
+    }
+
     /// The `Origin` header value. The server compares it with its `Host`.
     static func originHeader(_ origin: URL) -> String {
         origin.absoluteString.hasSuffix("/") ? String(origin.absoluteString.dropLast()) : origin.absoluteString

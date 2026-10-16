@@ -501,6 +501,7 @@ dependencies = [
  "lmux-core",
  "lmux-proto",
  "qrcode",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

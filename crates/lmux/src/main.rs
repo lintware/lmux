@@ -92,6 +92,7 @@ async fn run() -> anyhow::Result<()> {
         Cmd::Server(_) | Cmd::Hooks { .. } | Cmd::WsProbe { .. } | Cmd::Cp { .. }
         | Cmd::ImportCmux { .. } | Cmd::Share { .. } | Cmd::ShareCode { .. }
         | Cmd::ShareBackend | Cmd::ShareAttach { .. } | Cmd::ShareConnect { .. } | Cmd::ListHosts
+        | Cmd::ShareSessions | Cmd::ShareRevoke { .. }
     ) {
         bail!("--host supports daemon commands; service, hook, file-copy and discovery commands run on this machine");
     }
@@ -176,6 +177,8 @@ async fn run() -> anyhow::Result<()> {
         }
         Cmd::Cp { sources, dest, tell } => return cp::run(cp::Opts { sources, dest, tell }).await,
         Cmd::ShareCode { status } => return share::request_code(status).await,
+        Cmd::ShareSessions => return share::sessions(json).await,
+        Cmd::ShareRevoke { id, all } => return share::revoke(id, all).await,
         Cmd::ShareBackend => return share::backend(socket).await,
         Cmd::ShareConnect { gateway } => {
             share::connect_gateway(socket, gateway).await?;

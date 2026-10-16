@@ -792,6 +792,8 @@ fn build(cmd: Cmd) -> anyhow::Result<Req> {
         | Cmd::ListHosts
         | Cmd::Tree { all_hosts: true, .. }
         | Cmd::ShareCode { .. }
+        | Cmd::ShareSessions
+        | Cmd::ShareRevoke { .. }
         | Cmd::Rpc { .. }
         | Cmd::ImportCmux { .. }
         | Cmd::WaitFor { .. }

@@ -1274,3 +1274,210 @@ fn new_workspace_finds_a_folder_title_on_another_host() {
     let missing = fixture.cmd(&["new-workspace", "--folder", "nowhere"]).output().unwrap();
     assert!(String::from_utf8_lossy(&missing.stderr).contains("no host has a folder named"));
 }
+
+/// Phone links must not end abruptly: on the live socket a client that says
+/// `hello` gets a successor credential, acknowledges it, and keeps its socket;
+/// the gateway service keeps sessions across a restart; a revoke closes the
+/// socket at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn share_rolls_credentials_over_and_revoke_ends_them() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::io::{Read, Write};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+    let Some(d) = Daemon::start() else { return };
+    d.ok(&["new-workspace", "--name", "shared", "--command", "/bin/sh"]);
+    let state = tempfile::Builder::new().prefix("lmuxshare").tempdir_in("/tmp").unwrap();
+    let start = || {
+        d.cmd(&["share", "--service", "--no-tunnel"])
+            .env("LMUX_STATE_DIR", state.path())
+            .env("LMUX_SHARE_ROTATE_SECS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let code_from = || -> serde_json::Value {
+        for _ in 0..100 {
+            let out = d.cmd(&["share-code"]).env("LMUX_STATE_DIR", state.path()).output().unwrap();
+            if out.status.success() {
+                return serde_json::from_slice(&out.stdout).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the gateway service did not come up");
+    };
+    let mut service = start();
+    let info = code_from();
+    let url = info["url"].as_str().unwrap().to_string();
+    let (base, code) = url.split_once("/#").unwrap();
+    let base = base.to_string();
+    let addr = base.trim_start_matches("http://").to_string();
+    let http = |addr: &str, req: String| -> String {
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    };
+    let auth = |addr: &str, code: &str| -> Option<String> {
+        let body = format!("{{\"code\":\"{code}\"}}");
+        let r = http(addr, format!("POST /auth HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nContent-Length: {}\r\n\r\n{body}", body.len()));
+        let line = r.lines().find(|l| l.starts_with("Set-Cookie:"))?;
+        Some(line.trim_start_matches("Set-Cookie: ").split(';').next().unwrap().to_string())
+    };
+    let ack = |addr: &str, cookie: &str| {
+        http(addr, format!("POST /rollover/ack HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nCookie: {cookie}\r\nContent-Length: 0\r\n\r\n"))
+    };
+    let connect = |addr: String, cookie: String| async move {
+        let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+        req.headers_mut().insert("Origin", format!("http://{addr}").parse().unwrap());
+        req.headers_mut().insert("Cookie", cookie.parse().unwrap());
+        tokio_tungstenite::connect_async(req).await.map(|(ws, _)| ws)
+    };
+    async fn frame<S>(ws: &mut S, kind: &str) -> Option<serde_json::Value>
+    where
+        S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        while let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["t"] == kind {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    let first = auth(&addr, code).expect("paired");
+    let mut ws = connect(addr.clone(), first.clone()).await.expect("socket");
+    // Every client hears the share's addresses on connect.
+    let ends = frame(&mut ws, "endpoints").await.expect("endpoints");
+    assert_eq!(ends["primary"], base.as_str());
+    assert!(frame(&mut ws, "tree").await.is_some());
+    // The app's way: the token itself, stored, then acknowledged by use.
+    ws.send(Message::Text(r#"{"t":"hello","client":"ios","rollover":"token"}"#.into())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let roll = frame(&mut ws, "rollover").await.expect("a successor once the credential is old enough");
+    let second = format!("lmux_session={}", roll["token"].as_str().unwrap());
+    assert!(roll["expires_in"].as_u64().unwrap() > 86400);
+    // Until acknowledged both work; the ack is the successor's first use.
+    assert!(ack(&addr, &first).starts_with("HTTP/1.1 204"));
+    assert!(ack(&addr, &second).starts_with("HTTP/1.1 204"));
+    assert!(ack(&addr, "lmux_session=bogus").starts_with("HTTP/1.1 401"));
+    // The socket opened with the first credential stays up.
+    ws.send(Message::Text(r#"{"t":"open","surface":"surface:1"}"#.into())).await.unwrap();
+    assert!(frame(&mut ws, "screen").await.is_some(), "still streaming");
+
+    // The page's way: a code it trades at /auth for the successor cookie.
+    let mut page = connect(addr.clone(), second.clone()).await.expect("socket");
+    page.send(Message::Text(r#"{"t":"hello","client":"web","rollover":"code"}"#.into())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let roll = frame(&mut page, "rollover").await.expect("a rollover code");
+    let third = auth(&addr, roll["code"].as_str().unwrap()).expect("the code sets the successor cookie");
+    assert!(ack(&addr, &third).starts_with("HTTP/1.1 204"));
+
+    // A handoff code signs a page in on another address, same lineage.
+    page.send(Message::Text(r#"{"t":"handoff"}"#.into())).await.unwrap();
+    let hand = frame(&mut page, "handoff").await.expect("handoff");
+    assert!(auth(&addr, hand["code"].as_str().unwrap()).is_some());
+
+    // The service restarts (new process): the phone stays paired.
+    drop(ws);
+    drop(page);
+    let _ = service.kill();
+    let _ = service.wait();
+    let mut service = start();
+    let info = code_from();
+    let addr2 = info["url"].as_str().unwrap().split_once("/#").unwrap().0.trim_start_matches("http://").to_string();
+    assert!(ack(&addr2, &third).starts_with("HTTP/1.1 204"), "persisted across the restart");
+    let listed = d.cmd(&["--json", "share-sessions"]).env("LMUX_STATE_DIR", state.path()).output().unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+    assert!(!listed.to_string().contains(third.trim_start_matches("lmux_session=")), "no tokens listed");
+
+    // Revoke: the open socket closes within a tick, the cookie stops working.
+    let mut ws = connect(addr2.clone(), third.clone()).await.expect("socket");
+    assert!(frame(&mut ws, "tree").await.is_some());
+    let out = d.cmd(&["share-revoke", "--all"]).env("LMUX_STATE_DIR", state.path()).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Revoked 1 session."));
+    let ended = frame(&mut ws, "error").await.expect("told");
+    assert!(ended["msg"].as_str().unwrap().contains("expired"));
+    assert!(ack(&addr2, &third).starts_with("HTTP/1.1 401"));
+    assert!(connect(addr2.clone(), third.clone()).await.is_err());
+
+    let _ = service.kill();
+    let _ = service.wait();
+}
+
+/// When cloudflared exits, the share starts a new tunnel itself and tells
+/// connected clients the new address over their socket (a stand-in
+/// cloudflared prints a new trycloudflare address each start).
+#[tokio::test(flavor = "multi_thread")]
+async fn share_restarts_the_tunnel_and_tells_connected_clients() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+    let Some(d) = Daemon::start() else { return };
+    let state = tempfile::Builder::new().prefix("lmuxtun").tempdir_in("/tmp").unwrap();
+    let fake = state.path().join("cloudflared");
+    let count = state.path().join("starts");
+    std::fs::write(&fake, format!(r#"#!/bin/sh
+n=$(($(cat '{c}' 2>/dev/null || echo 0) + 1)); echo $n > '{c}'
+echo "INF |  https://gen-$n.trycloudflare.com  |" >&2
+echo "INF Registered tunnel connection" >&2
+if [ $n -eq 1 ]; then sleep 2; exit 1; fi
+exec sleep 60
+"#, c = count.display())).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut service = d.cmd(&["share", "--service", "--port", &port.to_string(), "--cloudflared", fake.to_str().unwrap()])
+        .env("LMUX_STATE_DIR", state.path())
+        .env("LMUX_SHARE_TAILNET", "0")
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let share_code = || -> Option<serde_json::Value> {
+        let out = d.cmd(&["share-code"]).env("LMUX_STATE_DIR", state.path()).output().unwrap();
+        out.status.success().then(|| serde_json::from_slice(&out.stdout).unwrap())
+    };
+    let mut info = None;
+    for _ in 0..100 {
+        info = share_code();
+        if info.is_some() { break; }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let info = info.expect("service up");
+    let url = info["url"].as_str().unwrap();
+    assert!(url.starts_with("https://gen-1.trycloudflare.com/#"), "{url}");
+    let code = url.split_once("/#").unwrap().1;
+    let addr = format!("127.0.0.1:{port}");
+    let body = format!("{{\"code\":\"{code}\"}}");
+    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    s.write_all(format!("POST /auth HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+    let mut r = String::new();
+    s.read_to_string(&mut r).unwrap();
+    let cookie = r.lines().find(|l| l.starts_with("Set-Cookie:")).unwrap().trim_start_matches("Set-Cookie: ").split(';').next().unwrap().to_string();
+
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("Origin", format!("http://{addr}").parse().unwrap());
+    req.headers_mut().insert("Cookie", cookie.parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws.send(Message::Text(r#"{"t":"hello","client":"ios","rollover":"token"}"#.into())).await.unwrap();
+    let mut primaries = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline && !primaries.iter().any(|p: &String| p.contains("gen-2")) {
+        let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_secs(10), ws.next()).await else { break };
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if v["t"] == "endpoints" {
+            primaries.push(v["primary"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(primaries, ["https://gen-1.trycloudflare.com", "https://gen-2.trycloudflare.com"], "the same socket heard the move");
+    // New codes and share.json use the new address.
+    assert!(share_code().unwrap()["url"].as_str().unwrap().starts_with("https://gen-2.trycloudflare.com/#"));
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(state.path().join("share.json")).unwrap()).unwrap();
+    assert_eq!(saved["url"], "https://gen-2.trycloudflare.com");
+    assert!(service.try_wait().unwrap().is_none(), "the service kept running");
+    let _ = service.kill();
+    let _ = service.wait();
+}

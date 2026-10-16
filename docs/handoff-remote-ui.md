@@ -37,7 +37,8 @@ Files: `crates/lmux/src/share/{page.html,app.js,app.css}` are embedded with `inc
 Auth:
 
 - The page sends `POST /auth` with the body `{"code":"<fragment>"}`, same-origin. The body limit is 1 KB.
-- `204` sets the `lmux_session` cookie (`Max-Age` 30 days). The server ends the session after 24 hours with no connected socket; each check of a live socket extends it.
+- `204` sets the `lmux_session` cookie (`Max-Age` 30 days, one credential's hard end). A credential lapses after 7 days unused; a connected socket counts as use. `Secure` is set except on the tailnet address (plain HTTP inside WireGuard), where a `Secure` cookie would not be stored.
+- The same `/auth` also takes rollover and handoff codes (below); each sets a cookie in the same session.
 - `401` means the code is expired or already used. Codes are single use and last 5 minutes.
 - `403` means a bad `Origin`.
 - After auth, the page opens `wss://<host>/ws` (`ws:` on plain HTTP). The cookie rides along. A page reload with no fragment can connect directly while the cookie is still valid; the current placeholder already does this.
@@ -46,15 +47,29 @@ Server to page:
 
 - `{"t":"tree","typing":bool,"host":str,"workspaces":[{"id","title","agent","summary","tabs":[{"id","title","kind"}]}]}`. Sent on connect, and when it changes (polled about every 2 s). `agent` is `none|running|idle|needs_input`. `summary` may be null. `kind` comes from serde's tag, so expect the string `"terminal"` or `"browser"`. Handle anything else as not openable. Only terminal tabs can be opened.
 - `{"t":"screen","surface":"surface:N","text":str}`. Plain text with no colours, polled about every 0.5 s, sent only when it changes.
-- `{"t":"error","msg":str}`. When the session expires, the server sends `"The session expired."` and closes the socket.
+- `{"t":"error","msg":str}`. When the session expires or is revoked, the server sends `"The session expired."` and closes the socket (within 0.5 s of a revoke).
+- `{"t":"endpoints","primary":str|null,"urls":[str]}`. Where the share answers: `primary` is the public tunnel address (pairing links use it), `urls` every address in the order to try (tailnet first, the tunnel last). Sent on connect and whenever it changes, for example when cloudflared restarted under a new Quick Tunnel address.
+- `{"t":"rollover","token":str,"expires_in":s}` (a client that said `hello` with `rollover:"token"`) or `{"t":"rollover","code":str}` (`rollover:"code"`). A successor credential, offered once the current one is a day old, again after 5 minutes until acknowledged.
+- `{"t":"handoff","code":str,"expires_in":s}`. Answers `handoff`: a one-time code that signs a page in at another of the share's addresses, in the same session.
+
+Credential rollover (sessions do not end while used):
+
+- The current credential keeps working until the successor is acknowledged, plus 2 minutes, or for a 7-day grace period if it never is. Acknowledging is using the successor: `POST /rollover/ack` with it as the cookie (same `Origin` rule), or any later request or socket with it. A client stores the successor before acknowledging it and tries it first on the next connect, falling back to the old one on 401, so no step can lose the session.
+- The page trades a rollover code at `/auth` (the cookie stays HttpOnly), then posts `/rollover/ack`. The app gets the token, saves it in the Keychain as `nextCookie`, acks, and promotes it.
+- A socket opened with the old credential stays open across the rollover.
+- `lmux share-sessions` lists the paired phones of the gateway service on that machine; `lmux share-revoke ID|--all` ends them at once. Stopping a share the app or a terminal runs ends all of its sessions (they live in memory); the gateway service keeps them in `share-sessions.json` (0600, SHA-256 hashes only) across restarts.
 
 Page to server:
 
 - `{"t":"open","surface":"surface:N"}` opens one tab at a time. `{"t":"close"}` closes it.
 - `{"t":"send","surface","text","enter":bool}`. The text is at most 4096 bytes, and the server turns newlines into spaces. Only for the open tab.
 - `{"t":"key","surface","key"}` with one of `enter escape esc tab up down left right backspace ctrl+c ctrl+d`.
+- `{"t":"hello","client":"ios"|"web","rollover":"token"|"code"}`. Asks for credential rollover. Clients that never say hello keep the old behaviour (one credential, ending after 30 days).
+- `{"t":"handoff"}`. Asks for a handoff code (the page does when the share has other addresses).
 
-Limits: at most 8 sockets (the 9th gets 429), plus the Quick Tunnel limits (changing URL, no uptime guarantee, 429 above 200 requests in flight).
+Limits: at most 8 sockets (the 9th gets 429), plus the Quick Tunnel limits (changing URL, no uptime guarantee, 429 above 200 requests in flight). When cloudflared exits, the share starts a new tunnel itself and announces the address with `endpoints`.
+
+Tailnet: when Tailscale runs, the share also listens on this machine's tailnet IPv4 at port 7871 (any free port if taken), plain HTTP, and lists `http://<MagicDNS name>:7871` and `http://<100.x>:7871` first in `endpoints`. That address does not change when the share or its tunnel restarts. `LMUX_SHARE_TAILNET=0` turns it off.
 
 ## 4. Protocol additions (posted in issue #8, built)
 

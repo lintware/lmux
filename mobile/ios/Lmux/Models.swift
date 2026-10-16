@@ -103,6 +103,11 @@ enum ServerFrame {
     case error(String)
     case uploaded(id: String, path: String)
     case uploadError(id: String, message: String)
+    /// A successor credential for this connection, and its lifetime in seconds.
+    case rollover(token: String, expiresIn: Double)
+    /// Where the share answers now: the public address, and every address,
+    /// the ones to try first first.
+    case endpoints(primary: String?, urls: [String])
     case unknown
 
     private struct Envelope: Decodable { let t: String }
@@ -111,6 +116,8 @@ enum ServerFrame {
     private struct Failure: Decodable { let msg: String }
     private struct Uploaded: Decodable { let id: String; let path: String }
     private struct UploadFailure: Decodable { let id: String; let msg: String }
+    private struct Rollover: Decodable { let token: String; let expires_in: Double }
+    private struct Endpoints: Decodable { let primary: String?; let urls: [String] }
 
     static func decode(_ data: Data) -> ServerFrame {
         let json = JSONDecoder()
@@ -135,6 +142,10 @@ enum ServerFrame {
             return (try? json.decode(Uploaded.self, from: data)).map { .uploaded(id: $0.id, path: $0.path) } ?? .unknown
         case "upload_error":
             return (try? json.decode(UploadFailure.self, from: data)).map { .uploadError(id: $0.id, message: $0.msg) } ?? .unknown
+        case "rollover":
+            return (try? json.decode(Rollover.self, from: data)).map { .rollover(token: $0.token, expiresIn: $0.expires_in) } ?? .unknown
+        case "endpoints":
+            return (try? json.decode(Endpoints.self, from: data)).map { .endpoints(primary: $0.primary, urls: $0.urls) } ?? .unknown
         default:
             return .unknown
         }
@@ -148,6 +159,8 @@ enum ClientMessage {
     case key(surface: String, key: String)
     /// Announces a file; its bytes follow as binary frames.
     case upload(id: String, name: String, size: Int)
+    /// Asks for credential rollover (as a token) and the share's addresses.
+    case hello
 
     /// The server's limit on one `send`.
     static let maxText = 4096
@@ -163,6 +176,7 @@ enum ClientMessage {
         case let .send(surface, text, enter): object = ["t": "send", "surface": surface, "text": text, "enter": enter]
         case let .key(surface, key): object = ["t": "key", "surface": surface, "key": key]
         case let .upload(id, name, size): object = ["t": "upload", "id": id, "name": name, "size": size]
+        case .hello: object = ["t": "hello", "client": "ios", "rollover": "token"]
         }
         let data = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data()
         return String(decoding: data, as: UTF8.self)

@@ -85,12 +85,32 @@ enum ShareClient {
     }
 
     static func socketRequest(_ saved: SavedSession) -> URLRequest? {
-        guard let url = ShareEndpoint.socketURL(saved.origin) else { return nil }
+        socketRequest(origin: saved.origin, cookie: saved.cookie)
+    }
+
+    /// The upgrade to `origin`'s socket with `cookie`. Any of a share's
+    /// addresses takes the same credential. A tailnet address (plain HTTP)
+    /// gets a short timeout: off the tailnet it never answers, and the public
+    /// address comes next.
+    static func socketRequest(origin: URL, cookie: String) -> URLRequest? {
+        guard let url = ShareEndpoint.socketURL(origin) else { return nil }
         var req = URLRequest(url: url)
-        req.setValue(ShareEndpoint.originHeader(saved.origin), forHTTPHeaderField: "Origin")
-        req.setValue("\(cookieName)=\(saved.cookie)", forHTTPHeaderField: "Cookie")
-        req.timeoutInterval = 20
+        req.setValue(ShareEndpoint.originHeader(origin), forHTTPHeaderField: "Origin")
+        req.setValue("\(cookieName)=\(cookie)", forHTTPHeaderField: "Cookie")
+        req.timeoutInterval = ShareEndpoint.isTailnet(origin) ? 4 : 20
         return req
+    }
+
+    /// `POST /rollover/ack` with the successor credential: the share then
+    /// lets the old one go.
+    static func ack(origin: URL, cookie: String) async throws {
+        var req = URLRequest(url: origin.appendingPathComponent("rollover").appendingPathComponent("ack"))
+        req.httpMethod = "POST"
+        req.setValue(ShareEndpoint.originHeader(origin), forHTTPHeaderField: "Origin")
+        req.setValue("\(cookieName)=\(cookie)", forHTTPHeaderField: "Cookie")
+        let (_, response) = try await session.data(for: req)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 204 || code == 200 else { throw AuthError.http(code) }
     }
 
     /// Maps a failed upgrade to a reason the UI can act on.
@@ -109,8 +129,12 @@ final class ShareSocket: @unchecked Sendable {
     let frames: AsyncThrowingStream<ServerFrame, Error>
     private var pinger: Task<Void, Never>?
 
-    init?(_ saved: SavedSession) {
-        guard let req = ShareClient.socketRequest(saved) else { return nil }
+    convenience init?(_ saved: SavedSession) {
+        self.init(origin: saved.origin, cookie: saved.cookie)
+    }
+
+    init?(origin: URL, cookie: String) {
+        guard let req = ShareClient.socketRequest(origin: origin, cookie: cookie) else { return nil }
         let task = ShareClient.session.webSocketTask(with: req)
         task.maximumMessageSize = 8 * 1024 * 1024
         self.task = task

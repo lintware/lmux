@@ -30,6 +30,8 @@ base64 = "0.22"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "0.26"
+# SHA-256 of share credentials (already in the tree through rustls).
+ring = "0.17"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

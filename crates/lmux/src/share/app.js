@@ -19,6 +19,9 @@
   var chatStuck = true, screenStuck = true;
 
   // Theme is the only thing kept in localStorage. Codes and tokens never are.
+  // One handoff code (single use, for this share's other addresses) is kept
+  // in sessionStorage, for this tab only, so the page can move when the
+  // address it came from goes away.
   function storedTheme() {
     try {
       var v = localStorage.getItem("lmux-theme");
@@ -64,6 +67,73 @@
   function send(obj) {
     if (!ws || ws.readyState !== 1) return false;
     ws.send(JSON.stringify(obj));
+    return true;
+  }
+
+  // ---- Staying signed in: rollover and the share's other addresses ----
+
+  var ends = null; // {primary, urls}: where this share answers, preferred first
+
+  function handoffCode() {
+    try { return sessionStorage.getItem("lmux-handoff"); } catch (e) { return null; }
+  }
+  function saveHandoff(code) {
+    try { sessionStorage.setItem("lmux-handoff", code); } catch (e) { /* private window */ }
+  }
+  function otherAddresses() {
+    if (!ends) return [];
+    return ends.urls.filter(function (u) { return u !== location.origin; });
+  }
+
+  // The server's successor credential arrives as a code; trading it at /auth
+  // replaces the HttpOnly cookie, and the ack (which carries the new cookie)
+  // lets the old one go. If either step fails the old cookie still works.
+  function rollOver(code) {
+    fetch("/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: code }),
+      credentials: "same-origin"
+    }).then(function (r) {
+      if (r.ok) return fetch("/rollover/ack", { method: "POST", credentials: "same-origin" });
+    }).catch(function () { /* the next offer retries */ });
+  }
+
+  function onEndpoints(m) {
+    ends = {
+      primary: typeof m.primary === "string" ? m.primary : null,
+      urls: (m.urls || []).filter(function (u) { return typeof u === "string" && /^https?:\/\//.test(u); })
+    };
+    if (otherAddresses().length) send({ t: "handoff" });
+  }
+
+  // The address this page is on is no longer the share's (a planned move):
+  // follow it while this one still answers.
+  function followMove() {
+    var code = handoffCode();
+    if (!ends || !code || !ends.primary || !ends.urls.length) return;
+    if (ends.urls.indexOf(location.origin) >= 0) return;
+    try { sessionStorage.removeItem("lmux-handoff"); } catch (e) { /* ignore */ }
+    location.replace(ends.primary + "/#" + code);
+  }
+
+  // When this address stops answering, offer the share's next one, signed
+  // in with the handoff code. A link, not a jump: the other address may not
+  // be reachable from this network (a tailnet one off the tailnet).
+  function offerOtherAddress() {
+    var code = handoffCode(), others = otherAddresses();
+    if (!code || !others.length) return false;
+    var n = $("notice");
+    n.textContent = "This address stopped answering. ";
+    others.forEach(function (u, i) {
+      var a = document.createElement("a");
+      a.href = u + "/#" + code;
+      a.textContent = (i ? " or " : "Try ") + u.replace(/^https?:\/\//, "");
+      a.rel = "noreferrer";
+      a.addEventListener("click", function () { try { sessionStorage.removeItem("lmux-handoff"); } catch (e) { /* ignore */ } });
+      n.appendChild(a);
+    });
+    n.hidden = false;
     return true;
   }
 
@@ -531,6 +601,13 @@
     } else if (m.t === "chat") {
       if (m.surface !== openId) return;
       renderChat(m);
+    } else if (m.t === "rollover") {
+      if (typeof m.code === "string") rollOver(m.code);
+    } else if (m.t === "endpoints") {
+      onEndpoints(m);
+      followMove();
+    } else if (m.t === "handoff") {
+      if (typeof m.code === "string") { saveHandoff(m.code); followMove(); }
     } else if (m.t === "error") {
       if (/expired/i.test(m.msg || "")) {
         expired = true;
@@ -548,6 +625,8 @@
     sock.onopen = function () {
       retries = 0;
       notice("");
+      // Ask for credential rollover and the share's addresses.
+      send({ t: "hello", client: "web", rollover: "code" });
       // A new socket knows nothing about the tab this page had open.
       if (openId) send({ t: "open", surface: openId });
     };
@@ -556,7 +635,9 @@
       if (ws === sock) ws = null;
       if (expired) return;
       if (retries >= MAX_RETRIES) {
-        notice("Disconnected. The share may have ended or the link expired. Scan a new QR code.");
+        if (!offerOtherAddress()) {
+          notice("Disconnected. The share may have ended or the link expired. Scan a new QR code.");
+        }
         return;
       }
       var wait = Math.min(1000 * Math.pow(2, retries), 8000);

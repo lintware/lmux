@@ -27,6 +27,10 @@ APP="${BUILD}/Lmux.app"
 
 DEV_ID="${DEV_ID:-00008140-00043D811E13001C}"
 BUNDLE_ID="${BUNDLE_ID:-com.vas.lmux}"
+# The tailnet's MagicDNS suffix. A share's tailnet address is plain HTTP
+# (WireGuard encrypts it; Headscale issues no certificates), so App Transport
+# Security needs an exception for it.
+TAILNET_DOMAIN="${TAILNET_DOMAIN:-hs.lint.internal}"
 TEAM_ID="UTSTY3J6NS"
 IDENTITY="${IDENTITY:-Apple Development: Vasanth Sreeram (C8T8853TKY)}"
 # The team's wildcard ("*") development profile. Xcode renews it under a new file
@@ -177,6 +181,23 @@ cat > "${APP}/Info.plist" <<PLIST
   <string>Attach a photo to send to your agent.</string>
   <key>UIAppFonts</key>
   <array><string>JetBrainsMono.ttf</string></array>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key><true/>
+    <key>NSExceptionDomains</key>
+    <dict>
+      <key>${TAILNET_DOMAIN}</key>
+      <dict>
+        <key>NSIncludesSubdomains</key><true/>
+        <key>NSExceptionAllowsInsecureHTTPLoads</key><true/>
+      </dict>
+      <key>ts.net</key>
+      <dict>
+        <key>NSIncludesSubdomains</key><true/>
+        <key>NSExceptionAllowsInsecureHTTPLoads</key><true/>
+      </dict>
+    </dict>
+  </dict>
 </dict>
 </plist>
 PLIST

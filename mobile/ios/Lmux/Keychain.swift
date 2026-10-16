@@ -6,11 +6,24 @@ import os
 /// the app last saw there (the gateway's name and its servers) for the
 /// connections list. The cookie is a bearer credential for terminals, so the
 /// list lives in the Keychain (this device only, after first unlock).
+///
+/// Rollover: the share sends a successor credential over the live socket. It
+/// is saved as `nextCookie` first, then acknowledged, then promoted to
+/// `cookie`; until then the old one still works, so a crash or a lost
+/// connection at any step loses nothing.
 struct SavedSession: Codable, Equatable, Identifiable {
     let id: UUID
-    let origin: URL
+    /// The share's public address. It follows the share when its tunnel
+    /// restarts under a new one (the `endpoints` frame).
+    var origin: URL
     var cookie: String
     var expires: Date
+    /// A successor credential not yet acknowledged.
+    var nextCookie: String?
+    var nextExpires: Date?
+    /// Every address of the share, the ones to try first first (tailnet,
+    /// then the public tunnel), as the share last said.
+    var endpoints: [URL]?
     /// The gateway or Mac's host name, from the share's tree.
     var name: String?
     /// The servers behind it when last connected.
@@ -34,9 +47,33 @@ struct SavedSession: Codable, Equatable, Identifiable {
         name = try c.decodeIfPresent(String.self, forKey: .name)
         servers = try c.decodeIfPresent([String].self, forKey: .servers)
         lastUsed = try c.decodeIfPresent(Date.self, forKey: .lastUsed)
+        nextCookie = try c.decodeIfPresent(String.self, forKey: .nextCookie)
+        nextExpires = try c.decodeIfPresent(Date.self, forKey: .nextExpires)
+        endpoints = try c.decodeIfPresent([URL].self, forKey: .endpoints)
     }
 
-    var isValid: Bool { expires > Date().addingTimeInterval(5) }
+    var isValid: Bool {
+        let soon = Date().addingTimeInterval(5)
+        return expires > soon || (nextCookie != nil && (nextExpires ?? .distantPast) > soon)
+    }
+
+    /// The credentials to try, the successor first: using it acknowledges it.
+    var credentials: [String] {
+        let soon = Date().addingTimeInterval(5)
+        var list: [String] = []
+        if let next = nextCookie, (nextExpires ?? .distantPast) > soon { list.append(next) }
+        if expires > soon { list.append(cookie) }
+        return list
+    }
+
+    /// Makes `token` the credential once the share has it acknowledged.
+    mutating func promote(_ token: String) {
+        guard nextCookie == token else { return }
+        cookie = token
+        expires = nextExpires ?? expires
+        nextCookie = nil
+        nextExpires = nil
+    }
     var displayName: String { name ?? origin.host ?? "lmux" }
 }
 
@@ -80,8 +117,18 @@ enum Keychain {
         return status == errSecSuccess ? result as? Data : nil
     }
 
+    /// Replaces the item in place, so the saved list is never missing in
+    /// between (a delete then add could lose every connection on a crash).
     private static func write(_ account: String, _ data: Data) {
-        delete(account)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let update: [String: Any] = [kSecValueData as String: data]
+        let updated = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+        if updated == errSecSuccess { return }
+        if updated != errSecItemNotFound { log.error("keychain update failed: \(updated, privacy: .public)") }
         let item: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

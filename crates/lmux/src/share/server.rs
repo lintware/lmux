@@ -17,7 +17,7 @@ use super::remote::Remote;
 use super::upload::{Pending, Step};
 use super::voice::{CmdResult, OfferError, PageCmd, Voice, VoiceConfig, MAX_SDP};
 use super::voice_tools::Backend;
-use super::{CODE_TTL, SESSION_IDLE, SESSION_MAX};
+use super::auth::{Auth, Who, GRACE};
 
 const PAGE: &str = include_str!("page.html");
 const JS: &str = include_str!("app.js");
@@ -56,11 +56,24 @@ impl Server {
     }
 }
 
-/// When a session token stops working: after `idle` passes with no use, or at
-/// `end` regardless.
-struct Session {
-    idle: Instant,
-    end: Instant,
+/// Where this share can be reached. `urls` is in the order clients should
+/// try (tailnet first, the public tunnel last); `primary` is the public one
+/// that pairing links use. `version` changes with every change, so each
+/// socket knows when to tell its client.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Endpoints {
+    pub primary: Option<String>,
+    pub urls: Vec<String>,
+    pub version: u64,
+}
+
+/// How a client takes a successor credential, from its `hello`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Rollover {
+    /// The app: the token itself, which it stores and acknowledges.
+    Token,
+    /// A web page: a code it trades at `/auth`, so the cookie stays HttpOnly.
+    Code,
 }
 
 pub struct Shared {
@@ -70,8 +83,8 @@ pub struct Shared {
     /// True when other servers are controlled too (gateway mode).
     gateway: bool,
     allow_typing: bool,
-    codes: Mutex<HashMap<String, Instant>>,
-    sessions: Mutex<HashMap<String, Session>>,
+    pub auth: Auth,
+    endpoints: Mutex<Endpoints>,
     clients: Mutex<usize>,
     /// The last merged tree message, shared by every socket for `TREE_TTL`.
     tree: tokio::sync::Mutex<Option<(Instant, String)>>,
@@ -82,11 +95,11 @@ pub struct Shared {
 impl Shared {
     #[cfg(test)]
     pub fn new(socket: String, allow_typing: bool) -> Self {
-        Self::with_servers(socket, Vec::new(), allow_typing)
+        Self::with_servers(socket, Vec::new(), allow_typing, Auth::in_memory())
     }
 
     /// This machine plus the servers reached over SSH at `targets`.
-    pub fn with_servers(socket: String, targets: Vec<String>, allow_typing: bool) -> Self {
+    pub fn with_servers(socket: String, targets: Vec<String>, allow_typing: bool, auth: Auth) -> Self {
         let local = Arc::new(Local::new(socket));
         let mut servers = vec![Arc::new(Server { name: lmux_core::daemon::hostname(), host: Host::Local(local.clone()) })];
         let gateway = !targets.is_empty();
@@ -99,8 +112,8 @@ impl Shared {
             attached: Mutex::new(HashMap::new()),
             gateway,
             allow_typing,
-            codes: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
+            auth,
+            endpoints: Mutex::new(Endpoints::default()),
             clients: Mutex::new(0),
             tree: tokio::sync::Mutex::new(None),
             voice: voice_config().map(|c| Arc::new(Voice::new(c))),
@@ -117,17 +130,25 @@ impl Shared {
     }
 
     pub fn new_code(&self) -> String {
-        let code = random_token();
-        self.codes.lock().unwrap().insert(code.clone(), Instant::now() + CODE_TTL);
-        code
+        self.auth.new_code()
     }
 
     /// Whether `code` is still waiting to be scanned.
     pub fn code_live(&self, code: &str) -> bool {
-        let mut codes = self.codes.lock().unwrap();
-        let now = Instant::now();
-        codes.retain(|_, exp| *exp > now);
-        codes.keys().any(|k| ct_eq(k.as_bytes(), code.as_bytes()))
+        self.auth.code_live(code)
+    }
+
+    /// Record where the share is reachable now; connected clients hear of a
+    /// change on their next tick.
+    pub fn set_endpoints(&self, primary: Option<String>, urls: Vec<String>) {
+        let mut e = self.endpoints.lock().unwrap();
+        if e.primary != primary || e.urls != urls {
+            *e = Endpoints { primary, urls, version: e.version + 1 };
+        }
+    }
+
+    pub fn endpoints(&self) -> Endpoints {
+        self.endpoints.lock().unwrap().clone()
     }
 
     pub fn allow_typing(&self) -> bool {
@@ -154,36 +175,6 @@ impl Shared {
         self.attached.lock().unwrap().insert(name.clone(), Arc::new(Server { name, host: Host::Remote(remote.clone()) }));
         *self.tree.lock().await = None;
         remote.serve_attached(stream).await
-    }
-
-    /// Spend a code. Returns a session token when the code was live.
-    fn redeem(&self, code: &str) -> Option<String> {
-        let mut codes = self.codes.lock().unwrap();
-        let now = Instant::now();
-        codes.retain(|_, exp| *exp > now);
-        // Look every stored code up in constant time per entry.
-        let hit = codes.keys().find(|k| ct_eq(k.as_bytes(), code.as_bytes())).cloned();
-        let hit = hit?;
-        codes.remove(&hit);
-        drop(codes);
-        let token = random_token();
-        self.sessions.lock().unwrap().insert(token.clone(), Session { idle: now + SESSION_IDLE, end: now + SESSION_MAX });
-        Some(token)
-    }
-
-    /// Whether `token` is a live session, and if so keep it alive for another
-    /// `SESSION_IDLE` (never past its `SESSION_MAX`).
-    fn session_alive(&self, token: &str) -> bool {
-        let mut s = self.sessions.lock().unwrap();
-        let now = Instant::now();
-        s.retain(|_, v| v.idle > now && v.end > now);
-        match s.iter_mut().find(|(k, _)| ct_eq(k.as_bytes(), token.as_bytes())) {
-            Some((_, v)) => {
-                v.idle = (now + SESSION_IDLE).min(v.end);
-                true
-            }
-            None => false,
-        }
     }
 
     /// The server that owns tab `id`, and the tab's id on that server.
@@ -239,22 +230,24 @@ pub fn random_token() -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-pub async fn serve(shared: Arc<Shared>, listener: TcpListener) {
+/// Accept clients on `listener`. `secure` says whether its clients reach it
+/// over HTTPS (the tunnel), which decides the cookie's `Secure` flag: the
+/// tailnet listener is plain HTTP inside WireGuard, where a `Secure` cookie
+/// would never be stored.
+pub async fn serve(shared: Arc<Shared>, listener: TcpListener, secure: bool) {
     loop {
         let Ok((stream, _)) = listener.accept().await else { continue };
         let shared = shared.clone();
         tokio::spawn(async move {
             // Errors are one client's problem; frames and bodies are never logged.
-            let _ = tokio::time::timeout(Duration::from_secs(3 * 3600), handle(shared, stream)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(3 * 3600), handle(shared, stream, secure)).await;
         });
     }
+}
+
+fn session_cookie(token: &str, max_age: u64, secure: bool) -> String {
+    let secure = if secure { " Secure;" } else { "" };
+    format!("{COOKIE}={token}; HttpOnly;{secure} SameSite=Strict; Path=/; Max-Age={max_age}")
 }
 
 struct Request {
@@ -327,7 +320,7 @@ fn respond(status: &str, ctype: &str, extra: &[(&str, String)], body: &[u8]) -> 
     out
 }
 
-async fn handle(shared: Arc<Shared>, mut stream: TcpStream) -> anyhow::Result<()> {
+async fn handle(shared: Arc<Shared>, mut stream: TcpStream, secure: bool) -> anyhow::Result<()> {
     let (req, head_len) = tokio::time::timeout(Duration::from_secs(10), peek_head(&stream)).await??;
     let path = req.path.split('?').next().unwrap_or("").to_string();
 
@@ -362,16 +355,25 @@ async fn handle(shared: Arc<Shared>, mut stream: TcpStream) -> anyhow::Result<()
                     .ok()
                     .and_then(|v| v["code"].as_str().map(str::to_owned))
                     .unwrap_or_default();
-                match shared.redeem(&code) {
-                    Some(token) => {
-                        let cookie = format!(
-                            "{COOKIE}={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={}",
-                            SESSION_MAX.as_secs()
-                        );
+                // A pairing, handoff or (web) rollover code: each sets the cookie.
+                match shared.auth.redeem(&code) {
+                    Some(g) => {
+                        let cookie = session_cookie(&g.token, g.max_age, secure);
                         respond("204 No Content", "text/plain", &[("Set-Cookie", cookie)], b"")
                     }
                     None => respond("401 Unauthorized", "text/plain", &[], b"expired"),
                 }
+            }
+        }
+        // The client stored its successor credential and sends it back: from
+        // now its predecessor only lingers briefly.
+        ("POST", "/rollover/ack") => {
+            if !origin_ok(&req) {
+                respond("403 Forbidden", "text/plain", &[], b"bad origin")
+            } else if req.cookie(COOKIE).and_then(|t| shared.auth.check(t)).is_some() {
+                respond("204 No Content", "text/plain", &[], b"")
+            } else {
+                respond("401 Unauthorized", "text/plain", &[], b"expired")
             }
         }
         ("POST", "/voice/offer" | "/voice/talk" | "/voice/end") => voice_route(&shared, &req, &path, &body).await,
@@ -392,9 +394,11 @@ async fn voice_route(shared: &Arc<Shared>, req: &Request, path: &str, body: &[u8
     if !origin_ok(req) {
         return json_reply("403 Forbidden", json!({"error": "Bad origin."}));
     }
-    let Some(token) = req.cookie(COOKIE).filter(|t| shared.session_alive(t)) else {
+    // The call belongs to the lineage, so a rollover mid-call keeps it.
+    let Some(token) = req.cookie(COOKIE).and_then(|t| shared.auth.check(t)).map(|w| w.lineage) else {
         return json_reply("401 Unauthorized", json!({"error": "Sign in again."}));
     };
+    let token = token.as_str();
     let Some(voice) = &shared.voice else {
         return json_reply("404 Not Found", json!({"error": "Voice is not set up on this share."}));
     };
@@ -451,7 +455,8 @@ impl Drop for ClientGuard {
 }
 
 async fn handle_ws(shared: Arc<Shared>, mut stream: TcpStream, req: Request) -> anyhow::Result<()> {
-    let authed = req.cookie(COOKIE).is_some_and(|t| shared.session_alive(t));
+    let who = req.cookie(COOKIE).and_then(|t| shared.auth.check(t));
+    let authed = who.is_some();
     if !origin_ok(&req) || !authed {
         let mut head = vec![0u8; MAX_HEADERS];
         let _ = stream.read(&mut head).await;
@@ -459,7 +464,7 @@ async fn handle_ws(shared: Arc<Shared>, mut stream: TcpStream, req: Request) -> 
         stream.write_all(&respond(status, "text/plain", &[], b"denied")).await?;
         return Ok(());
     }
-    let token = req.cookie(COOKIE).unwrap_or_default().to_string();
+    let Some(mut who) = who else { return Ok(()) };
     let admitted = {
         let mut n = shared.clients.lock().unwrap();
         let ok = *n < MAX_CLIENTS;
@@ -493,14 +498,31 @@ async fn handle_ws(shared: Arc<Shared>, mut stream: TcpStream, req: Request) -> 
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     let mut n: u64 = 0;
     let mut pending: Option<Pending> = None;
+    // Set by the client's `hello`; older clients never roll over.
+    let mut rollover: Option<Rollover> = None;
+    let mut told_endpoints = 0u64;
 
     loop {
         tokio::select! {
             _ = tick.tick() => {
                 n += 1;
-                if !shared.session_alive(&token) {
-                    let _ = sink.send(Message::Text(json!({"t":"error","msg":"The session expired."}).to_string())).await;
-                    break;
+                // The socket's credential, or the successor it rolled over to.
+                // None: revoked, or lapsed.
+                match shared.auth.follow(&who) {
+                    Some(w) => who = w,
+                    None => {
+                        let _ = sink.send(Message::Text(json!({"t":"error","msg":"The session expired."}).to_string())).await;
+                        break;
+                    }
+                }
+                if let Some(m) = endpoints_message(&shared, &mut told_endpoints) {
+                    if sink.send(Message::Text(m)).await.is_err() { break; }
+                }
+                // About once every 10 s, well under the resend window.
+                if n % 20 == 2 {
+                    if let Some(m) = rollover_message(&shared, &who, rollover) {
+                        if sink.send(Message::Text(m)).await.is_err() { break; }
+                    }
                 }
                 if n % 4 == 1 {
                     match tree_message(&shared).await {
@@ -579,6 +601,24 @@ async fn handle_ws(shared: Arc<Shared>, mut stream: TcpStream, req: Request) -> 
                         }
                     }
                     Some("close") => surface = None,
+                    Some("hello") => {
+                        rollover = match v["rollover"].as_str() {
+                            Some("token") => Some(Rollover::Token),
+                            Some("code") => Some(Rollover::Code),
+                            _ => None,
+                        };
+                        if let Some(m) = endpoints_message(&shared, &mut told_endpoints) {
+                            if sink.send(Message::Text(m)).await.is_err() { break; }
+                        }
+                        if let Some(m) = rollover_message(&shared, &who, rollover) {
+                            if sink.send(Message::Text(m)).await.is_err() { break; }
+                        }
+                    }
+                    // A page asks for a way in on the share's other addresses.
+                    Some("handoff") => {
+                        let m = json!({"t":"handoff","code":shared.auth.handoff(&who),"expires_in":GRACE}).to_string();
+                        if sink.send(Message::Text(m)).await.is_err() { break; }
+                    }
                     Some("upload") => {
                         let id = v["id"].as_str().unwrap_or("");
                         let started = if !shared.allow_typing {
@@ -634,6 +674,31 @@ async fn handle_ws(shared: Arc<Shared>, mut stream: TcpStream, req: Request) -> 
         }
     }
     Ok(())
+}
+
+/// The share's addresses, when they changed since this socket last heard.
+fn endpoints_message(shared: &Shared, told: &mut u64) -> Option<String> {
+    let e = shared.endpoints();
+    if e.version == 0 || e.version == *told {
+        return None;
+    }
+    *told = e.version;
+    Some(json!({"t":"endpoints","primary":e.primary,"urls":e.urls}).to_string())
+}
+
+/// A successor credential for this socket's client, when one is due.
+fn rollover_message(shared: &Shared, who: &Who, how: Option<Rollover>) -> Option<String> {
+    let how = how?;
+    if !shared.auth.rollover_due(who) {
+        return None;
+    }
+    Some(match how {
+        Rollover::Token => {
+            let g = shared.auth.offer_token(who)?;
+            json!({"t":"rollover","token":g.token,"expires_in":g.max_age}).to_string()
+        }
+        Rollover::Code => json!({"t":"rollover","code":shared.auth.offer_code(who)}).to_string(),
+    })
 }
 
 pub fn valid_surface(s: &str) -> bool {
@@ -731,42 +796,6 @@ mod tests {
     }
 
     #[test]
-    fn a_code_works_once() {
-        let s = shared();
-        let c = s.new_code();
-        assert!(s.redeem("wrong").is_none());
-        let tok = s.redeem(&c).expect("first use");
-        assert!(s.session_alive(&tok));
-        assert!(s.redeem(&c).is_none(), "second use must fail");
-    }
-
-    #[test]
-    fn an_expired_code_fails() {
-        let s = shared();
-        s.codes.lock().unwrap().insert("old".into(), Instant::now() - Duration::from_secs(1));
-        assert!(s.redeem("old").is_none());
-    }
-
-    #[test]
-    fn use_keeps_a_session_alive_until_its_end() {
-        let s = shared();
-        let now = Instant::now();
-        let sess = |idle, end| Session { idle, end };
-        let soon = now + Duration::from_secs(5);
-        s.sessions.lock().unwrap().insert("used".into(), sess(soon, now + SESSION_MAX));
-        s.sessions.lock().unwrap().insert("capped".into(), sess(soon, now + Duration::from_secs(60)));
-        s.sessions.lock().unwrap().insert("idle".into(), sess(now - Duration::from_secs(1), now + SESSION_MAX));
-        s.sessions.lock().unwrap().insert("over".into(), sess(soon, now - Duration::from_secs(1)));
-
-        assert!(s.session_alive("used"));
-        assert!(s.sessions.lock().unwrap()["used"].idle > now + SESSION_IDLE - Duration::from_secs(5));
-        assert!(s.session_alive("capped"));
-        assert!(s.sessions.lock().unwrap()["capped"].idle <= now + Duration::from_secs(60));
-        assert!(!s.session_alive("idle"));
-        assert!(!s.session_alive("over"));
-    }
-
-    #[test]
     fn origin_must_match_host() {
         let mk = |o: Option<&str>| {
             let mut headers = HashMap::new();
@@ -826,7 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn trees_merge_with_server_prefixes() {
-        let s = Shared::with_servers("/nonexistent".into(), vec!["vps1".into(), "vps2".into()], true);
+        let s = Shared::with_servers("/nonexistent".into(), vec!["vps1".into(), "vps2".into()], true, Auth::in_memory());
         let local_name = s.servers[0].name.clone();
         let parts: Vec<(&Server, Result<Value, String>)> = vec![
             (&s.servers[0], Ok(slim("mac"))),
@@ -860,7 +889,7 @@ mod tests {
 
     #[tokio::test]
     async fn actions_route_to_the_owning_server() {
-        let s = Shared::with_servers("/nonexistent".into(), vec!["vps1".into()], true);
+        let s = Shared::with_servers("/nonexistent".into(), vec!["vps1".into()], true, Auth::in_memory());
         let (v, id) = s.route("surface:3").unwrap();
         assert!(v.is_local());
         assert_eq!(id, "surface:3");
