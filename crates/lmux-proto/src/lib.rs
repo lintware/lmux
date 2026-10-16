@@ -46,6 +46,14 @@ pub struct Folder {
     #[serde(default)]
     pub parent: Option<Ref>,
     pub collapsed: bool,
+    /// Project directory new workspaces in this folder start in, on `host`.
+    /// Nested folders without one inherit the nearest ancestor's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The host whose daemon holds the folder (and so its workspaces), as
+    /// that daemon names itself. Filled in by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

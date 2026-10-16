@@ -424,6 +424,11 @@ fn folder_row(
 ) -> bool {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, ROW_H * theme::sidebar_scale()), Sense::click_and_drag());
+    // Where its new sessions start, on hover.
+    let resp = match &folder.cwd {
+        Some(cwd) => resp.on_hover_text(cwd),
+        None => resp,
+    };
     c.state.folder_rects.insert(folder.id.clone(), rect);
     c.state.sidebar_rows.push(SidebarRow {
         id: folder.id.clone(),
@@ -538,6 +543,7 @@ fn folder_menu(resp: &egui::Response, folder: &Folder, c: &mut Ctx) {
     let mut new_session = false;
     let mut new_child = false;
     let mut rename = false;
+    let mut set_dir = false;
     let mut close = false;
     resp.context_menu(|ui| {
         ui.set_min_width(160.0);
@@ -554,6 +560,11 @@ fn folder_menu(resp: &egui::Response, folder: &Folder, c: &mut Ctx) {
             rename = true;
             ui.close();
         }
+        let dir_label = if folder.cwd.is_some() { "Change Directory…" } else { "Set Directory…" };
+        if ui.button(dir_label).clicked() {
+            set_dir = true;
+            ui.close();
+        }
         if ui.button("Close Folder").clicked() {
             close = true;
             ui.close();
@@ -565,6 +576,8 @@ fn folder_menu(resp: &egui::Response, folder: &Folder, c: &mut Ctx) {
         c.state.new_folder(Some(folder.id.clone()));
     } else if rename {
         c.state.begin_folder_rename(&folder.id, &folder.name);
+    } else if set_dir {
+        c.state.begin_folder_cwd_edit(&folder.id);
     } else if close {
         c.state.rpc(lmux_proto::methods::FOLDER_CLOSE, serde_json::json!({ "folder": folder.id }));
     }
@@ -698,9 +711,11 @@ fn folder_rename_editor(
         let ui = &mut edit_ui;
         ui.style_mut().visuals.extreme_bg_color = Color32::from_rgb(0x2A, 0x2A, 0x2A);
         ui.style_mut().visuals.selection.bg_fill = theme::ACCENT;
+        let hint = if ren.directory { "Project directory (empty: none)" } else { "" };
         let out = ui.add(
             egui::TextEdit::singleline(&mut text)
                 .id(edit_id)
+                .hint_text(hint)
                 .font(theme::ui_semibold(theme::FS_BODY * theme::sidebar_scale()))
                 .text_color(theme::TEXT)
                 .desired_width(edit_rect.width().max(24.0)),
@@ -720,7 +735,15 @@ fn folder_rename_editor(
         }
     }
 
-    if commit {
+    if commit && ren.directory {
+        // The daemon checks the directory exists on the folder's host.
+        let cwd = text.trim();
+        c.state.rpc(
+            lmux_proto::methods::FOLDER_SET_CWD,
+            serde_json::json!({ "folder": folder.id, "cwd": (!cwd.is_empty()).then_some(cwd) }),
+        );
+        c.state.folder_rename = None;
+    } else if commit {
         let name = text.trim().to_owned();
         if !name.is_empty() {
             c.state.rpc(

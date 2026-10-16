@@ -1176,3 +1176,101 @@ fn host_cli_bounds_remote_waits_and_large_requests_and_keeps_explicit_discovery_
     }
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
 }
+
+/// #10 and #11: a folder carries a working directory, new workspaces in it
+/// (or in a folder nested inside it) start there, folders are named by
+/// title, and `close-folder` reports what moved up.
+#[test]
+fn folders_carry_a_cwd_and_close_by_title() {
+    let Some(d) = Daemon::start() else { return };
+    let project = tempfile::tempdir().unwrap();
+    // Canonical, as the caller's current directory is (macOS: /private/var).
+    let project_dir = cwd(&project.path().canonicalize().unwrap());
+    std::fs::create_dir(project.path().join("api")).unwrap();
+
+    let made = d.json(&["new-folder", "justcallme", "--cwd", &project_dir]);
+    assert_eq!(made["cwd"], project_dir.as_str());
+    let folder = made["folder"].as_str().unwrap().to_string();
+    let tree = d.json(&["tree"]);
+    let f = tree["folders"].as_array().unwrap().iter().find(|f| f["id"] == folder.as_str()).unwrap();
+    assert_eq!(f["cwd"], project_dir.as_str());
+    assert!(f["host"].as_str().is_some_and(|h| !h.is_empty()), "{f}");
+
+    // A relative --cwd means the caller's directory; a missing one is refused.
+    let out = d.cmd(&["--json", "new-folder", "api", "--parent", "justcallme", "--cwd", "api"])
+        .current_dir(project.path()).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let api: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(api["cwd"], format!("{project_dir}/api"));
+    let missing = d.run(&["new-folder", "typo", "--cwd", "/definitely/not/here"]);
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("not a directory"));
+
+    // By title, no --cwd: the folder's directory.
+    let ws = d.json(&["new-workspace", "--folder", "justcallme", "--command", "/bin/cat"]);
+    let ws_cwd = |ws: &serde_json::Value| {
+        let tree = d.json(&["tree"]);
+        tree["workspaces"].as_array().unwrap().iter().find(|w| w["id"] == ws["workspace"]).unwrap()["cwd"].clone()
+    };
+    assert_eq!(ws_cwd(&ws), project_dir.as_str());
+    // An explicit --cwd still wins.
+    let other = tempfile::tempdir().unwrap();
+    let ws2 = d.json(&["new-workspace", "--folder", "justcallme", "--cwd", &cwd(other.path()), "--command", "/bin/cat"]);
+    assert_eq!(ws_cwd(&ws2), cwd(other.path()).as_str());
+    // A nested folder without its own directory inherits the nearest one.
+    d.ok(&["set-folder-cwd", "api", "--clear"]);
+    let ws3 = d.json(&["new-workspace", "--folder", "api", "--command", "/bin/cat"]);
+    assert_eq!(ws_cwd(&ws3), project_dir.as_str());
+    // A folder without a cwd keeps today's behavior.
+    d.ok(&["new-folder", "plain"]);
+    let ws4 = d.json(&["new-workspace", "--folder", "plain", "--command", "/bin/cat"]);
+    assert_eq!(ws_cwd(&ws4), std::env::var("HOME").unwrap().as_str());
+
+    // close-folder: --if-empty refuses a folder with contents, then a plain
+    // close lifts them and says so.
+    let refused = d.run(&["close-folder", "justcallme", "--if-empty"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not empty (2 workspaces, 1 folders)"));
+    let closed = d.ok(&["close-folder", "justcallme"]);
+    assert_eq!(closed.trim(), format!("OK {folder} moved up 2 workspaces, 1 folder to the top level"));
+    let tree = d.json(&["tree"]);
+    assert!(tree["folders"].as_array().unwrap().iter().all(|f| f["name"] != "justcallme"));
+    assert!(d.ok(&["close-folder", "plain"]).contains("moved up 1 workspace, 0 folders"));
+    d.ok(&["new-folder", "empty"]);
+    assert!(d.ok(&["close-folder", "empty", "--if-empty"]).contains("(it was empty)"));
+    // Two folders with one title: ask for a ref.
+    d.ok(&["new-folder", "dup"]);
+    d.ok(&["new-folder", "dup"]);
+    let dup = d.run(&["close-folder", "dup"]);
+    assert!(String::from_utf8_lossy(&dup.stderr).contains("2 folders are named"));
+    assert!(!d.run(&["close-folder", "nope"]).status.success());
+}
+
+/// #10: `new-workspace --folder TITLE` without --host opens on the host that
+/// holds the folder, in its directory.
+#[test]
+fn new_workspace_finds_a_folder_title_on_another_host() {
+    let (Some(local), Some(remote)) = (Daemon::start(), Daemon::start()) else { return };
+    let fixture = HostCliFixture::new(&local, &remote, serde_json::json!([
+        {"name":"build", "kind":"ssh", "ssh_target":"box"}
+    ]));
+    let run = |args: &[&str]| {
+        let out = fixture.cmd(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        out
+    };
+    run(&["--host", "build", "new-folder", "justcallme", "--cwd", "/tmp"]);
+    let out = run(&["--json", "new-workspace", "--folder", "justcallme", "--command", "/bin/cat"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is on host build"));
+    let made: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(made["cli_target"]["host"], "build");
+    let tree = remote.json(&["tree"]);
+    let ws = tree["workspaces"].as_array().unwrap().iter().find(|w| w["id"] == made["workspace"]).unwrap();
+    assert_eq!(ws["cwd"], "/tmp");
+    assert_eq!(ws["folder"], tree["folders"][0]["id"]);
+    assert!(local.json(&["tree"])["workspaces"].as_array().unwrap().is_empty());
+    // Over --host, close-folder works by title as well.
+    let out = run(&["--host", "build", "close-folder", "justcallme"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("moved up 1 workspace"));
+    let missing = fixture.cmd(&["new-workspace", "--folder", "nowhere"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no host has a folder named"));
+}

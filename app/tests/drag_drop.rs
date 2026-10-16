@@ -206,8 +206,8 @@ fn sidebar_tree() -> wire::Tree {
     Tree {
         host: "h".into(),
         folders: vec![
-            Folder { id: "folder:1".into(), name: "webapp".into(), parent: None, collapsed: false },
-            Folder { id: "folder:2".into(), name: "lintlabs".into(), parent: None, collapsed: false },
+            Folder { id: "folder:1".into(), name: "webapp".into(), parent: None, collapsed: false, cwd: None, host: None },
+            Folder { id: "folder:2".into(), name: "lintlabs".into(), parent: None, collapsed: false, cwd: None, host: None },
         ],
         workspaces: vec![
             ws("workspace:1", "one", Some("folder:1"), "surface:1"),

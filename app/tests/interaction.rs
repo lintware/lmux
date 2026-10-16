@@ -42,8 +42,8 @@ fn sample_tree() -> wire::Tree {
     Tree {
         host: "my-server".into(),
         folders: vec![
-            Folder { id: "folder:1".into(), name: "one".into(), parent: None, collapsed: false },
-            Folder { id: "folder:2".into(), name: "nested".into(), parent: Some("folder:1".into()), collapsed: false },
+            Folder { id: "folder:1".into(), name: "one".into(), parent: None, collapsed: false, cwd: None, host: None },
+            Folder { id: "folder:2".into(), name: "nested".into(), parent: Some("folder:1".into()), collapsed: false, cwd: None, host: None },
         ],
         workspaces: vec![
             ws("workspace:1", "first", Some("folder:1"), "pane:1", "surface:1"),
@@ -478,6 +478,8 @@ fn a_create_aimed_at_another_host_waits_for_that_host() {
         name: "remote".into(),
         parent: None,
         collapsed: false,
+        cwd: None,
+        host: None,
     }];
     {
         let st = &mut h.state_mut().state;
@@ -636,6 +638,8 @@ fn a_new_folder_is_named_in_line_in_the_sidebar() {
         name: "New Folder".into(),
         parent: Some("folder:1".into()),
         collapsed: false,
+        cwd: None,
+        host: None,
     });
     h.state_mut().state.apply_tree(tree);
     let id = h

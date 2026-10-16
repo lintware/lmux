@@ -159,10 +159,10 @@ fn sample_tree() -> wire::Tree {
     Tree {
         host: "my-server".into(),
         folders: vec![
-            Folder { id: "folder:1".into(), name: "webapp".into(), parent: None, collapsed: false },
+            Folder { id: "folder:1".into(), name: "webapp".into(), parent: None, collapsed: false, cwd: None, host: None },
             // Nested one level: a folder inside a folder, holding a session.
-            Folder { id: "folder:3".into(), name: "api".into(), parent: Some("folder:1".into()), collapsed: false },
-            Folder { id: "folder:2".into(), name: "lintlabs".into(), parent: None, collapsed: false },
+            Folder { id: "folder:3".into(), name: "api".into(), parent: Some("folder:1".into()), collapsed: false, cwd: None, host: None },
+            Folder { id: "folder:2".into(), name: "lintlabs".into(), parent: None, collapsed: false, cwd: None, host: None },
         ],
         workspaces: vec![ws1, ws2, ws3, ws4],
         selected_workspace: Some("workspace:1".into()),

@@ -54,7 +54,7 @@ mod tests {
     fn tree_decode() {
         let tree = Tree {
             host: "lint".into(),
-            folders: vec![Folder { id: "folder:1".into(), name: "ws".into(), parent: None, collapsed: false }],
+            folders: vec![Folder { id: "folder:1".into(), name: "ws".into(), parent: None, collapsed: false, cwd: None, host: None }],
             workspaces: vec![],
             selected_workspace: None,
         };

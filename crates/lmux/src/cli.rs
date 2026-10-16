@@ -10,15 +10,17 @@ use clap::{Args, Parser, Subcommand};
 /// it in step with the subcommands.
 pub const COMMANDS_HELP: &str = "\
 Workspaces:
-  new-workspace              Create a workspace (--name, --cwd, --command, --folder)
+  new-workspace              Create a workspace (--name, --cwd, --command, --folder; a folder's cwd is the default)
   list-workspaces            List workspaces
   current-workspace          Print the caller's (else the selected) workspace
   select-workspace           Select a workspace
   rename-workspace           Rename a workspace
   reorder-workspace          Move a workspace (--index, --before, --after, --folder)
   close-workspace            Close a workspace and its terminals
-  new-folder                 Create a sidebar folder
+  new-folder                 Create a sidebar folder (--parent, --cwd: where its sessions start)
+  set-folder-cwd             Set or clear (--clear) a folder's working directory
   move-folder                Move a folder into another one, or to the top level
+  close-folder               Close a folder; its workspaces and folders move up (--if-empty)
   tree                       Print workspaces, panes and surfaces
   identify                   Print the caller's workspace, pane and surface
 
@@ -84,7 +86,7 @@ Other:
   help                       Print help for a command
 
 Targets: --workspace/--surface/--pane take refs such as workspace:2, surface:5,
-pane:3, or just the number (2). A workspace can also be named by its title.
+pane:3, or just the number (2). A workspace or folder can also be named by its title.
 Left out, they mean the caller's own (from $LMUX_SURFACE_ID and
 $LMUX_WORKSPACE_ID), else what is focused. Refs belong to one host.
 Use --host HOST to query another daemon, or tree --all-hosts to discover sessions.";
@@ -171,12 +173,35 @@ pub enum Cmd {
     Server(ServerArgs),
 
     // ----- workspaces ------------------------------------------------------
-    /// Create a sidebar folder.
+    /// Create a sidebar folder. With --host it lives on that host, and so do
+    /// the workspaces opened in it.
     NewFolder {
         name: String,
         /// Nest the folder inside this one, instead of the top level.
         #[arg(long)]
         parent: Option<String>,
+        /// Project directory (on the folder's host) new workspaces in it start in.
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+    /// Set a folder's working directory, or clear it with --clear.
+    SetFolderCwd {
+        /// Folder ref (folder:3), number or title.
+        folder: String,
+        /// Directory on the folder's host.
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        cwd: Option<String>,
+        /// Forget the directory: new workspaces start in the default again.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Close a folder. Its workspaces and child folders move up to its parent.
+    CloseFolder {
+        /// Folder ref (folder:3), number or title.
+        folder: String,
+        /// Refuse when the folder still holds workspaces or folders.
+        #[arg(long)]
+        if_empty: bool,
     },
     /// Move a folder into another one, or to the top level.
     MoveFolder {

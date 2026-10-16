@@ -39,6 +39,8 @@ fn tree(host: &str, folder: &str, title: &str, cwd: &str) -> wire::Tree {
             name: folder.into(),
             parent: None,
             collapsed: false,
+            cwd: None,
+            host: None,
         }],
         workspaces: vec![Workspace {
             id: "workspace:1".into(),

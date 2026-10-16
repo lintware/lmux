@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::browser::unsupported;
 use crate::daemon::{Inner, Out};
-use crate::tree::{terminal_surface, MoveFolderError};
+use crate::tree::{terminal_surface, FolderLookupError, MoveFolderError};
 
 fn ok(id: u64, v: Value) -> RpcResponse {
     RpcResponse {
@@ -444,6 +444,27 @@ fn default_cwd(params: &Value, state: &crate::tree::SessionState, ws: Option<&st
     std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
 }
 
+/// A folder's directory as stored: `~` expanded with this daemon's HOME, and
+/// it must be an existing absolute directory here, so a typo is caught when
+/// the folder is set up rather than when a session opens in `$HOME`.
+fn folder_dir(cwd: &str) -> Result<String, String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let path = if cwd == "~" {
+        home
+    } else if let Some(rest) = cwd.strip_prefix("~/") {
+        format!("{}/{rest}", home.trim_end_matches('/'))
+    } else {
+        cwd.to_string()
+    };
+    if !path.starts_with('/') {
+        return Err(format!("folder directory {cwd:?} must be absolute (or start with ~)"));
+    }
+    if !std::path::Path::new(&path).is_dir() {
+        return Err(format!("folder directory {path} is not a directory on this host"));
+    }
+    Ok(path)
+}
+
 /// Shells count as idle: closing a pane at its prompt loses nothing.
 const SHELLS: &[&str] = &["zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "login", "-zsh", "-bash"];
 
@@ -514,11 +535,27 @@ pub(crate) async fn spawn_terminal_env(
 /// Turn the target params people type into refs: a bare number names that
 /// ref (`2` is `workspace:2`), and a workspace may also be named by its title.
 /// An explicit workspace that matches nothing is an error here, so it is not
-/// reported later as a missing surface or pane.
-fn normalize_targets(state: &crate::tree::SessionState, params: &mut Value) -> Result<(), RpcError> {
+/// reported later as a missing surface or pane. Folders work the same way
+/// (`folder`, and `parent` on the folder methods).
+fn normalize_targets(state: &crate::tree::SessionState, method: &str, params: &mut Value) -> Result<(), RpcError> {
     let Some(obj) = params.as_object_mut() else {
         return Ok(());
     };
+    let folder_keys: &[&str] = if method.starts_with("folder.") { &["folder", "parent"] } else { &["folder"] };
+    for key in folder_keys {
+        let Some(Value::String(name)) = obj.get(*key) else { continue };
+        let found = match state.resolve_folder(name) {
+            Ok(r) => r,
+            Err(FolderLookupError::NotFound) => return Err(not_found(format!("folder {name} not found"))),
+            Err(FolderLookupError::Ambiguous(refs)) => {
+                return Err(RpcError {
+                    code: RpcErrorCode::InvalidParams,
+                    message: format!("{} folders are named {name:?}; use a ref like {}", refs.len(), refs[0]),
+                })
+            }
+        };
+        obj.insert((*key).into(), Value::String(found));
+    }
     for key in ["surface", "pane"] {
         if let Some(Value::String(v)) = obj.get_mut(key) {
             if !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit()) {
@@ -554,7 +591,7 @@ fn normalize_targets(state: &crate::tree::SessionState, params: &mut Value) -> R
 
 pub async fn dispatch(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
     let mut params = req.params.clone();
-    if let Err(e) = normalize_targets(&*inner.state.lock().await, &mut params) {
+    if let Err(e) = normalize_targets(&*inner.state.lock().await, &req.method, &mut params) {
         return RpcResponse { id: req.id, result: None, error: Some(e) };
     }
     let req = &RpcRequest { id: req.id, method: req.method.clone(), params };
@@ -607,19 +644,47 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
         methods::FOLDER_NEW => {
             let name = v_str(params, "name").unwrap_or_else(|| "folder".to_string());
             let parent = s(params, "parent");
-            let folder = {
+            let cwd = match s(params, "cwd").map(|c| folder_dir(&c)).transpose() {
+                Ok(c) => c,
+                Err(e) => return err(id, RpcErrorCode::InvalidParams, e),
+            };
+            let (folder, host) = {
                 let mut state = inner.state.lock().await;
                 if let Some(p) = &parent {
                     if state.folder(p).is_none() {
                         return err(id, RpcErrorCode::NotFound, format!("folder {p} not found"));
                     }
                 }
-                state.add_folder(name, parent).id
+                let f = state.add_folder(name, parent);
+                if let Some(f) = state.folders.iter_mut().find(|x| x.id == f.id) {
+                    f.cwd = cwd.clone();
+                }
+                (f.id, f.host)
             };
             inner.tree_changed();
             inner.mark_dirty();
             // Every create answers with the new ref, as the mock has always done.
-            ok(id, json!({"folder": folder}))
+            ok(id, json!({"folder": folder, "cwd": cwd, "host": host}))
+        }
+        methods::FOLDER_SET_CWD => {
+            let Some(folder) = s(params, "folder") else {
+                return err(id, RpcErrorCode::InvalidParams, "folder required");
+            };
+            // A null or empty cwd clears it: the folder goes back to the default.
+            let cwd = match s(params, "cwd").filter(|c| !c.is_empty()).map(|c| folder_dir(&c)).transpose() {
+                Ok(c) => c,
+                Err(e) => return err(id, RpcErrorCode::InvalidParams, e),
+            };
+            {
+                let mut state = inner.state.lock().await;
+                let Some(f) = state.folders.iter_mut().find(|f| f.id == folder) else {
+                    return err(id, RpcErrorCode::NotFound, format!("folder {folder} not found"));
+                };
+                f.cwd = cwd.clone();
+            }
+            inner.tree_changed();
+            inner.mark_dirty();
+            ok(id, json!({"folder": folder, "cwd": cwd}))
         }
         methods::FOLDER_RENAME => {
             let (folder, name) = (s(params, "folder"), v_str(params, "name"));
@@ -650,16 +715,27 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
             let Some(folder) = s(params, "folder") else {
                 return err(id, RpcErrorCode::InvalidParams, "folder required");
             };
-            let closed = {
+            let if_empty = b(params, "if_empty") == Some(true);
+            let (workspaces, folders, parent) = {
                 let mut state = inner.state.lock().await;
-                state.close_folder(&folder)
+                let Some(parent) = state.folder(&folder).map(|f| f.parent.clone()) else {
+                    return err(id, RpcErrorCode::NotFound, format!("folder {folder} not found"));
+                };
+                let (workspaces, folders) = state.folder_contents(&folder);
+                if if_empty && workspaces + folders > 0 {
+                    return err(
+                        id,
+                        RpcErrorCode::InvalidParams,
+                        format!("folder {folder} is not empty ({workspaces} workspaces, {folders} folders)"),
+                    );
+                }
+                state.close_folder(&folder);
+                (workspaces, folders, parent)
             };
-            if !closed {
-                return err(id, RpcErrorCode::NotFound, "folder not found");
-            }
             inner.tree_changed();
             inner.mark_dirty();
-            ok(id, json!({}))
+            // What moved up and where to, so a script sees the effect.
+            ok(id, json!({"folder": folder, "parent": parent, "workspaces_moved": workspaces, "folders_moved": folders}))
         }
         methods::FOLDER_MOVE => {
             let Some(folder) = s(params, "folder") else {
@@ -718,7 +794,11 @@ async fn dispatch_inner(inner: &Arc<Inner>, req: &RpcRequest) -> RpcResponse {
                             .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
                     })
                     .unwrap_or_else(|| format!("workspace {}", state.counters.workspace + 1));
-                let cwd = default_cwd(params, &state, None);
+                // An explicit cwd wins; else the folder's (or an ancestor's).
+                let cwd = match folder.as_deref().and_then(|f| state.folder_cwd(f)) {
+                    Some(c) if s(params, "cwd").is_none() => c,
+                    _ => default_cwd(params, &state, None),
+                };
                 let ws_ref = state.next_workspace();
                 let pane_ref = state.next_pane();
                 let surface_ref = state.next_surface();
@@ -2643,7 +2723,7 @@ mod tests {
         let (mut s, ws2, ..) = two_workspaces();
         let norm = |s: &SessionState, p: Value| {
             let mut p = p;
-            normalize_targets(s, &mut p).map(|_| p).map_err(|e| e.message)
+            normalize_targets(s, "system.tree", &mut p).map(|_| p).map_err(|e| e.message)
         };
         let n = ws2.trim_start_matches("workspace:");
         assert_eq!(norm(&s, json!({"workspace": n})).unwrap()["workspace"], ws2.as_str());

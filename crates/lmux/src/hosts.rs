@@ -199,6 +199,59 @@ pub async fn call(endpoint: &Endpoint, method: &str, params: Value) -> anyhow::R
     endpoint.call(method, params).await
 }
 
+/// Whether `error` is the daemon saying the folder named `folder` is not there.
+pub fn folder_missing(error: &anyhow::Error, folder: &str) -> bool {
+    format!("{error:#}").contains(&format!("folder {folder} not found"))
+}
+
+/// The one SSH host whose daemon has a folder titled `title`, for commands that
+/// name a folder without --host. Refs are host-scoped, so only titles qualify.
+pub async fn host_with_folder(title: &str) -> anyhow::Result<Endpoint> {
+    if title.starts_with("folder:") || title.bytes().all(|c| c.is_ascii_digit()) {
+        bail!("folder refs belong to one host; add --host HOST");
+    }
+    let hosts = discover()?;
+    let remote: Vec<&Host> = hosts.iter().filter(|h| h.transport == "ssh").collect();
+    if remote.len() > 64 {
+        bail!("too many hosts to search for folder {title:?}; add --host HOST");
+    }
+    let found: Vec<(String, Result<bool, String>)> = stream::iter(remote.iter().map(|host| {
+        let hosts = &hosts;
+        async move {
+            let result = async {
+                let endpoint = Endpoint::select(Some(&host.name), None, "", hosts).map_err(|e| format!("{e:#}"))?;
+                let tree = tokio::time::timeout(Duration::from_secs(20), endpoint.call(lmux_proto::methods::TREE, json!({})))
+                    .await
+                    .map_err(|_| "timed out".to_string())?
+                    .map_err(|e| format!("{e:#}"))?;
+                Ok(tree["folders"].as_array().into_iter().flatten().any(|f| f["name"] == title))
+            }
+            .await;
+            (host.name.clone(), result)
+        }
+    }))
+    .buffered(8)
+    .collect()
+    .await;
+    pick_folder_host(title, &found).and_then(|name| Endpoint::select(Some(&name), None, "", &hosts))
+}
+
+/// Exactly one host with the folder wins; none or several is an error that
+/// says which hosts could not be asked.
+fn pick_folder_host(title: &str, found: &[(String, Result<bool, String>)]) -> anyhow::Result<String> {
+    let with: Vec<&str> = found.iter().filter(|(_, r)| r == &Ok(true)).map(|(n, _)| n.as_str()).collect();
+    let unreachable: Vec<&str> = found.iter().filter(|(_, r)| r.is_err()).map(|(n, _)| n.as_str()).collect();
+    match with.as_slice() {
+        [one] => {
+            eprintln!("lmux: folder {title:?} is on host {one}");
+            Ok(one.to_string())
+        }
+        [] if unreachable.is_empty() => bail!("no host has a folder named {title:?}"),
+        [] => bail!("no reachable host has a folder named {title:?} (not asked: {})", unreachable.join(", ")),
+        many => bail!("folder {title:?} exists on several hosts ({}); add --host HOST", many.join(", ")),
+    }
+}
+
 pub fn discover() -> anyhow::Result<Vec<Host>> {
     let home = crate::dirs_home().context("HOME is unavailable")?;
     let path = crate::cp::hosts_file();
@@ -429,6 +482,23 @@ mod tests {
             Path::new("/ssh/config")
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_folder_title_routes_to_the_one_host_that_has_it() {
+        let found = |v: &[(&str, Result<bool, &str>)]| {
+            v.iter().map(|(n, r)| (n.to_string(), r.map_err(String::from))).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pick_folder_host("justcallme", &found(&[("a", Ok(false)), ("b", Ok(true)), ("c", Err("down"))])).unwrap(),
+            "b"
+        );
+        let none = pick_folder_host("x", &found(&[("a", Ok(false)), ("c", Err("down"))])).unwrap_err();
+        assert!(none.to_string().contains("not asked: c"), "{none}");
+        let many = pick_folder_host("x", &found(&[("a", Ok(true)), ("b", Ok(true))])).unwrap_err();
+        assert!(many.to_string().contains("several hosts (a, b)"), "{many}");
+        assert!(folder_missing(&anyhow::anyhow!("rpc error (NotFound): folder justcallme not found"), "justcallme"));
+        assert!(!folder_missing(&anyhow::anyhow!("rpc error (NotFound): folder other not found"), "justcallme"));
     }
 
     #[test]

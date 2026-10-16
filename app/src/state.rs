@@ -427,12 +427,14 @@ pub struct Rename {
     pub focus_requested: bool,
 }
 
-/// Inline rename of a folder row.
+/// Inline rename of a folder row (or of its working directory).
 #[derive(Clone, Debug, PartialEq)]
 pub struct FolderRename {
     pub folder: Ref,
     pub text: String,
     pub focus_requested: bool,
+    /// Editing the folder's directory rather than its name.
+    pub directory: bool,
 }
 
 /// What a create aimed at another host should make once that host answers.
@@ -710,6 +712,19 @@ impl AppState {
             folder: folder.to_owned(),
             text: current.to_owned(),
             focus_requested: false,
+            directory: false,
+        });
+    }
+
+    /// Edit the directory new sessions in `folder` start in, in place of its
+    /// name. Committing an empty text clears it.
+    pub fn begin_folder_cwd_edit(&mut self, folder: &str) {
+        let current = self.folder(folder).and_then(|f| f.cwd.clone()).unwrap_or_default();
+        self.folder_rename = Some(FolderRename {
+            folder: folder.to_owned(),
+            text: current,
+            focus_requested: false,
+            directory: true,
         });
     }
 
@@ -1112,7 +1127,7 @@ impl AppState {
         let id = ws.map(str::to_owned).or_else(|| self.selected.clone());
         let Some(id) = id else { return };
         let Some(title) = self.workspace(&id).map(|w| w.title.clone()) else { return };
-        self.ws_rename = Some(FolderRename { folder: id, text: title, focus_requested: false });
+        self.ws_rename = Some(FolderRename { folder: id, text: title, focus_requested: false, directory: false });
     }
 
     /// Cmd+Shift+Enter: show the focused pane alone, or go back to the split.
@@ -2698,6 +2713,30 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_directory_edit_starts_from_its_current_cwd() {
+        let mut st = AppState::new();
+        st.apply_tree(Tree {
+            host: "h".into(),
+            folders: vec![lmux_proto::Folder {
+                id: "folder:1".into(),
+                name: "justcallme".into(),
+                parent: None,
+                collapsed: false,
+                cwd: Some("/p/justcallme".into()),
+                host: Some("h".into()),
+            }],
+            workspaces: vec![],
+            selected_workspace: None,
+        });
+        st.begin_folder_cwd_edit("folder:1");
+        let ren = st.folder_rename.clone().expect("editor opens");
+        assert!(ren.directory);
+        assert_eq!(ren.text, "/p/justcallme");
+        st.begin_folder_rename("folder:1", "justcallme");
+        assert!(!st.folder_rename.unwrap().directory, "a rename is not a directory edit");
+    }
+
+    #[test]
     fn a_folder_trail_names_its_whole_path() {
         let mut st = AppState::new();
         st.apply_tree(Tree {
@@ -2708,12 +2747,16 @@ mod tests {
                     name: "outer".into(),
                     parent: None,
                     collapsed: false,
+                    cwd: None,
+                    host: None,
                 },
                 lmux_proto::Folder {
                     id: "folder:2".into(),
                     name: "inner".into(),
                     parent: Some("folder:1".into()),
                     collapsed: false,
+                    cwd: None,
+                    host: None,
                 },
             ],
             workspaces: vec![],
@@ -2768,13 +2811,15 @@ mod tests {
         Tree {
             host: "h".into(),
             folders: vec![
-                Folder { id: "folder:a".into(), name: "a".into(), parent: None, collapsed: false },
-                Folder { id: "folder:b".into(), name: "b".into(), parent: None, collapsed: false },
+                Folder { id: "folder:a".into(), name: "a".into(), parent: None, collapsed: false, cwd: None, host: None },
+                Folder { id: "folder:b".into(), name: "b".into(), parent: None, collapsed: false, cwd: None, host: None },
                 Folder {
                     id: "folder:c".into(),
                     name: "c".into(),
                     parent: Some("folder:b".into()),
                     collapsed: false,
+                    cwd: None,
+                    host: None,
                 },
             ],
             workspaces: vec![

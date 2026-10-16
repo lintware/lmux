@@ -14,11 +14,12 @@ pub const IDENTIFY: &str = "system.identify"; // {} -> {workspace, pane, surface
 pub const TREE: &str = "system.tree"; // {} -> Tree
 
 // --- folders & workspaces ---
-pub const FOLDER_NEW: &str = "folder.new"; // {name, parent?} -> {folder} (parent nests it inside another folder)
+pub const FOLDER_NEW: &str = "folder.new"; // {name, parent?, cwd?} -> {folder, cwd, host} (parent nests it inside another folder; cwd is where its new workspaces start)
+pub const FOLDER_SET_CWD: &str = "folder.set_cwd"; // {folder, cwd?: string|null} -> {folder, cwd} (null/absent clears it)
 pub const FOLDER_RENAME: &str = "folder.rename"; // {folder, name}
-pub const FOLDER_CLOSE: &str = "folder.close"; // {folder} (its workspaces and child folders move up to its parent)
+pub const FOLDER_CLOSE: &str = "folder.close"; // {folder, if_empty?} -> {folder, parent, workspaces_moved, folders_moved} (its workspaces and child folders move up to its parent; if_empty refuses a folder with contents)
 pub const FOLDER_MOVE: &str = "folder.move"; // {folder, parent?: Ref|null, index?} (reparent/reorder; a folder cannot move into itself or a descendant; `parent` null/absent is the top level, `index` counts the parent's child folders)
-pub const WORKSPACE_NEW: &str = "workspace.new"; // {name?, cwd?, command?, folder?} -> {workspace, pane, surface}
+pub const WORKSPACE_NEW: &str = "workspace.new"; // {name?, cwd?, command?, folder?} -> {workspace, pane, surface} (no cwd: the folder's, else an ancestor folder's, else HOME)
 pub const WORKSPACE_LIST: &str = "workspace.list"; // {} -> {workspaces: [..]}
 pub const WORKSPACE_SELECT: &str = "workspace.select"; // {workspace}
 pub const WORKSPACE_RENAME: &str = "workspace.rename"; // {workspace?, title}

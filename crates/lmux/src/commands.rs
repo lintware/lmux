@@ -49,6 +49,21 @@ fn refs(keys: &'static [&'static str]) -> Printer {
     Box::new(move |v, j| print_json_or(v, j, |v| println!("{}", refs_line(v, keys))))
 }
 
+/// `OK folder:9 moved up 2 workspaces, 1 folder to the top level`: closing a
+/// folder moves its contents, so say how much and where.
+fn close_folder_line(v: &Value) -> String {
+    let head = refs_line(v, &["folder"]);
+    let (Some(w), Some(f)) = (v["workspaces_moved"].as_u64(), v["folders_moved"].as_u64()) else {
+        return head;
+    };
+    if w + f == 0 {
+        return format!("{head} (it was empty)");
+    }
+    let plural = |n: u64, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
+    let to = v["parent"].as_str().map(|p| format!("into {p}")).unwrap_or_else(|| "to the top level".into());
+    format!("{head} moved up {}, {} {to}", plural(w, "workspace"), plural(f, "folder"))
+}
+
 fn ok_box() -> Printer {
     Box::new(|v, j| print_json_or(v, j, |_| println!("OK")))
 }
@@ -141,6 +156,18 @@ fn take_flags(text: &mut Vec<String>, t: &mut Target, bools: &mut [(&str, &mut b
     *text = out;
 }
 
+/// `path` against the current directory, unless it is absolute or `~`-based
+/// (the daemon expands `~` with its own HOME).
+fn absolute_here(path: String) -> String {
+    if path.starts_with('/') || path.starts_with('~') {
+        return path;
+    }
+    match std::env::current_dir() {
+        Ok(dir) => dir.join(&path).to_string_lossy().into_owned(),
+        Err(_) => path,
+    }
+}
+
 /// Run a non-server, non-hook command.
 pub async fn run(cmd: Cmd, socket: &Endpoint, json: bool) -> anyhow::Result<()> {
     // `send`/`paste`: flags written after the text.
@@ -152,6 +179,13 @@ pub async fn run(cmd: Cmd, socket: &Endpoint, json: bool) -> anyhow::Result<()> 
         Cmd::Paste { mut text, mut target, mut submit, mut force } => {
             take_flags(&mut text, &mut target, &mut [("--submit", &mut submit), ("--force", &mut force)]);
             Cmd::Paste { text, target, submit, force }
+        }
+        // A relative folder directory means here, when "here" is the host.
+        Cmd::NewFolder { name, parent, cwd } if !socket.is_remote() => {
+            Cmd::NewFolder { name, parent, cwd: cwd.map(absolute_here) }
+        }
+        Cmd::SetFolderCwd { folder, cwd, clear } if !socket.is_remote() => {
+            Cmd::SetFolderCwd { folder, cwd: cwd.map(absolute_here), clear }
         }
         other => other,
     };
@@ -173,15 +207,23 @@ pub async fn run(cmd: Cmd, socket: &Endpoint, json: bool) -> anyhow::Result<()> 
             return wait::run(socket, name, signal, text, scrollback, target, timeout).await;
         }
         Cmd::NewWorkspace { name, cwd, command, folder, focus } => {
-            let v = call(
-                socket,
-                methods::WORKSPACE_NEW,
-                json!({"name": name, "cwd": cwd, "command": command, "folder": folder}),
-            )
-            .await?;
+            let params = json!({"name": name, "cwd": cwd, "command": command, "folder": folder});
+            let (endpoint, v) = match call(socket, methods::WORKSPACE_NEW, params.clone()).await {
+                // A folder title that this machine does not have may be a
+                // folder on another host: open the workspace there.
+                Err(e) if !socket.is_remote()
+                    && folder.as_deref().is_some_and(|f| crate::hosts::folder_missing(&e, f)) =>
+                {
+                    let f = folder.as_deref().unwrap_or_default();
+                    let remote = crate::hosts::host_with_folder(f).await.map_err(|why| e.context(why))?;
+                    let v = call(&remote, methods::WORKSPACE_NEW, params).await?;
+                    (remote, v)
+                }
+                other => (socket.clone(), other?),
+            };
             if focus == Some(true) {
                 if let Some(ws) = v["workspace"].as_str() {
-                    call(socket, methods::WORKSPACE_SELECT, json!({"workspace": ws})).await?;
+                    call(&endpoint, methods::WORKSPACE_SELECT, json!({"workspace": ws})).await?;
                 }
             }
             print_json_or(&v, json, |v| println!("{}", refs_line(v, &["workspace", "pane", "surface"])));
@@ -292,7 +334,26 @@ pub async fn run(cmd: Cmd, socket: &Endpoint, json: bool) -> anyhow::Result<()> 
 fn build(cmd: Cmd) -> anyhow::Result<Req> {
     Ok(match cmd {
         // ----- workspaces --------------------------------------------------
-        Cmd::NewFolder { name, parent } => req(methods::FOLDER_NEW, json!({"name": name, "parent": parent}), refs(&["folder"])),
+        Cmd::NewFolder { name, parent, cwd } => req(
+            methods::FOLDER_NEW,
+            json!({"name": name, "parent": parent, "cwd": cwd}),
+            Box::new(|v, j| {
+                print_json_or(v, j, |v| match v["cwd"].as_str() {
+                    Some(cwd) => println!("{} cwd={cwd}", refs_line(v, &["folder"])),
+                    None => println!("{}", refs_line(v, &["folder"])),
+                })
+            }),
+        ),
+        Cmd::SetFolderCwd { folder, cwd, clear: _ } => req(
+            methods::FOLDER_SET_CWD,
+            json!({"folder": folder, "cwd": cwd}),
+            refs(&["folder", "cwd"]),
+        ),
+        Cmd::CloseFolder { folder, if_empty } => req(
+            methods::FOLDER_CLOSE,
+            json!({"folder": folder, "if_empty": if_empty}),
+            Box::new(|v, j| print_json_or(v, j, |v| println!("{}", close_folder_line(v)))),
+        ),
         Cmd::MoveFolder { folder, parent, index } => req(
             methods::FOLDER_MOVE,
             json!({"folder": folder, "parent": parent, "index": index}),

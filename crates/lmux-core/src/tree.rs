@@ -46,6 +46,14 @@ pub enum MoveFolderError {
     Cycle,
 }
 
+/// Why a typed folder name names no single folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FolderLookupError {
+    NotFound,
+    /// Several folders share the title; these are their refs.
+    Ambiguous(Vec<Ref>),
+}
+
 /// Which surface a tmux window/pane backs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TermMeta {
@@ -324,9 +332,53 @@ impl SessionState {
             name: name.into(),
             parent,
             collapsed: false,
+            cwd: None,
+            host: (!self.host.is_empty()).then(|| self.host.clone()),
         };
         self.folders.push(f.clone());
         f
+    }
+
+    /// The directory a new workspace in `id` starts in: the folder's own cwd,
+    /// else the nearest ancestor's. `None` keeps the daemon's default.
+    pub fn folder_cwd(&self, id: &str) -> Option<String> {
+        let mut cursor = Some(id.to_string());
+        // Bounded like `is_descendant_of`, in case a cycle ever slips in.
+        for _ in 0..=self.folders.len() {
+            let f = self.folder(cursor.as_deref()?)?;
+            if let Some(cwd) = f.cwd.as_ref().filter(|c| !c.is_empty()) {
+                return Some(cwd.clone());
+            }
+            cursor = f.parent.clone();
+        }
+        None
+    }
+
+    /// How many workspaces and child folders sit directly in `id`: what a
+    /// close would move up a level.
+    pub fn folder_contents(&self, id: &str) -> (usize, usize) {
+        let workspaces = self.workspaces.iter().filter(|w| w.folder.as_deref() == Some(id)).count();
+        (workspaces, self.folder_children(Some(id)).len())
+    }
+
+    /// A folder named the way people type it: a ref (`folder:3`), its number
+    /// (`3`), or its title when exactly one folder has it.
+    pub fn resolve_folder(&self, name: &str) -> Result<Ref, FolderLookupError> {
+        if self.folder(name).is_some() {
+            return Ok(name.to_string());
+        }
+        if !name.is_empty() && name.bytes().all(|c| c.is_ascii_digit()) {
+            let numbered = format!("folder:{name}");
+            if self.folder(&numbered).is_some() {
+                return Ok(numbered);
+            }
+        }
+        let named: Vec<&Folder> = self.folders.iter().filter(|f| f.name == name).collect();
+        match named.as_slice() {
+            [one] => Ok(one.id.clone()),
+            [] => Err(FolderLookupError::NotFound),
+            many => Err(FolderLookupError::Ambiguous(many.iter().map(|f| f.id.clone()).collect())),
+        }
     }
 
     /// Every folder inside `parent`, in list order (`None` = top level).
@@ -1270,6 +1322,48 @@ mod tests {
         );
         assert_eq!(s.folder(&inner.id).unwrap().parent.as_deref(), Some(outer.id.as_str()));
         assert_eq!(s.workspace(&ws).unwrap().folder.as_deref(), Some(inner.id.as_str()));
+    }
+
+    #[test]
+    fn a_folder_cwd_is_inherited_by_nested_folders_without_one() {
+        let mut s = SessionState::new("h");
+        let outer = s.add_folder("justcallme", None);
+        let inner = s.add_folder("api", Some(outer.id.clone()));
+        let plain = s.add_folder("scratch", None);
+        assert_eq!(s.folder_cwd(&inner.id), None, "no directory anywhere keeps today's default");
+        s.folders.iter_mut().find(|f| f.id == outer.id).unwrap().cwd = Some("/p/justcallme".into());
+        assert_eq!(s.folder_cwd(&outer.id).as_deref(), Some("/p/justcallme"));
+        assert_eq!(s.folder_cwd(&inner.id).as_deref(), Some("/p/justcallme"));
+        s.folders.iter_mut().find(|f| f.id == inner.id).unwrap().cwd = Some("/p/justcallme/api".into());
+        assert_eq!(s.folder_cwd(&inner.id).as_deref(), Some("/p/justcallme/api"), "the nearest wins");
+        assert_eq!(s.folder_cwd(&plain.id), None);
+        assert_eq!(s.folder_cwd("folder:99"), None);
+        assert_eq!(outer.host.as_deref(), Some("h"), "the daemon stamps its own host");
+    }
+
+    #[test]
+    fn folders_resolve_by_ref_number_or_unique_title() {
+        let mut s = SessionState::new("h");
+        let a = s.add_folder("justcallme", None);
+        let b = s.add_folder("dup", None);
+        let c = s.add_folder("dup", Some(a.id.clone()));
+        assert_eq!(s.resolve_folder(&a.id), Ok(a.id.clone()));
+        assert_eq!(s.resolve_folder("1"), Ok(a.id.clone()));
+        assert_eq!(s.resolve_folder("justcallme"), Ok(a.id.clone()));
+        assert_eq!(s.resolve_folder("dup"), Err(FolderLookupError::Ambiguous(vec![b.id, c.id])));
+        assert_eq!(s.resolve_folder("nope"), Err(FolderLookupError::NotFound));
+        assert_eq!(s.resolve_folder("folder:99"), Err(FolderLookupError::NotFound));
+    }
+
+    #[test]
+    fn folder_contents_counts_what_a_close_moves_up() {
+        let (mut s, ws) = ws_with_two_panes();
+        let outer = s.add_folder("webapp", None);
+        s.add_folder("api", Some(outer.id.clone()));
+        s.workspace_mut(&ws).unwrap().folder = Some(outer.id.clone());
+        assert_eq!(s.folder_contents(&outer.id), (1, 1));
+        assert!(s.close_folder(&outer.id));
+        assert!(s.folder(&outer.id).is_none());
     }
 
     #[test]

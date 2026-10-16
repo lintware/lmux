@@ -711,6 +711,8 @@ mod tests {
             name: id.into(),
             parent: parent.map(str::to_owned),
             collapsed: false,
+            cwd: None,
+            host: None,
         };
         let tree = Tree {
             host: "h".into(),
