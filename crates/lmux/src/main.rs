@@ -199,7 +199,7 @@ async fn run() -> anyhow::Result<()> {
             hooks(cmd, &socket, json).await?;
             return Ok(());
         }
-        Cmd::ListHosts => { hosts::print_hosts(&discovered, json); Ok(()) }
+        Cmd::ListHosts => { hosts::print_hosts(&discovered, json).await; Ok(()) }
         Cmd::Tree { all_hosts: true, .. } => hosts::all_trees(&discovered, &socket, json).await,
         other => commands::run(other, &endpoint, json).await,
     }

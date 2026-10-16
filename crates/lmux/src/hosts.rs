@@ -313,13 +313,14 @@ fn discover_from(
     }
     // Literal aliases only. OpenSSH resolves Include, Match and wildcard rules
     // when a host is explicitly selected; discovery performs no network scan.
+    // Git hosting aliases are SSH hosts but never run lmux.
     for line in ssh.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         let mut words = line.split_whitespace();
         if !words.next().is_some_and(|s| s.eq_ignore_ascii_case("host")) {
             continue;
         }
-        for alias in words.filter(|s| valid_target(s) && *s != "local") {
+        for alias in words.filter(|s| valid_target(s) && *s != "local" && !GIT_HOSTS.contains(&s.to_ascii_lowercase().as_str())) {
             if let Some(entry) = hosts
                 .iter_mut()
                 .find(|h| h.name == alias || h.ssh_target.as_deref() == Some(alias))
@@ -342,17 +343,83 @@ fn discover_from(
     Ok(hosts)
 }
 
-pub fn print_hosts(hosts: &[Host], json_output: bool) {
-    if json_output {
-        println!("{}", serde_json::to_string_pretty(&json!({"hosts":hosts,"scope":"configured_routes","discovery":"app hosts.json and literal ~/.ssh/config Host aliases; no network scan"})).unwrap());
+const GIT_HOSTS: &[&str] = &["github.com", "gitlab.com", "bitbucket.org", "ssh.dev.azure.com", "codeberg.org"];
+
+/// How an SSH route reaches its host, from the address OpenSSH would dial.
+pub fn route_kind(address: &str, magic_suffix: Option<&str>) -> &'static str {
+    let a = address.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    if let Ok(ip) = a.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) if crate::share::tailnet::in_tailnet_range(&v4) => "tailnet",
+            std::net::IpAddr::V4(v4) if v4.is_loopback() => "loopback",
+            std::net::IpAddr::V4(v4) if v4.is_private() || v4.is_link_local() => "lan",
+            std::net::IpAddr::V6(v6) if v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0] => "tailnet",
+            std::net::IpAddr::V6(v6) if v6.is_loopback() => "loopback",
+            std::net::IpAddr::V6(v6) if (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80 => "lan",
+            _ => "public",
+        };
+    }
+    if a.ends_with(".ts.net") || magic_suffix.is_some_and(|s| a.ends_with(&format!(".{s}"))) {
+        "tailnet"
+    } else if a.ends_with(".local") || !a.contains('.') {
+        "lan"
     } else {
-        for host in hosts {
+        "name"
+    }
+}
+
+/// The address OpenSSH would dial for `alias` (`ssh -G`: reads the config, no network).
+async fn ssh_address(alias: &str) -> Option<String> {
+    let out = tokio::time::timeout(Duration::from_secs(5), Command::new("ssh").args(["-G", "--", alias]).stdin(Stdio::null()).stderr(Stdio::null()).output())
+        .await
+        .ok()?
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.strip_prefix("hostname ").map(str::to_owned))
+}
+
+/// Lists the routes with the address each one dials and how it gets there
+/// (`tailnet`, `lan`, `public`, `name`), so a route that bypasses the tailnet
+/// shows up.
+pub async fn print_hosts(hosts: &[Host], json_output: bool) {
+    let magic = crate::share::tailnet::detect().await.and_then(|t| t.dns).and_then(|d| d.split_once('.').map(|(_, s)| s.to_string()));
+    let routes: Vec<(Option<String>, Option<&'static str>)> = stream::iter(hosts.iter().map(|h| {
+        let magic = magic.clone();
+        async move {
+            let target = h.ssh_target.as_deref().filter(|_| h.transport == "ssh")?;
+            let address = ssh_address(target).await?;
+            let kind = route_kind(&address, magic.as_deref());
+            Some((Some(address), Some(kind)))
+        }
+    }))
+    .buffered(16)
+    .map(|r| r.unwrap_or((None, None)))
+    .collect()
+    .await;
+    if json_output {
+        let list: Vec<Value> = hosts.iter().zip(&routes).map(|(h, (address, kind))| {
+            let mut v = serde_json::to_value(h).unwrap_or(Value::Null);
+            v["address"] = json!(address);
+            v["route"] = json!(kind);
+            v
+        }).collect();
+        println!("{}", serde_json::to_string_pretty(&json!({"hosts":list,"scope":"configured_routes","discovery":"app hosts.json and literal ~/.ssh/config Host aliases; no network scan"})).unwrap());
+    } else {
+        for (host, (address, kind)) in hosts.iter().zip(&routes) {
+            let via = match (address, kind) {
+                (Some(a), Some(k)) => format!("{a} ({k})"),
+                _ => String::new(),
+            };
             println!(
-                "{}\t{}\t{}",
+                "{}\t{}\t{}\t{}",
                 host.name,
                 host.transport,
-                host.ssh_target.as_deref().unwrap_or("this machine")
+                host.ssh_target.as_deref().unwrap_or("this machine"),
+                via
             );
+        }
+        let off: Vec<&str> = hosts.iter().zip(&routes).filter(|(_, (_, k))| matches!(k, Some("public" | "lan"))).map(|(h, _)| h.name.as_str()).collect();
+        if !off.is_empty() {
+            println!("Not over the tailnet: {}. Point their HostName at the tailnet address when the host has one.", off.join(", "));
         }
         println!(
             "Use `lmux --host HOST tree`. Refs belong to that host. SSH aliases can use Tailscale."
@@ -499,6 +566,22 @@ mod tests {
         assert!(many.to_string().contains("several hosts (a, b)"), "{many}");
         assert!(folder_missing(&anyhow::anyhow!("rpc error (NotFound): folder justcallme not found"), "justcallme"));
         assert!(!folder_missing(&anyhow::anyhow!("rpc error (NotFound): folder other not found"), "justcallme"));
+    }
+
+    #[test]
+    fn routes_are_classified_by_the_address_they_dial() {
+        let m = Some("hs.lint.internal");
+        assert_eq!(route_kind("100.64.0.15", m), "tailnet");
+        assert_eq!(route_kind("fd7a:115c:a1e0::2", m), "tailnet");
+        assert_eq!(route_kind("lint-hqc-01.hs.lint.internal", m), "tailnet");
+        assert_eq!(route_kind("box.tail1234.ts.net", None), "tailnet");
+        assert_eq!(route_kind("192.168.0.8", m), "lan");
+        assert_eq!(route_kind("RENU.local", m), "lan");
+        assert_eq!(route_kind("109.123.251.196", m), "public");
+        assert_eq!(route_kind("100.128.0.1", m), "public", "outside 100.64/10");
+        assert_eq!(route_kind("example.com", m), "name");
+        let hosts = discover_from(&Value::Null, None, "Host github.com box\nHost GitLab.com\n", Path::new("/c")).unwrap();
+        assert_eq!(hosts.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["local", "box"], "git hosts are not lmux hosts");
     }
 
     #[test]

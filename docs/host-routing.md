@@ -108,3 +108,10 @@ Regression tests use separate scratch daemons and a private SSH stand-in. They c
 
 A temporary CLI copy on `lint-hqc-03` also verified discovery and read-only access to `lint-hqc-01` through the existing private SSH route. Its local tree and the peer's tree stayed separate. The check preserved installed binaries, daemons, and sessions; temporary copies were removed.
 No native app or browser UI changes are required for host routing.
+
+## Tailnet first
+
+`lmux list-hosts` prints the address each SSH route dials (`ssh -G`, no network) and whether it is `tailnet`, `lan`, `public` or a plain `name`, and names the routes that bypass the tailnet. Hosts reachable over Tailscale should be reached at their tailnet address (100.64.0.0/10, or the MagicDNS name), so routes keep working off the LAN and need no public SSH. Check that the tailnet address presents the host key already trusted for the old route before switching a `HostName`. Git hosting aliases (`github.com`, …) are not listed.
+
+The phone share prefers the tailnet the same way: it listens at `<tailnet IP>:7871` and lists that address before the Cloudflare tunnel (see `docs/handoff-remote-ui.md`).
+

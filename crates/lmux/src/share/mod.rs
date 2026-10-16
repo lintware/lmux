@@ -19,7 +19,7 @@ mod host;
 mod remote;
 mod server;
 mod service;
-mod tailnet;
+pub mod tailnet;
 mod tunnel;
 mod upload;
 mod voice;
